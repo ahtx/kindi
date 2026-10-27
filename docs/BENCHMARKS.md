@@ -22,6 +22,44 @@ generated. Project page: [amirhusain.com/kindi](https://amirhusain.com/kindi/).
 | 32,768 | Kindi: does not fit (its maximum on 1 GB is 24,576) | loads; not measured | does not fit | not measured |
 | 65,536 | does not fit | does not load (an 805 MB allocation fails) | does not fit | does not load |
 
+## Quadro K4000, 3 GB · Ternary-Bonsai-2-2B, 4B and 9B
+
+2026-10-26 (Kindi) and 2026-10-22 (llama.cpp). Kindi 0.2.0 (tag `v0.2.0`, commit `f5b60fb`), ctx 24,576, f16 K/V,
+chunked prompt reading. llama.cpp: Prism ML's fork, Vulkan build, commit `73bfe6c`, `-ngl 99 -fa on`, f16 K/V.
+Model files Ternary-Bonsai-2-2B/4B/9B-PTQ1_0.gguf; `kindi verify` is ALL PASS on the three.
+
+| Model | Context | Kindi read | Kindi write |
+|---|---|---:|---:|
+| 2B | 512 | 122.1 | 63.3 |
+| 2B | 8,192 | 108.9 | 57.5 |
+| 2B | 24,000 | 89.5 | 48.4 |
+| 4B | 512 | 47.3 | 30.3 |
+| 4B | 8,192 | 41.8 | 26.9 |
+| 4B | 24,000 | 33.9 | 22.1 |
+| 9B | 512 | 26.2 | 18.2 |
+| 9B | 8,192 | 24.4 | 16.9 |
+| 9B | 24,000 | does not fit (its maximum on 3 GB is 12,032) | does not fit |
+
+- Each figure is the median of three complete passes, and the three agree within 0.1%. The prompt is the same
+  24,576 token ids for the three models, read in chunks of 128 tokens (the automatic value on sm_30).
+- The 9B does not reach 24,000 tokens on this card: with `KINDI_MEM_RESERVE_MB=256` its context fits 12,032
+  tokens (208 MiB free). With the default reserve of 96 MB it fits 17,152 and leaves 46 MiB free.
+- llama.cpp has no rows at 512 tokens and above on this card: at 128 tokens its prompt path already takes 100 s
+  (1.28 tokens/s), the same `mul_mm` cliff documented for the K420.
+
+llama.cpp on the same card and file, at the sizes that are practical there:
+
+| llama.cpp (Vulkan, PTQ1_0) | tokens/s |
+|---|---:|
+| pp64 | 24.5 |
+| pp128 | 1.28 |
+| tg128 | 6.03 |
+
+- With llama.cpp's Q2_0 file of the 2B (a different file, about 28 % more bytes per token): pp64 64.7 and
+  tg128 10.8. The PTQ1_0 numbers above are the same-file comparison.
+- The card is sm_30, so llama.cpp runs with Vulkan here for the reason in "Why llama.cpp runs with Vulkan on the
+  Kepler and Maxwell cards".
+
 ## Quadro K1200, 4 GB, one card · 2B, 4B and 9B
 
 2026-10-23 (Kindi) and 2026-10-22 (llama.cpp). Kindi 0.2.0, ctx 24,576, f16 K/V, chunked prompt reading. llama.cpp: Prism ML's fork,

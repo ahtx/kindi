@@ -40,6 +40,25 @@ Replace `...` with the variables in the section for your card. To use one card o
 | variables | `KINDI_CTX=65536` for the 2B, `KINDI_CTX=24576` for the 4B |
 | generation | 2B: 21.2 tokens/s (exact head), 24.8 (fast head); 4B: 9.8 tokens/s |
 
+## Quadro K4000, 3 GB (Kepler, sm_30)
+
+| item | value |
+|---|---|
+| models | 2B (`/data/pack`), 4B (`/data/pack4b`) or 9B (`/data/pack9b`); `kindi verify` is ALL PASS on the three |
+| variables | `KINDI_CTX=65536` for the 2B, `KINDI_CTX=24576` for the 4B, `KINDI_CTX=12032` with `KINDI_MEM_RESERVE_MB=256` for the 9B |
+| generation | 2B: 63.3 tokens/s at 512 tokens (exact head), 48.4 at 24K; 4B: 30.3 and 22.1; 9B: 18.2 at 512 and 16.4 at 11.9K |
+| prompt reading | 2B: 122.1 tokens/s at 512 tokens, 108.9 at 8K, 89.5 at 24K (one token at a time: 78.0); 4B: 47.3, 41.8, 33.9; 9B: 26.2 at 512 and 24.4 at 8K |
+
+- Four SMX. The prompt path uses chunks of 128 tokens on this card, as on the K420.
+- 65,536 tokens leaves 1,664 MiB of the 3 GB free; 131,072 loads and runs with 876 MiB free.
+- The 4B fits 50,688 tokens with `KINDI_MEM_RESERVE_MB=256`; 49,152 leaves 259 MiB.
+- The 9B fits 12,032 tokens with `KINDI_MEM_RESERVE_MB=256` (208 MiB free), and 17,152 with the default
+  reserve of 96 MB (46 MiB free). Use 12,032.
+- `KINDI_BLOCKING_SYNC=0` makes no measurable difference here: 64.2 tokens/s with and without.
+- The card reports as `Quadro K4000`; the installer picks the Kepler profile for it.
+- The card is sm_30, so llama.cpp runs with Vulkan here (see [BENCHMARKS.md](BENCHMARKS.md)): at 128 tokens its
+  prompt path already reads at 1.28 tokens/s.
+
 ## Quadro K1200, 4 GB (Maxwell, sm_50)
 
 | item | value |
