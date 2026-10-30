@@ -211,6 +211,24 @@ In the 380 W column, Kindi is the dev build release-tcspec6 (2026-10-22): its ex
 With the draft model, Kindi's greedy output is the same as without it (30 of 30 prompts). llama.cpp 1180918 does
 not load the 2B as a draft model for the 27B: the two files have different Hadamard metadata.
 
+## GeForce RTX 4060 Laptop, 8 GB · Ternary-Bonsai-2-27B, tensor-core chunk attention
+
+2026-10-30. One long prompt (39,292 tokens) on an RTX 4060 Laptop (Ada, sm_89, 8 GB, 60 W cap), driver 580.178.04,
+Kindi 0.3.0, exact head, q8_0 K/V, greedy (temperature 0, seed 42). The same prompt before and after; the greedy
+output was token-for-token identical in both runs.
+
+The default chunked prompt path runs the attention and the chunk GEMM on the general CUDA cores. Enabling the
+tensor-core plans (`KINDI_TC=1 KINDI_ATT_TC=1`) moves both onto the tensor cores; the attention arithmetic stays
+bit-identical, so the output does not change.
+
+| Path | Context | Attention GPU time | Chunk GEMM GPU time | Prompt GPU time | Prompt read |
+|---|---|---:|---:|---:|---:|
+| default | 64,512 | 67.17 s (30.9%) | 127.43 s (58.7%) | 217.18 s | 225.88 s (173.9 tok/s) |
+| `KINDI_TC=1 KINDI_ATT_TC=1` | 55,040 | 39.05 s (39.0%) | 37.11 s (37.1%) | 100.10 s | 109.73 s (358.1 tok/s) |
+
+On this card the tensor-core path about halves the prompt read time. The trade-off is VRAM: the tensor-core plans
+and buffers cost about 400 MiB, so the context falls from 64,512 to 55,040 tokens on 8 GB.
+
 ## Why llama.cpp runs with Vulkan on the Kepler and Maxwell cards
 
 The K420 has compute capability 3.0 (sm_30). CUDA 11 and later cannot compile code for it, and current llama.cpp
