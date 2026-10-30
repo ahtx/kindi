@@ -185,6 +185,9 @@ curl -s localhost:8093/health
 The server listens on `127.0.0.1:8093` (natively) or on the port you publish (Docker). To serve your network, publish
 `-p 8093:8093` (Docker) or set `host = 0.0.0.0`, and set an `api_key`.
 
+To watch the server's activity (throughput, GPU memory, prompt-cache hit ratio) in a Grafana dashboard, see
+[docs/MONITORING.md](docs/MONITORING.md).
+
 ## Use it
 
 The endpoint is `http://localhost:8093/v1`, the model id `bonsai2-2b` (configurable).

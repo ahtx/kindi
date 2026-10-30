@@ -1,0 +1,63 @@
+services:
+  kindi:
+    image: kindi:0.3.0
+    restart: unless-stopped
+    # NVIDIA (requires the NVIDIA Container Toolkit on the host):
+    gpus: all
+    # AMD RDNA3 (replace the `gpus: all` line with these; see docs/DOCKER.md):
+    # devices:
+    #   - /dev/kfd:/dev/kfd
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - "44"    # video
+    #   - "104"   # render
+    # environment:
+    #   - HSA_OVERRIDE_GFX_VERSION=11.0.2
+    #   - HSA_ENABLE_SDMA=0
+    environment:
+      - KINDI_HOST=0.0.0.0
+    # Bound to loopback for safety; use "8093:8093" (and set KINDI_API_KEY) to serve the LAN.
+    ports:
+      - "127.0.0.1:8093:8093"
+    volumes:
+      - ${KINDI_DATA_DIR:-~/.kindi}:/data
+
+  json-exporter:
+    image: quay.io/prometheuscommunity/json-exporter:latest
+    restart: unless-stopped
+    volumes:
+      - ./json-exporter.yml:/config.yml:ro
+    command: ["--config.file=/config.yml"]
+    depends_on:
+      - kindi
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - json-exporter
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_LOG_LEVEL=warn
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  grafana-data:

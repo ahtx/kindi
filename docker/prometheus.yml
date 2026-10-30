@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Prometheus' own metrics.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Kindi's JSON /health, fetched through the json-exporter sidecar.
+  - job_name: kindi
+    metrics_path: /probe
+    params:
+      module: [default]
+    static_configs:
+      - targets:
+          - http://kindi:8093/health
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: json-exporter:7979

@@ -1,0 +1,42 @@
+# Translates Kindi's JSON GET /health into Prometheus metrics. See docker-compose.yml.
+#
+# The exporter is gauge-only: the cumulative counters in `stats` are emitted as gauges, so use
+# rate()/increase() in PromQL rather than expecting counter types.
+modules:
+  default:
+    metrics:
+    - name: kindi_uptime_s
+      path: '{ .uptime_s }'
+      help: Kindi server uptime in seconds
+      labels:
+        model: '{ .model }'
+        head: '{ .head }'
+    - name: kindi_gpu_free_mib
+      path: '{ .gpu_free_mib }'
+      help: Free GPU memory in MiB
+      allow_missing_key: true
+    - name: kindi_gpu_total_mib
+      path: '{ .gpu_total_mib }'
+      help: Total GPU memory in MiB
+      allow_missing_key: true
+    - name: kindi_stats
+      type: object
+      path: '{ .stats }'
+      help: Cumulative request, token and timing counters
+      values:
+        requests: '{ .requests }'
+        prompt_tokens: '{ .prompt_tokens }'
+        cached_tokens: '{ .cached_tokens }'
+        completion_tokens: '{ .completion_tokens }'
+        prefill_seconds: '{ .prefill_seconds }'
+        decode_seconds: '{ .decode_seconds }'
+    - name: kindi_busy
+      type: object
+      path: '{ .busy }'
+      help: Live request progress (present only while a request is running)
+      allow_missing_key: true
+      values:
+        elapsed_s: '{ .elapsed_s }'
+        prompt_tokens: '{ .prompt_tokens }'
+        reused: '{ .reused }'
+        generated: '{ .generated }'

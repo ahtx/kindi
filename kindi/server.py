@@ -93,7 +93,8 @@ class Kindi(object):
             self.runner = Runner(self.eng, cfg, self.pack_id, log, progress=self.busy)
             self.sample = Sampler(self.eng)
         self.lock = threading.Lock()
-        self.stats = {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
+        self.stats = {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0,
+                      "prefill_seconds": 0.0, "decode_seconds": 0.0}
         self.t0 = time.time()
 
     def head_mode(self):
@@ -253,6 +254,8 @@ class Kindi(object):
         self.stats["prompt_tokens"]+=len(ids)
         self.stats["cached_tokens"]+=self.busy.get("cached",0)
         self.stats["completion_tokens"]+=len(generated)
+        self.stats["prefill_seconds"]+=prompt_done-started
+        self.stats["decode_seconds"]+=elapsed
         self.log("Gemma 4 done: %d tokens in %.1fs (%.1f tok/s, %s)"%
                  (len(generated),elapsed,len(generated)/elapsed,finish))
         raw=(gemma4_tools.THINK_OPEN+"thought\n" if thinking_open else "")+"".join(content)
@@ -411,6 +414,8 @@ class Kindi(object):
         for k, v in (("requests", 1), ("prompt_tokens", len(T)), ("cached_tokens", cached),
                      ("completion_tokens", len(gen))):
             self.stats[k] += v
+        self.stats["prefill_seconds"] += t1 - t0
+        self.stats["decode_seconds"] += t2 - t1
         reasoning = ""
         if "</think>" in text:
             reasoning, text = text.split("</think>", 1)
