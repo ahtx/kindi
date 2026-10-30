@@ -81,6 +81,31 @@ Prism fork (ROCm build) for the 27B, upstream b10700 (ROCm build) for Nemotron. 
 With the 27B, Kindi reads 1.5 to 1.7 times as fast at each context and writes 1.03, 1.17 and 1.43 times as fast.
 Kindi's Nemotron support is experimental, and we are still optimizing it; on this chip llama.cpp is faster with it.
 
+### GeForce RTX 4060 Laptop, 8 GB
+
+2026-10-30. RTX 4060 Laptop GPU (AD107, Ada Lovelace, sm_89), 8 GB, driver 580.178.04 on an Ubuntu 24.04 host.
+Kindi 0.3.0 (`kindi:0.3.0`), the default 24,576-token context, exact head, 5-trit lane weights. Model file
+Ternary-Bonsai-2-27B-PTQ1_0.gguf, sha256 53107f53…. One stream, greedy. llama.cpp was not measured on this card.
+
+`kindi bench`, generation at each position:
+
+| Position | Kindi write |
+|---|---:|
+| 100 | 28.0 |
+| 2,000 | 27.8 |
+| 8,000 | 27.6 |
+| 16,000 | 25.5 |
+| 24,000 | 25.2 |
+
+- Prompt reading: 31.2 tokens/s (the 1,000-token prompt of `kindi bench`).
+- `kindi verify`: ALL PASS, token-exact with llama.cpp over 4 prompts × 40 tokens (all 40/40), 29.3 tokens/s over
+  the run.
+- The 24,576-token context leaves 1,367 MiB free.
+- Generation is about the same as the GTX 1080's (27.9 tokens/s at 512 tokens in the table above), despite the newer
+  compute: the 4060 Laptop has a 128-bit memory bus and the GTX 1080 a 256-bit one.
+- Prompt reading is the outlier: 31.2 tokens/s against 254.0 on the GTX 1080 and 1,093 on the RTX 3080 at 512
+  tokens. The chunked prompt path may not map well onto sm_89, or the narrow bus dominates.
+
 ## Quadro K6000, 12 GB
 
 2026-10-25. Quadro K6000 12 GB (Kepler GK110, sm_35) passed through to a KVM virtual machine on a dual Xeon E5-2673 v4 host, NVIDIA driver 470.256.02. The same model files and the same token ids for both engines, greedy, 32 tokens of write at each depth. Kindi 0.3.0 development build (597d2d8) in the CUDA 10.2 image, q8_0 K/V for the 27B, f16 for Nemotron. llama.cpp: Vulkan builds (the Prism fork for the 27B, upstream 1b29621 for Nemotron), `-ngl 99 -fa on`. Read / write tokens/s:

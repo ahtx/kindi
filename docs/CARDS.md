@@ -136,6 +136,28 @@ reading 1,093 tokens/s at 512 to 855 at 22K.
 - The cluster runs seven servers on one 4-core host with `--memory 6g`. One server on a computer of its own can use
   the default budgets.
 
+## GeForce RTX 4060 Laptop, 8 GB (Ada Lovelace, sm_89)
+
+| item | value |
+|---|---|
+| model | Ternary-Bonsai-2-27B |
+| variables | `KINDI_PACK=/data/pack27b`, `KINDI_CTX=24576` (the default), `KINDI_HEAD=exact` |
+| generation | 28.0 tokens/s at 100 tokens, 27.6 at 8K, 25.2 at 24K |
+| prompt reading | 31.2 tokens/s (the `kindi bench` 1,000-token prompt) |
+
+- `kindi verify` is ALL PASS: 4 prompts × 40 tokens, all 40/40 token-exact with llama.cpp, 29.3 tokens/s over the
+  run.
+- A context of 24,576 leaves 1,367 MiB free.
+- The first sm_89 card in this list. The stock 0.3.0 image (Ubuntu 18.04, CUDA 10.2 toolkit) runs unchanged on
+  driver 580.178.04.
+- Generation is close to the GTX 1080's 28.4 tokens/s: this card has a 128-bit memory bus and the GTX 1080 a 256-bit
+  one.
+- Prompt reading is far below the GTX 1080 (254 tokens/s at 512 tokens) and the RTX 3080 (1,093 tokens/s with the
+  tensor-core profile) on the same model. The chunked prompt path may not map well onto sm_89, or the narrow bus
+  dominates.
+- The installer selects its `pascal8` profile for this 8 GB card and asks for 65,536 tokens; the figures above use
+  the default 24,576.
+
 ## CPU (x86-64 with AVX2)
 
 | item | value |
