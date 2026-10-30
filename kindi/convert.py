@@ -75,6 +75,21 @@ def convert(gguf_path, out_dir, log=print):
     t0 = time.time()
     selftest()
     g = GGUF(gguf_path)
+    if g.kv.get("general.architecture") == "nemotron_h_moe":
+        from .packed import PackedFile
+        from .lightning import ModelSpec
+        source = PackedFile(gguf_path)
+        spec = ModelSpec(source.gguf)
+        manifest = {"kindi_version": __version__, "pack_format": 1, "backend": "kindi_lightning",
+            "model": g.kv.get("general.name"), "model_id": "nemotron-lightning-30b-a3b-ternary",
+            "model_path": os.path.abspath(gguf_path), "source_sha256": source.source_hash(),
+            "context_length": spec.max_context, "tensor_count": len(source.tensors), "source_file": os.path.basename(gguf_path),
+            "adapter": "nota_nemotron_3_5_lightning", "router": "sigmoid_corrected_topk", "expert_activation": "relu2",
+            "position_encoding": "none", "weight_storage": "gguf_q2_0_q8_0_f32"}
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "kindi_pack.json"), "w") as f: json.dump(manifest, f, indent=2)
+        log("recognized Lightning GGUF; native Kindi CUDA backend")
+        return manifest
     if g.kv.get("general.architecture") == "gemma4":
         from .gemma4 import inspect_model
         info = inspect_model(gguf_path)

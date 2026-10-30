@@ -462,6 +462,13 @@ def _make_engine(cfg, log):
 
 
 def create_app(cfg, log=print):
+    manifest_path = os.path.join(cfg["pack"], "kindi_pack.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        if manifest.get("backend") == "kindi_lightning":
+            from .lightning_server import create_app as lightning_app
+            return lightning_app(cfg, log)
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse, StreamingResponse
 

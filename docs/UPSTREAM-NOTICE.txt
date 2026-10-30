@@ -1,0 +1,25 @@
+Kindi 0.1.0 - third-party notices
+
+Kindi is licensed under the GNU Affero General Public License v3.0 (see LICENSE). Commercial licenses are
+available (see COMMERCIAL-LICENSE.md).
+
+Kindi is distributed without any model weights or third-party code. It is designed to be used with, and at run time
+depends on, the following, which are obtained separately and governed by their own licenses:
+
+Ternary-Bonsai-2-2B (model weights, GGUF)          Apache License 2.0
+  Copyright Prism ML. Derived from Qwen3.5-2B (Qwen team, Alibaba Cloud), Apache License 2.0.
+  https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf
+  `kindi convert` re-lays out the weights of a file you download; it does not alter them. If you redistribute a
+  converted pack, the Apache License 2.0 terms of the model apply to it.
+
+CuPy                                                MIT License (Preferred Networks, Inc. and Preferred Infrastructure)
+NumPy                                               BSD 3-Clause License (NumPy Developers)
+FastAPI                                             MIT License (Sebastian Ramirez)
+Uvicorn                                             BSD 3-Clause License (Encode OSS Ltd.)
+Pydantic                                            MIT License (Samuel Colvin and contributors)
+NVIDIA CUDA Toolkit 10.2                            NVIDIA CUDA Toolkit End User License Agreement
+                                                    (downloaded from NVIDIA when the Docker image is built)
+
+Interoperability: Kindi reads the GGUF file format and reproduces the numerical behaviour and the tokenizer of
+llama.cpp (MIT License, the ggml authors) for this model, so that its output can be checked against llama.cpp's. The
+reference outputs in kindi/reference.json were produced with llama.cpp. No llama.cpp source code is included.

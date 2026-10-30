@@ -1,3 +1,37 @@
+Kindi 0.3.0 + Lightning backend V3 — notices
+
+Original Kindi: Copyright (c) 2026 Amir Husain.
+https://github.com/ahtx/kindi
+Modified fork maintained by slavalevski-tech; modifications dated 2026-10-30.
+This fork's program code is licensed under AGPL-3.0-only; see LICENSE and
+MODIFICATIONS.md. No warranty is provided. This fork is not an official
+release or endorsement by Amir Husain, NVIDIA, Nota AI or boro64.
+
+The unchanged commercial-licensing information in COMMERCIAL-LICENSE.md
+refers to the original Kindi author's offering. It is not an alternative
+license grant for this fork's additional contributions or third-party models.
+
+Lightning model provenance (weights are NOT distributed here):
+NVIDIA NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  -> Nota AI ternary checkpoint
+  -> boro64 GGUF conversion.
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+The model is separately governed by OpenMDW 1.1; the accompanying notice is
+retained in licenses/Nemotron-OpenMDW-1.1.txt. See MODEL.md for pinned sources.
+The small lightning_reference*.npz files contain numerical validation outputs,
+not model parameters. We did not train or modify the selected GGUF weights.
+
+Reference implementations consulted during development: MLX-LM (Apple, MIT)
+and llama.cpp (ggml authors, MIT). They are not the production inference
+runtime and their source files are not included in this release. Jinja2
+(Pallets, BSD-3-Clause) and MarkupSafe (Pallets, BSD-3-Clause) are separately
+installed runtime dependencies. Preserve dependency licenses when distributing
+an image; this repository's AGPL does not replace those licenses.
+
+Original upstream notice, preserved verbatim below (including its historical
+0.1.0 heading). The opening "no third-party code" statement refers to the
+upstream source distribution, not the separately installed Docker dependencies.
+
 Kindi 0.1.0 - third-party notices
 
 Kindi is licensed under the GNU Affero General Public License v3.0 (see LICENSE). Commercial licenses are

@@ -1,0 +1,19 @@
+# Lightning V3 public example, 2026-10-30; no credentials included.
+[kindi]
+pack = /workspace/pack
+state_dir = /workspace/state
+host = 0.0.0.0
+port = 8093
+model_name = nemotron-lightning-30b-a3b-ternary
+ctx = 32768
+head = exact
+lightning_kv = fp32
+checkpoint_budget_mb = 512
+prefix_max = 8
+prefix_min = 512
+max_tokens = 1024
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+# Set a private api_key in .local/kindi.conf before exposing inference beyond localhost.
+# api_key = choose-your-own-secret

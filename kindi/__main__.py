@@ -45,6 +45,8 @@ def cmd_convert(cfg, a):
     manifest = convert(a.gguf, out, log=log)
     if manifest.get("backend") == "kindi_gemma4":
         log("Gemma 4 model ready for Kindi native CUDA inference")
+    elif manifest.get("backend") == "kindi_lightning":
+        log("Lightning model ready; validate with: kindi verify")
     else:
         log("next: kindi verify")
     return 0
@@ -52,6 +54,8 @@ def cmd_convert(cfg, a):
 
 def cmd_fast_head(cfg, a):
     _setup_gpu_env(cfg)
+    from .lightning_cli import selected
+    if selected(cfg):raise SystemExit("kindi: Lightning supports the exact full-vocabulary head")
     manifest_path=os.path.join(cfg["pack"],"kindi_pack.json")
     manifest=json.load(open(manifest_path)) if os.path.isfile(manifest_path) else {}
     if manifest.get("backend")=="kindi_gemma4":
@@ -66,12 +70,16 @@ def cmd_fast_head(cfg, a):
 
 def cmd_verify(cfg, a):
     _setup_gpu_env(cfg)
+    from .lightning_cli import selected, verify
+    if selected(cfg):return verify(cfg,log=log)
     from .verify import run
     return run(cfg, log=log)
 
 
 def cmd_bench(cfg, a):
     _setup_gpu_env(cfg)
+    from .lightning_cli import selected, bench
+    if selected(cfg):return bench(cfg,log=log)
     from .bench import run
     return run(cfg, log=log)
 
@@ -85,6 +93,8 @@ def cmd_serve(cfg, a):
 
 def cmd_chat(cfg, a):
     _setup_gpu_env(cfg)
+    from .lightning_cli import selected, chat
+    if selected(cfg):return chat(cfg,a,log=log)
     from .server import Kindi
     K = Kindi(cfg, log=log)
     msgs = []
@@ -118,6 +128,10 @@ def cmd_chat(cfg, a):
 
 
 def cmd_head(cfg, a):
+    from .lightning_cli import selected
+    if selected(cfg):
+        if a.mode!='exact':raise SystemExit("kindi: Lightning supports the exact full-vocabulary head")
+        log("Lightning head: exact");return 0
     os.makedirs(cfg["state_dir"], exist_ok=True)
     if a.mode == "fast" and not os.path.exists(os.path.join(cfg["pack"], "head_clusters.npz")):
         raise SystemExit("kindi: the fast head needs the cluster file - run: kindi fast-head")
@@ -152,6 +166,8 @@ def cmd_info(cfg, a):
             print("backend: Kindi Gemma 4 CUDA")
             print("fast head: %s" % ("available" if os.path.exists(os.path.join(cfg["pack"],"head_clusters.npz"))
                                      else "not built (kindi fast-head)"))
+        elif m.get("backend") == "kindi_lightning":
+            print("backend: native Kindi Lightning CUDA; exact head; FP32 state/KV")
         else:
             print("fast head: %s" % ("available" if os.path.exists(os.path.join(cfg["pack"], "head_clusters.npz"))
                                      else "not built (kindi fast-head)"))
@@ -187,6 +203,7 @@ def main(argv=None):
     p.add_argument("--pack")
     p.add_argument("--state-dir", dest="state_dir")
     p.add_argument("--ctx", type=int)
+    p.add_argument('--lightning-kv',choices=('fp32','fp16','q8_0'))
     p.add_argument("--version", action="version", version="kindi " + __version__)
     sub = p.add_subparsers(dest="cmd")
     s = sub.add_parser("convert", help="build the weight pack from the GGUF")
@@ -218,7 +235,7 @@ def main(argv=None):
     if not a.cmd:
         p.print_help()
         return 1
-    ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head")}
+    ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head", "lightning_kv")}
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,

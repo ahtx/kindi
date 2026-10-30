@@ -1,3 +1,14 @@
+# Fork release: Kindi 0.3.0 + Lightning backend V3 — 2026-10-30
+
+- Native Lightning30B-A3B backend; tile16 prefill, split attention,32K acceptance.
+- Preserve original Kindi author attribution and AGPL-3.0-only notices.
+- Publish source-build recipe, neutral launch/config examples and exact V3 defaults.
+- Add complete corresponding-source and legal-notice routes for the Lightning API.
+- No model weights; no internal host administration scripts or private configuration.
+- Publication build/GPU validation status is recorded separately in VALIDATION.md.
+
+## Original upstream changelog (preserved)
+
 # Changelog
 
 ## 0.3.0 (2026-10-28)

@@ -20,6 +20,7 @@ DEFAULTS = {
     "model_name": "auto",              # infer the reported id from the selected pack
     # engine
     "ctx": "24576",                     # requested context; each backend clamps it to available device memory
+    "lightning_kv": "fp32",             # native Lightning only: fp32 | fp16 | q8_0
     "head": "exact",                    # exact | fast (shortlist head, ~15% faster, approximate)
     "fast_clusters": "256",             # clusters scored by the fast head
     # prompt cache
@@ -101,7 +102,7 @@ def load(explicit=None, overrides=None):
     if cfg["model_name"] == "auto":
         manifest = os.path.join(cfg["pack"], "kindi_pack.json")
         m = json.load(open(manifest)) if os.path.isfile(manifest) else {}
-        if m.get("backend") == "kindi_gemma4":
+        if m.get("backend") in ("kindi_gemma4", "kindi_lightning"):
             cfg["model_name"] = m.get("model_id", "gemma4")
         else:
             # the GGUF's general.name, then its file name: some files name the model only "Hf"
@@ -113,5 +114,6 @@ def load(explicit=None, overrides=None):
             cfg["model_name"] = "bonsai2-%sb" % (size.group(1) if size else "2")
     if cfg["head"] not in ("exact", "fast"):
         raise SystemExit("kindi: head must be exact or fast, not %r" % cfg["head"])
+    if cfg['lightning_kv'] not in ('fp32','fp16','q8_0'):raise SystemExit('kindi: invalid Lightning KV format')
     cfg["source"] = source or "(built-in defaults)"
     return cfg

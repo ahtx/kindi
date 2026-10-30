@@ -6,7 +6,9 @@ language modelling.
 import os
 import subprocess
 
-VERSION = "0.3.0"
+UPSTREAM_VERSION = "0.3.0"
+LIGHTNING_BACKEND_VERSION = "V3"
+VERSION = "0.3.0-lightning-v3"
 
 
 def _commit():

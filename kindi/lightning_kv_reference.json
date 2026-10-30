@@ -1,0 +1,26 @@
+[
+  {
+    "kv": "fp16",
+    "file": "lightning_reference-fp16.npz",
+    "sha256": "1dd168b65f47c3db7d28d3bc0d12594e5b28e2cd1efc012e351866991aebaa44",
+    "oracle": "PyTorch, native prequantization K/V supplied at lossy storage boundaries; independent quantization and other operations",
+    "source_evidence": "full-fp16-aligned-rtx4080.json.npz",
+    "tokens": [
+      1,
+      22177,
+      1046
+    ]
+  },
+  {
+    "kv": "q8_0",
+    "file": "lightning_reference-q8_0.npz",
+    "sha256": "8a4f050649a6291a7f46eb623776e07768ecb64b92f9a5925d81452a09a871e1",
+    "oracle": "PyTorch, native prequantization K/V supplied at lossy storage boundaries; independent quantization and other operations",
+    "source_evidence": "full-q8-aligned-rtx4080.json.npz",
+    "tokens": [
+      1,
+      22177,
+      1046
+    ]
+  }
+]

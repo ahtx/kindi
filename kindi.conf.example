@@ -15,6 +15,8 @@ model_name = auto
 
 # --- engine
 ctx = 24576
+# Native Lightning adapter only: fp32 | fp16 | q8_0. All arithmetic and Mamba state stay FP32.
+lightning_kv = fp32
 head = exact
 fast_clusters = 256
 # --- prompt cache

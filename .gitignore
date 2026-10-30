@@ -16,3 +16,21 @@ __pycache__/
 *.log
 .vscode/
 .idea/
+
+# Publication excludes private state, archives and model binaries.
+.local/
+*.safetensors
+*.pth
+*.pt
+*.pem
+*.key
+*.zip
+*.tar
+*.tar.gz
+*.bundle
+.env.*
+!.env.example
+# These three small arrays are validation outputs, not model weights.
+!kindi/lightning_reference.npz
+!kindi/lightning_reference-fp16.npz
+!kindi/lightning_reference-q8_0.npz

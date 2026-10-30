@@ -1,0 +1,38 @@
+services:
+  lightning:
+    build:
+      context: .
+      dockerfile: Dockerfile.lightning
+    image: kindi-lightning:v3-publication
+    ports:
+      - "127.0.0.1:${LIGHTNING_PORT:-18095}:8093"
+    environment:
+      KINDI_LIGHTNING_KERNELS: optimized
+      KINDI_LIGHTNING_DENSE_PREFILL: tile16
+      KINDI_LIGHTNING_EXPERT_PREFILL: tile16
+      KINDI_LIGHTNING_ATTENTION: split
+      KINDI_LIGHTNING_PREFILL_CHUNK: "128"
+    volumes:
+      - type: bind
+        source: ${MODEL_DIRECTORY:?Set MODEL_DIRECTORY to your existing GGUF directory}
+        target: /models
+        read_only: true
+      - ./.local/kindi.conf:/release/config/kindi.conf:ro
+      - ./.local/pack:/workspace/pack
+      - ./.local/state:/workspace/state
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_DEVICE:-0}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8093/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
