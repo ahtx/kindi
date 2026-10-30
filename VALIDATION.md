@@ -53,4 +53,5 @@ lines are retained. CUDA kernels match accepted development V3 after line-ending
 fixtures contain numerical outputs, not model weights. The explicit manifest and
 selected secret/host-pattern checks pass; pattern scanning is not a universal
 proof of absence of secrets. Internal infrastructure logs/configuration are not
-part of this public source payload. No GitHub repository or image was published.
+part of this public source payload. The installation test did not publish images;
+this repository distributes the backend source only.
