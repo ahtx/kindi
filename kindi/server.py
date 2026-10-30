@@ -134,22 +134,13 @@ class Kindi(object):
         return int(self.cp.argmax(logits).item())
 
     def _generate_gemma(self,req,cancel=None):
-        from .gemma4_chat import render as render_gemma
         from . import gemma4_tools
-        cfg=self.cfg; messages=gemma4_tools.prepare_messages(req.get("messages") or [])
+        cfg=self.cfg
         self.eng.shortlist=cfg["fast_clusters"] if self.head_mode()=="fast" and self.eng.fast_centroids is not None else 0
-        tools=req.get("tools") or None
-        if req.get("tool_choice")=="none": tools=None
-        kw=dict(req.get("chat_template_kwargs") or {})
-        kw["enable_thinking"]=bool(kw.get("enable_thinking",req.get("enable_thinking",False)))
-        kw["conversational_mode"]=bool(kw.get("conversational_mode",False))
-        prompt=render_gemma(self.model_path,messages,tools,kw,True)
+        p=self._render_gemma_prompt(req)
+        prompt,ids,tools=p["prompt"],p["ids"],p["tools"]
         thinking_open=prompt.endswith(gemma4_tools.THINK_OPEN+"thought\n")   # after a tool response, thinking on
         sorter=gemma4_tools.Stream(thinking_open)
-        ids=self.tok.encode(prompt)
-        if not ids: raise ValueError("Gemma 4 chat template produced an empty prompt")
-        if len(ids)>=self.eng.ctx:
-            raise OverflowError("the Gemma 4 prompt has %d tokens; context is %d"%(len(ids),self.eng.ctx))
         max_new=int(req.get("max_tokens") or req.get("max_completion_tokens") or cfg["max_tokens"])
         max_new=max(1,min(max_new,self.eng.ctx-len(ids)))
         temperature=float(req.get("temperature",cfg["temperature"]))
@@ -268,6 +259,48 @@ class Kindi(object):
           "timing":{"prompt_s":round(prompt_done-started,2),"prompt_new_tokens":len(ids),
                     "gen_s":round(elapsed,2),"gen_tok_s":round(len(generated)/elapsed,2)}}
 
+    def _render_prompt(self, req):
+        """Render and tokenise the request's prompt. Raises OverflowError when the prompt does not fit the
+        context and ValueError when the chat template produced an empty prompt. Called once by the request
+        handler to reject an overflowing prompt with a clean error before the response starts, and again at
+        the start of generate()."""
+        if self.native:
+            return self._render_gemma_prompt(req)
+        cfg = self.cfg
+        messages = req.get("messages") or []
+        tools = req.get("tools") or None
+        if req.get("tool_choice") == "none":
+            tools = None
+        think = bool((req.get("chat_template_kwargs") or {}).get("enable_thinking", req.get("enable_thinking", False)))
+        kw = req.get("chat_template_kwargs") or {}
+        effort = req.get("reasoning_effort") or kw.get("reasoning_effort") or cfg.get("reasoning_effort") or None
+        body, gp = chat.render(messages, tools, think, variant=self.variant, reasoning_effort=effort,
+                               preserve_thinking=kw.get("preserve_thinking"))
+        Tb = self.tok.encode(body)
+        T = Tb + self.tok.encode(gp)
+        ctx = self.eng.ctx
+        if len(T) + 1 >= ctx:
+            raise OverflowError("the prompt has %d tokens; the context is %d" % (len(T), ctx))
+        return {"T": T, "Tb": Tb, "ctx": ctx, "think": think, "tools": tools}
+
+    def _render_gemma_prompt(self, req):
+        from .gemma4_chat import render as render_gemma
+        from . import gemma4_tools
+        messages = gemma4_tools.prepare_messages(req.get("messages") or [])
+        tools = req.get("tools") or None
+        if req.get("tool_choice") == "none":
+            tools = None
+        kw = dict(req.get("chat_template_kwargs") or {})
+        kw["enable_thinking"] = bool(kw.get("enable_thinking", req.get("enable_thinking", False)))
+        kw["conversational_mode"] = bool(kw.get("conversational_mode", False))
+        prompt = render_gemma(self.model_path, messages, tools, kw, True)
+        ids = self.tok.encode(prompt)
+        if not ids:
+            raise ValueError("Gemma 4 chat template produced an empty prompt")
+        if len(ids) >= self.eng.ctx:
+            raise OverflowError("the Gemma 4 prompt has %d tokens; context is %d" % (len(ids), self.eng.ctx))
+        return {"ids": ids, "prompt": prompt, "tools": tools}
+
     def generate(self, req, cancel=None):
         """Yields ("text", piece) while generating, then ("done", info). cancel: a threading.Event set when the
         client disconnects (prompt reading and generation stop at the next token)."""
@@ -275,13 +308,6 @@ class Kindi(object):
             yield from self._generate_gemma(req,cancel)
             return
         cfg = self.cfg
-        messages = req.get("messages") or []
-        tools = req.get("tools") or None
-        if req.get("tool_choice") == "none":
-            tools = None
-        think = bool((req.get("chat_template_kwargs") or {}).get("enable_thinking", req.get("enable_thinking", False)))
-        budget = req.get("thinking_budget_tokens") or req.get("thinking_budget") or cfg.get("thinking_budget") or 0
-        budget = int(budget) if think else 0
         g = lambda k, d: d if req.get(k) is None else req.get(k)  # noqa: E731
         temperature = float(g("temperature", cfg["temperature"]))
         top_p = float(g("top_p", cfg["top_p"]))
@@ -297,15 +323,10 @@ class Kindi(object):
         self.eng.shortlist = cfg["fast_clusters"] if fast else 0
         seed = req.get("seed")
         rng = np.random.RandomState(seed if seed is not None else int(time.time() * 1000) % 2 ** 31)
-        kw = req.get("chat_template_kwargs") or {}
-        effort = req.get("reasoning_effort") or kw.get("reasoning_effort") or cfg.get("reasoning_effort") or None
-        body, gp = chat.render(messages, tools, think, variant=self.variant, reasoning_effort=effort,
-                               preserve_thinking=kw.get("preserve_thinking"))
-        Tb = self.tok.encode(body)
-        T = Tb + self.tok.encode(gp)
-        ctx = self.eng.ctx
-        if len(T) + 1 >= ctx:
-            raise OverflowError("the prompt has %d tokens; the context is %d" % (len(T), ctx))
+        p = self._render_prompt(req)
+        T, Tb, ctx, think, tools = p["T"], p["Tb"], p["ctx"], p["think"], p["tools"]
+        budget = req.get("thinking_budget_tokens") or req.get("thinking_budget") or cfg.get("thinking_budget") or 0
+        budget = int(budget) if think else 0
         max_new = max(1, min(max_new, ctx - len(T) - 1))
         t0 = time.time()
         self.busy.update(active=True, phase="matching cache", prompt_tokens=len(T), cached=0, read=0, generated=0,
@@ -469,8 +490,8 @@ def create_app(cfg, log=print):
     model_id = cfg["model_name"]
     app = FastAPI(title="Kindi", version=__version__)
 
-    def _err(code, msg, typ="invalid_request_error"):
-        return JSONResponse({"error": {"message": msg, "type": typ, "code": typ}}, status_code=code)
+    def _err(code, msg, typ="invalid_request_error", err_code=None):
+        return JSONResponse({"error": {"message": msg, "type": typ, "code": err_code or typ}}, status_code=code)
 
     def _auth(request):
         key = cfg["api_key"]
@@ -517,6 +538,16 @@ def create_app(cfg, log=print):
 
         cancel = threading.Event()
 
+        # Reject a prompt that does not fit the context before the response starts, so the client gets a
+        # proper 400 context_length_exceeded instead of a 200 stream that ends without a completion.
+        try:
+            await asyncio.get_event_loop().run_in_executor(GPU_THREAD, K._render_prompt, req)
+        except OverflowError as e:
+            log("context length exceeded: %s" % e)
+            return _err(400, str(e), "invalid_request_error", "context_length_exceeded")
+        except ValueError as e:
+            return _err(400, str(e))
+
         if req.get("stream"):
             def sse():
                 with K.lock:
@@ -554,7 +585,9 @@ def create_app(cfg, log=print):
                                 inc = (req.get("stream_options") or {}).get("include_usage")
                                 yield chunk({}, info["finish"], info["usage"] if inc else None)
                     except OverflowError as e:
-                        yield "data: " + json.dumps({"error": {"message": str(e), "type": "context_length_exceeded"}}) + "\n\n"
+                        log("context length exceeded: %s" % e)
+                        yield "data: " + json.dumps({"error": {"message": str(e), "type": "invalid_request_error",
+                                                              "code": "context_length_exceeded"}}) + "\n\n"
                     except ValueError as e:
                         yield "data: " + json.dumps({"error": {"message": str(e), "type": "invalid_request_error"}}) + "\n\n"
                     except Exception as e:
@@ -609,7 +642,8 @@ def create_app(cfg, log=print):
             if info is None:
                 return _err(499, "request cancelled", "cancelled")
         except OverflowError as e:
-            return _err(400, str(e), "context_length_exceeded")
+            log("context length exceeded: %s" % e)
+            return _err(400, str(e), "invalid_request_error", "context_length_exceeded")
         except ValueError as e:
             return _err(400, str(e))
         except Exception as e:
