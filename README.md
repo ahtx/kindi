@@ -88,19 +88,21 @@ context to the free card memory. On the K420 1 GB, Kindi uses about 870 MB of it
 ### With Docker (recommended)
 
 CUDA 10.2 and CuPy 9.6 are the last releases that support Kepler, and they need an old userland; the image packages
-exactly that.
+exactly that. The images are built in two tiers - a dependency base image and a code image on top of it - so that a
+code change rebuilds only the code (see [docs/DOCKER.md](docs/DOCKER.md)).
 
 ```sh
 git clone https://github.com/ahtx/kindi.git && cd kindi
-docker build -t kindi:0.3.0 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
+docker/build-base.sh cuda   # the dependencies: downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
+docker/build-code.sh cuda   # the Kindi code on top, seconds
 ```
 
-For AMD graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.3.0`, about 6 GB to download); see
+For AMD graphics, use the `rocm` argument instead (`kindi-base-rocm:0.3.0`, about 6 GB to download); see
 [docs/AMD.md](docs/AMD.md).
 
 You can also use the release archive. Download `kindi-0.3.0.tar.gz` from the
 [v0.3.0 release](https://github.com/ahtx/kindi/releases/tag/v0.3.0), then run
-`tar xzf kindi-0.3.0.tar.gz && cd kindi-0.3.0` and build the image with the same `docker build` command.
+`tar xzf kindi-0.3.0.tar.gz && cd kindi-0.3.0` and run the same two build scripts.
 
 Check that Docker sees the GPU (create `~/.kindi` first, so it belongs to you and not to root):
 

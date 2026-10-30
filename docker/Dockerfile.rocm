@@ -1,28 +1,12 @@
-# Kindi runtime image for AMD GPUs (ROCm). The host needs only the amdgpu kernel driver (in the Linux kernel) and
-# Docker: ROCm 6.3, Python and CuPy are in the image. For the Radeon 780M (gfx1103), also set
-# HSA_OVERRIDE_GFX_VERSION=11.0.2 and boot with amdgpu.cwsr_enable=0 (see docs/AMD.md).
+# Kindi code image for AMD GPUs (ROCm): the Kindi source on top of the dependency base image
+# (docker/base/Dockerfile.rocm). Rebuild this one after every code change - it takes seconds. See docs/DOCKER.md.
 #
-#   docker build -t kindi-rocm:0.3.0 -f docker/Dockerfile.rocm .
+#   docker/build-code.sh rocm   (or: docker build -t kindi-rocm:0.3.0 -f docker/Dockerfile.rocm .)
 #   docker run -d --name kindi --device /dev/kfd --device /dev/dri --group-add video --group-add render \
 #       --security-opt seccomp=unconfined -e HSA_OVERRIDE_GFX_VERSION=11.0.2 \
 #       -p 127.0.0.1:8093:8093 -v $HOME/.kindi:/data kindi-rocm:0.3.0
-FROM rocm/dev-ubuntu-24.04:6.3.3
-
-ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-# the ROCm math libraries that CuPy builds against (the versions of the ROCm 6.3.3 base image)
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv python3-dev build-essential \
-        hipblas-dev hipcub-dev hipfft-dev hiprand-dev hipsolver-dev hipsparse-dev rocblas-dev rocfft-dev rocprim-dev \
-        rocrand-dev rocsolver-dev rocsparse-dev rocthrust-dev rccl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# CuPy built for ROCm (HIP). The GPU code that Kindi runs is compiled at run time by hipRTC; the targets below are
-# for CuPy's own precompiled parts (RDNA3; comma-separated, because CuPy passes the list through a shell).
-ENV ROCM_HOME=/opt/rocm CUPY_INSTALL_USE_HIP=1 HCC_AMDGPU_TARGET="gfx1100,gfx1101,gfx1102"
-RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir "setuptools==84.2.1" "wheel==0.48.0" "Cython==3.3.0" "fastrlock==0.8.4" "numpy==2.5.4" \
-    && /opt/venv/bin/pip install --no-cache-dir --no-build-isolation "cupy==14.2.0" \
-    && /opt/venv/bin/pip install --no-cache-dir "fastapi==0.115.6" "uvicorn==0.32.1" "Jinja2==3.1.4" "MarkupSafe==3.0.2"
-ENV PATH=/opt/venv/bin:$PATH
+ARG BASE_IMAGE=kindi-base-rocm:0.3.0
+FROM ${BASE_IMAGE}
 
 COPY kindi /opt/kindi/kindi
 WORKDIR /opt/kindi

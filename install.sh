@@ -638,17 +638,21 @@ gpu_args() {
   return 0
 }
 image_of() { if [ "$1" = rocm ]; then echo "kindi-rocm:${KINDI_VERSION}"; else echo "kindi:${KINDI_VERSION}"; fi; }
+base_image_of() { if [ "$1" = rocm ]; then echo "kindi-base-rocm:${KINDI_VERSION}"; else echo "kindi-base:${KINDI_VERSION}"; fi; }
 UIDGID="$(id -u):$(id -g)"
 
 # ------------------------------------------------------------------------------------------------ 4. image
 src_id=""
 for b in $BACKENDS; do
   IMAGE=$(image_of "$b")
+  BASE_IMAGE=$(base_image_of "$b")
   if [ "$b" = rocm ]; then
     DOCKERFILE=docker/Dockerfile.rocm
+    BASE_DOCKERFILE=docker/base/Dockerfile.rocm
     step "Build the Kindi image (${IMAGE})" "The image holds ROCm 6.3, CuPy 14.2 (built for ROCm) and Kindi. The first build downloads about 6 GB and takes 30-45 minutes."
   else
     DOCKERFILE=docker/Dockerfile
+    BASE_DOCKERFILE=docker/base/Dockerfile
     step "Build the Kindi image (${IMAGE})" "The image holds CUDA 10.2, CuPy 9.6 and Kindi. The first build downloads about 3 GB and takes 10-15 minutes."
   fi
   if [ -n "$SOURCE" ] && [ -d "$SOURCE" ]; then SRC="$SOURCE"
@@ -661,12 +665,18 @@ for b in $BACKENDS; do
       else run sh -c "curl -fsSL '$tarball' | tar -xz -C '$SRC' --strip-components=1"; fi
     fi
   fi
+  # the base image holds the dependencies only: build it once, then layer the code image on top of it
+  if $DOCKER image inspect "$BASE_IMAGE" >/dev/null 2>&1; then ok "${BASE_IMAGE} is present"
+  else
+    run $DOCKER build -q -t "$BASE_IMAGE" -f "$SRC/$BASE_DOCKERFILE" "$SRC" >/dev/null
+    ok "built ${BASE_IMAGE}"
+  fi
   [ "$DRY" = 1 ] || src_id=$(cd "$SRC" && find kindi docker -type f | sort | xargs cat | sha256sum | cut -c1-12)
   have=$($DOCKER image inspect -f '{{index .Config.Labels "kindi.source"}}' "$IMAGE" 2>/dev/null || true)
   if [ -n "$have" ] && [ "$have" = "$src_id" ]; then ok "${IMAGE} is up to date (source ${src_id})"
   else
     [ -n "$have" ] && info "the image is from other source (${have}): upgrading"
-    run $DOCKER build -q --label "kindi.source=${src_id}" -t "$IMAGE" -f "$SRC/$DOCKERFILE" "$SRC" >/dev/null
+    run $DOCKER build -q --build-arg "BASE_IMAGE=${BASE_IMAGE}" --label "kindi.source=${src_id}" -t "$IMAGE" -f "$SRC/$DOCKERFILE" "$SRC" >/dev/null
     ok "built ${IMAGE}"
   fi
   # every module must load before anything runs on a GPU (a broken file otherwise shows only at the server start)

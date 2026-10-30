@@ -3,12 +3,18 @@
 To install Kindi with one command (the image, the models and the servers), see [INSTALL.md](INSTALL.md). This page
 tells how to do the same steps by hand.
 
-Kindi has two images:
+Kindi's images are built in two tiers, so that a code change rebuilds only the code and not the dependencies:
 
-| Image | Dockerfile | Contents | For |
-|---|---|---|---|
-| `kindi:0.3.0` | `docker/Dockerfile` | Ubuntu 18.04, CUDA 10.2, Python 3.6, CuPy 9.6, FastAPI, Kindi | NVIDIA cards from Kepler on, and the CPU engine |
-| `kindi-rocm:0.3.0` | `docker/Dockerfile.rocm` | Ubuntu 24.04, ROCm 6.3.3, Python 3.12, CuPy 14.2.0 built for ROCm, FastAPI, Kindi | AMD RDNA3 graphics (tested: Radeon 780M) |
+| Tier | Image | Dockerfile | Contents | For |
+|---|---|---|---|---|
+| base | `kindi-base:0.3.0` | `docker/base/Dockerfile` | Ubuntu 18.04, CUDA 10.2, Python 3.6, CuPy 9.6, FastAPI | NVIDIA cards from Kepler on, and the CPU engine |
+| base | `kindi-base-rocm:0.3.0` | `docker/base/Dockerfile.rocm` | Ubuntu 24.04, ROCm 6.3.3, Python 3.12, CuPy 14.2.0 built for ROCm, FastAPI | AMD RDNA3 graphics (tested: Radeon 780M) |
+| code | `kindi:0.3.0` | `docker/Dockerfile` | the Kindi code, on top of `kindi-base:0.3.0` | NVIDIA cards from Kepler on, and the CPU engine |
+| code | `kindi-rocm:0.3.0` | `docker/Dockerfile.rocm` | the Kindi code, on top of `kindi-base-rocm:0.3.0` | AMD RDNA3 graphics (tested: Radeon 780M) |
+
+The base image holds everything that changes slowly - the OS, the CUDA / ROCm toolchain, Python, CuPy and the Python
+packages. The code image is just `COPY kindi` on top of it, so a code change rebuilds in seconds. The code images keep
+the `kindi:0.3.0` and `kindi-rocm:0.3.0` tags, so `knd`, the installer and the run examples below keep working.
 
 Everything Kindi reads or writes lives in one volume mounted at `/data`:
 
@@ -34,10 +40,30 @@ AMD:
 
 ## Build
 
+Two scripts build the two tiers. The version in the image tag comes from `KINDI_VERSION` (default `0.3.0`, matching
+`install.sh`):
+
 ```sh
-docker build -t kindi:0.3.0 -f docker/Dockerfile .              # NVIDIA and CPU, about 15 minutes
-docker build -t kindi-rocm:0.3.0 -f docker/Dockerfile.rocm .    # AMD; builds CuPy for ROCm, 30-45 minutes
+docker/build-base.sh cuda    # kindi-base:0.3.0 - NVIDIA and CPU, about 15 minutes (downloads the CUDA 10.2 toolkit)
+docker/build-base.sh rocm    # kindi-base-rocm:0.3.0 - AMD; builds CuPy for ROCm, 30-45 minutes
+docker/build-code.sh cuda    # kindi:0.3.0 - the Kindi code on top of the base image, seconds
+docker/build-code.sh rocm    # kindi-rocm:0.3.0 - the Kindi code on top of the ROCm base image, seconds
 ```
+
+Without an argument, each script builds both variants (`all`). Build the base image only when the dependencies
+change; after a code change, `docker/build-code.sh` alone is enough. The same result can be produced by hand:
+
+```sh
+docker build -t kindi-base:0.3.0 -f docker/base/Dockerfile .
+docker build -t kindi:0.3.0 --build-arg BASE_IMAGE=kindi-base:0.3.0 -f docker/Dockerfile .
+```
+
+A `.dockerignore` keeps the build context small: it excludes the converted models (`pack`), the downloaded GGUFs
+(`models`), the caches (`state`), `.git` and Python bytecode. Without it, every build would upload the pack (tens of
+GB) to the Docker daemon.
+
+After `docker/build-code.sh cuda`, `./knd info` runs the freshly built code, because the code image keeps the
+`kindi:0.3.0` tag that `knd` uses.
 
 ## Commands
 

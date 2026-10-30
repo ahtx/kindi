@@ -1,0 +1,20 @@
+# The build context only needs kindi/ (copied into the image) and docker/ (the Dockerfiles). Everything here would
+# otherwise be sent to the Docker daemon on every build - in particular `pack` (a symlink to the converted models)
+# can be tens of GB, and `.git` the full history.
+.git
+.gitignore
+.gitattributes
+.github
+models
+pack
+state
+*.gguf
+*.bin
+*.npz
+*.npy
+__pycache__
+*.pyc
+*.log
+kindi.conf
+.vscode
+.idea

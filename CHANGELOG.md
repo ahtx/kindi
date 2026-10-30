@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- **Two-tier Docker images.** Each image is now split into a dependency base image (`kindi-base:0.3.0`,
+  `kindi-base-rocm:0.3.0`) and a code image (`kindi:0.3.0`, `kindi-rocm:0.3.0`) that layers `COPY kindi` on top.
+  `docker/build-base.sh` and `docker/build-code.sh` rebuild each tier, so a code change rebuilds in seconds instead
+  of 15-45 minutes. A `.dockerignore` keeps the converted models out of the build context.
+  [docs/DOCKER.md](docs/DOCKER.md)
+
 ## 0.3.0 (2026-10-28)
 
 ### New
