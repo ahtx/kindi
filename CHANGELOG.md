@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A prompt that exceeds the context now returns a proper 400 `context_length_exceeded` error (type
+  `invalid_request_error`) for both streaming and non-streaming requests, before the response starts. Before, a
+  streaming request committed HTTP 200 first and then emitted the error as a mid-stream event, so clients reported
+  a generic "no choices" failure instead of the real cause. A `context length exceeded: ...` line is logged to the
+  console in either case.
+
 ## 0.3.0 (2026-10-28)
 
 ### New
