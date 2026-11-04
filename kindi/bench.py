@@ -1,27 +1,51 @@
-"""kindi bench: generation speed at several context positions, prompt-reading speed, and GPU memory."""
+"""kindi bench: generation speed at several context positions, prompt-reading speed, and GPU memory.
+With KINDI_DEVICE=cpu (or without CuPy) it times the CPU engine with the host clock."""
 import os
 import time
 
 
+def _cupy():
+    if os.environ.get("KINDI_DEVICE", "gpu") == "cpu":
+        return None
+    try:
+        import cupy as cp
+        return cp
+    except ImportError:
+        return None
+
+
 def run(cfg, log=print):
-    import cupy as cp
     import numpy as np
+    cp = _cupy()
     from .engine import make_engine
     pack = cfg["pack"]
+    mp = os.path.join(pack, "kindi_pack.json")
+    man = __import__("json").load(open(mp)) if os.path.exists(mp) else {}
+    if man.get("backend") == "kindi_nanbeige":
+        if cp is None:
+            log("kindi bench: the Nanbeige backend runs only on an NVIDIA GPU (KINDI_DEVICE=cpu is set or CuPy is missing)")
+            return 2
+        from .nanbeige_cli import bench
+        return bench(cfg, man, log=log)
     cl = os.path.join(pack, "head_clusters.npz")
     eng = make_engine(pack, ctx=cfg["ctx"], clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log)
-    free, total = cp.cuda.runtime.memGetInfo()
-    log("GPU memory: %.0f MiB free of %.0f with a %d-token context" % (free / 2 ** 20, total / 2 ** 20, eng.ctx))
+    if cp is not None:
+        free, total = cp.cuda.runtime.memGetInfo()
+        log("GPU memory: %.0f MiB free of %.0f with a %d-token context" % (free / 2 ** 20, total / 2 ** 20, eng.ctx))
+        sync = cp.cuda.Device().synchronize
+    else:
+        log("CPU engine: %s threads, %d-token context" % (os.environ.get("OMP_NUM_THREADS", os.cpu_count()), eng.ctx))
+        sync = lambda: None                    # noqa: E731 - the CPU engine returns when the work is done
     eng.reset()
 
     def timed(fn, n):
         fn(0)                                  # warm-up (first launches compile/load kernels)
-        cp.cuda.Device().synchronize()
-        t0 = time.time()
+        sync()
+        t0 = time.perf_counter()
         for i in range(n):
             fn(i)
-        cp.cuda.Device().synchronize()
-        return (time.time() - t0) / n * 1000
+        sync()
+        return (time.perf_counter() - t0) / n * 1000
 
     ms = timed(lambda i: eng.feed(1000 + i, 10 + i), 20)
     log("prompt reading:       %5.1f tokens/s" % (1000 / ms))

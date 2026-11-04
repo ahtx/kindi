@@ -2,10 +2,10 @@
 # Docker: ROCm 6.3, Python and CuPy are in the image. For the Radeon 780M (gfx1103), also set
 # HSA_OVERRIDE_GFX_VERSION=11.0.2 and boot with amdgpu.cwsr_enable=0 (see docs/AMD.md).
 #
-#   docker build -t kindi-rocm:0.3.0 -f docker/Dockerfile.rocm .
+#   docker build -t kindi-rocm:0.4.0 -f docker/Dockerfile.rocm .
 #   docker run -d --name kindi --device /dev/kfd --device /dev/dri --group-add video --group-add render \
 #       --security-opt seccomp=unconfined -e HSA_OVERRIDE_GFX_VERSION=11.0.2 \
-#       -p 127.0.0.1:8093:8093 -v $HOME/.kindi:/data kindi-rocm:0.3.0
+#       -p 127.0.0.1:8093:8093 -v $HOME/.kindi:/data kindi-rocm:0.4.0
 FROM rocm/dev-ubuntu-24.04:6.3.3
 
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1

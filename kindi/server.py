@@ -68,7 +68,13 @@ class Kindi(object):
         self.native = man.get("backend") == "kindi_gemma4"
         self.busy = {"active": False, "phase": "", "prompt_tokens": 0, "cached": 0, "read": 0, "generated": 0,
                      "started": 0.0}
-        if self.native:
+        self.nanbeige = None
+        if man.get("backend") == "kindi_nanbeige":        # llama-arch K/I-quant GGUF (Nanbeige 4.3 33B)
+            from .nanbeige_gen import NanbeigeBackend
+            self.variant = "nanbeige"
+            self.nanbeige = NanbeigeBackend(man, cfg, log=log)
+            self.eng, self.tok, self.runner, self.sample = self.nanbeige.eng, self.nanbeige.tok, None, None
+        elif self.native:
             from .gemma4 import Engine as NativeEngine
             from .gemma4_tokenizer import Tok as GemmaTok
             self.variant = "gemma4"
@@ -106,13 +112,20 @@ class Kindi(object):
             pass
         return self.cfg["head"]
 
-    def _pick(self, nxt, temperature, top_p, top_k, rng):
+    def head_active(self):
+        """the head that runs: "fast" only when the engine has a fast head (the 27B, Nanbeige and the CPU engine have none)"""
+        m = self.head_mode()
+        if m == "fast" and getattr(self.eng, "hsl", None) is None and getattr(self.eng, "fast_centroids", None) is None:
+            return "exact"
+        return m
+
+    def _pick(self, nxt, temperature, top_p, top_k, rng, min_p=0.0, penalty=None):
         """the next token: already drawn by speculative sampling, or sampled now"""
         ps = getattr(self.eng, "spec_presampled", None)
         if ps is not None:
             self.eng.spec_presampled = None
             return ps
-        return self.sample(nxt, temperature, top_p, top_k, rng)
+        return self.sample(nxt, temperature, top_p, top_k, rng, min_p, penalty)
 
     def _g4_text(self,token):
         return self.tok.decode_bytes(token).decode("utf-8","replace")
@@ -137,7 +150,6 @@ class Kindi(object):
         from .gemma4_chat import render as render_gemma
         from . import gemma4_tools
         cfg=self.cfg; messages=gemma4_tools.prepare_messages(req.get("messages") or [])
-        self.eng.shortlist=cfg["fast_clusters"] if self.head_mode()=="fast" and self.eng.fast_centroids is not None else 0
         tools=req.get("tools") or None
         if req.get("tool_choice")=="none": tools=None
         kw=dict(req.get("chat_template_kwargs") or {})
@@ -150,6 +162,8 @@ class Kindi(object):
         if not ids: raise ValueError("Gemma 4 chat template produced an empty prompt")
         if len(ids)>=self.eng.ctx:
             raise OverflowError("the Gemma 4 prompt has %d tokens; context is %d"%(len(ids),self.eng.ctx))
+        if req.get("_kindi_check"): return                # check_prompt(): the prompt is valid, nothing to run
+        self.eng.shortlist=cfg["fast_clusters"] if self.head_mode()=="fast" and self.eng.fast_centroids is not None else 0
         max_new=int(req.get("max_tokens") or req.get("max_completion_tokens") or cfg["max_tokens"])
         max_new=max(1,min(max_new,self.eng.ctx-len(ids)))
         temperature=float(req.get("temperature",cfg["temperature"]))
@@ -268,9 +282,19 @@ class Kindi(object):
           "timing":{"prompt_s":round(prompt_done-started,2),"prompt_new_tokens":len(ids),
                     "gen_s":round(elapsed,2),"gen_tok_s":round(len(generated)/elapsed,2)}}
 
+    def check_prompt(self, req):
+        """Renders and counts the prompt of a request without the GPU or the lock. Raises OverflowError (the prompt does
+        not fit the context) or ValueError (the prompt is not valid), so that a streaming request gets an HTTP 400
+        before its first byte."""
+        for _ in self.generate(dict(req, _kindi_check=True)):
+            pass
+
     def generate(self, req, cancel=None):
         """Yields ("text", piece) while generating, then ("done", info). cancel: a threading.Event set when the
         client disconnects (prompt reading and generation stop at the next token)."""
+        if self.nanbeige is not None:
+            yield from self.nanbeige.generate(self, req, cancel)
+            return
         if self.native:
             yield from self._generate_gemma(req,cancel)
             return
@@ -286,15 +310,14 @@ class Kindi(object):
         temperature = float(g("temperature", cfg["temperature"]))
         top_p = float(g("top_p", cfg["top_p"]))
         top_k = int(g("top_k", cfg["top_k"]))
+        min_p = float(g("min_p", cfg.get("min_p", 0)))
+        rp = float(g("repeat_penalty", cfg.get("repeat_penalty", 1.0)))
+        rlast = int(g("repeat_last_n", cfg.get("repeat_last_n", 64)))
         max_new = int(req.get("max_tokens") or req.get("max_completion_tokens") or cfg["max_tokens"])
         repeat_stop = bool(cfg.get("repeat_stop"))
         stops = req.get("stop") or []
         if isinstance(stops, str):
             stops = [stops]
-        fast = self.head_mode() == "fast"
-        if fast and self.eng.hsl is None:
-            fast = False
-        self.eng.shortlist = cfg["fast_clusters"] if fast else 0
         seed = req.get("seed")
         rng = np.random.RandomState(seed if seed is not None else int(time.time() * 1000) % 2 ** 31)
         kw = req.get("chat_template_kwargs") or {}
@@ -306,6 +329,12 @@ class Kindi(object):
         ctx = self.eng.ctx
         if len(T) + 1 >= ctx:
             raise OverflowError("the prompt has %d tokens; the context is %d" % (len(T), ctx))
+        if req.get("_kindi_check"):                       # check_prompt(): the prompt is valid, nothing to run
+            return
+        fast = self.head_mode() == "fast"
+        if fast and self.eng.hsl is None:
+            fast = False
+        self.eng.shortlist = cfg["fast_clusters"] if fast else 0
         max_new = max(1, min(max_new, ctx - len(T) - 1))
         t0 = time.time()
         self.busy.update(active=True, phase="matching cache", prompt_tokens=len(T), cached=0, read=0, generated=0,
@@ -325,8 +354,12 @@ class Kindi(object):
         t1 = time.time()
         self.log("prompt: %d reused, %d read in %.1fs" % (cached, len(T) - cached, t1 - t0))
         self.busy["phase"] = "generating"
+        pen = rp != 1.0 and rlast != 0
         if hasattr(self.eng, "spec_begin"):
-            self.eng.spec_begin(temperature <= 0, temperature, top_p, top_k, rng)   # speculative decoding (KINDI_SPEC)
+            if pen or (min_p > 0 and temperature > 0):        # the speculative paths do not apply these: no drafts
+                self.eng.spec_begin(False)
+            else:
+                self.eng.spec_begin(temperature <= 0, temperature, top_p, top_k, rng)   # speculative decoding (KINDI_SPEC)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         text, gen, finish = "", [], "length"
         # while thinking, pieces go out as ("reasoning", ...) - the last 8 characters are held back in case they are
@@ -354,7 +387,9 @@ class Kindi(object):
                 st["sent"] = len(text) - 8
             return out
 
-        tok = self.sample(nxt, temperature, top_p, top_k, rng)
+        # repeat_penalty: over the last repeat_last_n tokens of the prompt and the reply (-1: all of them)
+        recent = lambda: (rp, set((T + gen)[-rlast:] if rlast > 0 else T + gen)) if pen else None  # noqa: E731
+        tok = self.sample(nxt, temperature, top_p, top_k, rng, min_p, recent())
         try:
             while True:
                 if cancel is not None and cancel.is_set():
@@ -395,7 +430,7 @@ class Kindi(object):
                         for item in route(piece):
                             yield item
                         nxt = self.runner.step(ft)
-                tok = self._pick(nxt, temperature, top_p, top_k, rng)
+                tok = self._pick(nxt, temperature, top_p, top_k, rng, min_p, recent())
         finally:
             sp = self.eng.spec_end() if hasattr(self.eng, "spec_end") else None
             self.busy["active"] = False
@@ -487,7 +522,7 @@ def create_app(cfg, log=print):
             busy = {"phase": b["phase"], "elapsed_s": round(time.time() - b["started"]),
                     "prompt_tokens": b["prompt_tokens"], "reused": b["cached"],
                     "prompt_read": "%d/%d" % (b["read"], b["prompt_tokens"] - b["cached"]), "generated": b["generated"]}
-        return {"ok": True, "kindi": __version__, "commit": COMMIT, "model": model_id, "ctx": K.eng.ctx, "head": K.head_mode(),
+        return {"ok": True, "kindi": __version__, "commit": COMMIT, "model": model_id, "ctx": K.eng.ctx, "head": K.head_active(),
                 "uptime_s": round(time.time() - K.t0), "busy": busy, "stats": K.stats,
                 "gpu_free_mib": round(free / 1048576.0), "gpu_total_mib": round(total / 1048576.0)}
 
@@ -518,6 +553,16 @@ def create_app(cfg, log=print):
         cancel = threading.Event()
 
         if req.get("stream"):
+            # an oversized or invalid prompt is an HTTP 400 now: after the first byte the status is always 200
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, K.check_prompt, req)
+            except OverflowError as e:
+                return _err(400, str(e), "context_length_exceeded")
+            except ValueError as e:
+                return _err(400, str(e))
+            except Exception:  # noqa: BLE001 - anything else: the stream reports it
+                pass
+
             def sse():
                 with K.lock:
                     yield chunk({"role": "assistant", "content": ""})

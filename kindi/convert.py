@@ -92,8 +92,11 @@ def convert(gguf_path, out_dir, log=print):
         log("recognized Gemma 4 GGUF: %d tensors, %s quantization; Kindi native CUDA decoder" %
             (info["tensor_count"], info["tensor_types"]))
         return manifest
+    from . import nanbeige_cli
+    if nanbeige_cli.is_llama_iq(g):
+        return nanbeige_cli.convert(g, gguf_path, out_dir, __version__, PACK_FORMAT, sha256, log=log)
     if g.kv.get("general.architecture") != "qwen35":
-        raise SystemExit("kindi convert: expected a qwen35 or Gemma 4 GGUF")
+        raise SystemExit("kindi convert: expected a qwen35, Gemma 4 or llama (K / I-quant) GGUF")
     profile = (g.kv.get("qwen35.block_count"), g.kv.get("qwen35.embedding_length"),
                g.kv.get("qwen35.feed_forward_length"), g.kv.get("qwen35.attention.head_count"),
                g.kv.get("qwen35.attention.head_count_kv"), g.kv.get("qwen35.ssm.group_count"))

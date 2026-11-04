@@ -38,6 +38,33 @@ __device__ __forceinline__ float h2f(unsigned short h){ return __half2float(*(__
 __device__ __forceinline__ float h2f(unsigned short h){ float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
 #endif
 
+/* e^x with no special-function unit: x = k ln2 + r with k the nearest integer to x / ln2 and |r| <= ln2 / 2, r found
+   with ln2 split in a 16-bit-exact high part and a low part (Cody-Waite), e^r from its Taylor series to r^7 / 7!
+   in Horner form, then scaled by 2^k in two halves so that results near the float limits (k = 128, subnormals) stay
+   right. Only round-to-nearest fma/mul/add are used, so every compiler version gives the same bits. */
+#if !KHIP
+__device__ __forceinline__ float kexpf(float x){
+    const float INV_LN2 = 1.44269502162933349609375f, LN2_HI = 0.693145751953125f, LN2_LO = 1.428606765330187045e-06f;
+    float c = fminf(fmaxf(x, -104.0f), 89.0f);
+    float k = rintf(__fmul_rn(c, INV_LN2));
+    float r = __fmaf_rn(-k, LN2_HI, c);
+    r = __fmaf_rn(-k, LN2_LO, r);
+    float p = 1.98412698e-4f;                          // 1/7!
+    p = __fmaf_rn(p, r, 1.38888889e-3f);               // 1/6!
+    p = __fmaf_rn(p, r, 8.33333377e-3f);               // 1/5!
+    p = __fmaf_rn(p, r, 4.16666679e-2f);               // 1/4!
+    p = __fmaf_rn(p, r, 0.166666672f);                 // 1/3!
+    p = __fmaf_rn(p, r, 0.5f);
+    p = __fmaf_rn(p, r, 1.0f);
+    p = __fmaf_rn(p, r, 1.0f);
+    int ki = (int)k, a = ki >> 1, b = ki - a;
+    float y = __fmul_rn(p, __int_as_float((a + 127) << 23));
+    y = __fmul_rn(y, __int_as_float((b + 127) << 23));
+    return x != x ? x : y;
+}
+#define expf(x) kexpf(x)
+#endif
+
 #if KHIP
 __device__ __forceinline__ float hf(unsigned short h){ return __half2float(*(__half*)&h); }
 #else

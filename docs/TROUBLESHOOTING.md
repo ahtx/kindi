@@ -27,5 +27,12 @@ time. `/health` and the server log show `prompt: N reused, M read` per request.
 **`the prompt has N tokens; the context is M`.** The conversation outgrew `ctx`. Let the client summarise older turns,
 or raise `ctx` if memory allows.
 
+**`could not select device driver "" with capabilities: [[gpu]]`.** The Docker daemon started before you installed the NVIDIA
+Container Toolkit. Restart the daemon: `sudo systemctl restart docker`, or `systemctl --user restart docker`
+for rootless Docker. Then `docker run --rm --gpus all ubuntu nvidia-smi` must show the cards.
+
+**`PermissionError: [Errno 13] Permission denied: '/data/...'` on rootless Docker.** Remove `-u $(id -u):$(id -g)` from
+the `docker run` command. Rootless Docker runs the container's root as your user (see [DOCKER.md](DOCKER.md)).
+
 **`kindi verify` fails.** The pack is from a different model file, or the GPU stack differs from the tested one.
 Re-run `kindi convert --force` from the official file and check the driver.

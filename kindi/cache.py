@@ -29,6 +29,25 @@ def _host(a):
     return a.get() if hasattr(a, "get") else np.array(a)
 
 
+# pinned checkpoint copies: on by default under WSL2 (/dev/dxg; the WDDM driver copies pageable memory slowly: first
+# token 1.52 -> 0.98 s on a GTX 1070, issue #4); on Linux they gave no gain (RTX 3060, 19 MB: 6.2 vs 6.9 ms)
+PINNED = os.environ.get("KINDI_CKPT_PINNED", "1" if os.path.exists("/dev/dxg") else "0") == "1"
+
+
+def _host_ckpt(a):
+    """a checkpoint's host copy of a GPU array, in pinned (page-locked) memory (KINDI_CKPT_PINNED=1), else a plain
+    NumPy array"""
+    if not PINNED or cp is None or not isinstance(a, cp.ndarray):
+        return _host(a)
+    try:
+        mem = cp.cuda.alloc_pinned_memory(a.nbytes)
+    except Exception:  # noqa: BLE001 - no pinned memory left: a plain copy
+        return _host(a)
+    h = np.frombuffer(mem, dtype=a.dtype, count=a.size).reshape(a.shape)   # (h keeps mem alive)
+    a.get(out=h)
+    return h
+
+
 def _to_dev(dst, pos, src):
     """dst[:pos] = src[:pos] (a parked K/V block back into the engine), in place. A plain CuPy assignment from a
     host array first makes a temporary device copy, and on a full card there is no room for it (GTX 1080, 27B at
@@ -38,6 +57,15 @@ def _to_dev(dst, pos, src):
         dst[:pos].set(s)                     # CuPy
     else:
         dst[:pos] = s                        # NumPy (CPU engine) or tp.Dist (copies in place itself)
+
+
+def _set_host(dst, h):
+    """dst[...] = h in place: CuPy .set on the GPU engines, np.copyto on the CPU engine (whose arrays the C code
+    holds by address, so they must not be replaced)"""
+    if hasattr(dst, "set") and not isinstance(dst, np.ndarray):
+        dst.set(h)
+    else:
+        np.copyto(dst, h)
 
 
 def _free_device_pool():
@@ -61,7 +89,7 @@ def _lcp(a, b):
 
 
 # the files whose code decides the arithmetic of the state (a change of any of them changes the saved states)
-_ARITH = ("kindi.cu", "chunk.cu", "chunk1.cu", "tc.cu", "tcf.cu", "tca.cu", "spec.cu", "kcpu.c", "engine.py", "tp.py",
+_ARITH = ("kindi.cu", "chunk.cu", "chunk1.cu", "tc.cu", "tcp.cu", "tcf.cu", "tca.cu", "spec.cu", "kcpu.c", "engine.py", "tp.py",
           "chunk.py", "chunk1.py", "tc.py", "spec.py", "cpu.py", "layout.py")
 
 
@@ -190,9 +218,9 @@ class Openings(object):
         Ms = [z["M%d" % i] for i in range(len(eng.M))]
         Cs = [z["C%d" % i] for i in range(len(eng.conv))]
         for a, h in zip(eng.M, Ms):
-            a.set(h)
+            _set_host(a, h)
         for a, h in zip(eng.conv, Cs):
-            a.set(h)
+            _set_host(a, h)
         for i in range(len(eng.Kc)):
             eng.Kc[i][:p] = z["K%d" % i]
             eng.Vc[i][:p] = z["V%d" % i]
@@ -428,7 +456,7 @@ class Runner(object):
                     del self.ckpt[key]
                 self.ckpt[pos] = sl.save(drop or key is None)
             else:
-                self.ckpt[pos] = ([_host(m) for m in self.eng.M], [_host(c) for c in self.eng.conv])
+                self.ckpt[pos] = ([_host_ckpt(m) for m in self.eng.M], [_host_ckpt(c) for c in self.eng.conv])
             # besides the evenly spaced checkpoints, every request adds two (its generation prompt and its end): keep
             # only the two latest of those, or a long agent session collects one state copy per turn (a leak of
             # ~100 MB per turn on the 9B)
@@ -479,9 +507,9 @@ class Runner(object):
 
     def _set_state(self, Ms, Cs):
         for a, h in zip(self.eng.M, Ms):
-            a.set(h)
+            _set_host(a, h)
         for a, h in zip(self.eng.conv, Cs):
-            a.set(h)
+            _set_host(a, h)
 
     def _park(self):
         n = len(self.tokens)

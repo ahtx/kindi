@@ -1,17 +1,22 @@
 <p align="center"><img src="assets/kindi-banner.svg" alt="Kindi 0.3.0: modern 2B to 27B language models on low-cost NVIDIA cards and AMD Radeon 780M graphics, from a 1 GB Quadro K420 to an RTX 3080. Two Quadro K1200 cards work as one 8 GB card." width="100%"></p>
 
-# Kindi 0.3.0
+# Kindi 0.4.0
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Commercial licenses available](https://img.shields.io/badge/commercial%20licenses-available-green.svg)](COMMERCIAL-LICENSE.md)
-[![Release v0.3.0](https://img.shields.io/badge/release-v0.3.0-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.3.0)
+[![Release v0.4.0](https://img.shields.io/badge/release-v0.4.0-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.4.0)
 
 Kindi is a custom inference engine for Prism ML's **Ternary-Bonsai-2** language models (2B, 4B, 9B and 27B
 parameters, ternary weights). It started on the **NVIDIA Quadro K420** (Kepler, 1 GB). On this card, it writes
 **22.9 tokens per second** with the 2B (fast head). Version 0.2.0 added the Quadro K1200, two cards in tensor
 parallel, the GeForce GTX 1080 and the GeForce RTX 3080. It also added a CPU engine and a one-command installer.
 Version 0.3.0 adds AMD Radeon 780M graphics (a ROCm image) and the Quadro K6000. It also adds a prompt cache for
-agents and setups with several servers on several cards. NVIDIA Nemotron 3.5 Bolt E4B has experimental support. The
+agents and setups with several servers on several cards. NVIDIA Nemotron 3.5 Bolt E4B has experimental support.
+Version 0.4.0 turns on speculative decoding on the RTX 30, 40 and 50 cards: on an RTX 3080, the 27B with the 2B
+draft model writes up to 1.82 times as fast, with the same output ([docs/MTP.md](docs/MTP.md)). It also adds
+AH-Nanbeige4.3-33B, a separate model (see below). Kindi 0.4.0 supports the GeForce RTX 20, 30, 40 and 50 series.
+It also supports the Tesla P100 (16 GB, Pascal) as a full card: Kindi writes the 27B 1.9 to 2.7 times as fast as
+llama.cpp on the same P100 ([docs/CARDS.md](docs/CARDS.md)). The
 installer finds the GeForce RTX 30 cards that NVIDIA limits to half-rate 16-bit arithmetic. It offers to unlock them
 with the excellent [gpu-unlock](https://github.com/Zagitta/gpu-unlock) module by Zagitta. Kindi's prompt cache is
 more effective than llama.cpp's. In our test, Nemotron on a GTX 1080 answers three questions about a 9,400-token
@@ -53,6 +58,7 @@ To see each step before anything changes, add `-s -- --dry-run` after `bash`. Ru
 see [docs/INSTALL.md](docs/INSTALL.md).
 
 - [Quick start: one command](#quick-start-one-command)
+- [First steps after the install](#first-steps-after-the-install)
 - [Requirements](#requirements)
 - [Install](#install) - with Docker, or natively
 - [Get the model and convert it](#get-the-model-and-convert-it)
@@ -69,11 +75,39 @@ see [docs/INSTALL.md](docs/INSTALL.md).
 - [License](#license)
 - [Acknowledgements](#acknowledgements)
 
+## First steps after the install
+
+1. Find the port of the server. At the end, the installer shows the port of each server. The first server uses
+   port 8093, the second server uses 8094, and so on.
+2. Make sure that the server runs. Open `http://localhost:8093/health` in a browser, or use
+   `curl -s localhost:8093/health`. The answer shows the model, the context size and the server state.
+3. Connect a chat client. Kindi uses the OpenAI API at `http://localhost:8093/v1`. In Open WebUI, LM Studio, Jan or
+   pi, add an "OpenAI-compatible" connection with this address. The API key can be any text, unless you set an
+   `api_key`. The model id is in `/health` (for example `bonsai2-2b`).
+4. Send a test request with curl:
+
+```sh
+curl -s localhost:8093/v1/chat/completions -H "Content-Type: application/json"   -d '{"model": "bonsai2-2b", "messages": [{"role": "user", "content": "Say hello."}]}'
+```
+
+5. Or send it with Python (`pip install openai`):
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8093/v1", api_key="none")
+r = client.chat.completions.create(model="bonsai2-2b", messages=[{"role": "user", "content": "Say hello."}])
+print(r.choices[0].message.content)
+```
+
+If the server is on a different computer, use its address in place of `localhost`. By default, the server accepts
+connections only from the same computer (see [Run the server](#run-the-server)). For more about clients, see
+[Use it](#use-it) and [docs/AGENTS.md](docs/AGENTS.md).
+
 ## Requirements
 
 | | |
 |---|---|
-| GPU | NVIDIA, compute capability 3.0 (Kepler) or later. Tested: Quadro K420 (1 GB and 2 GB), Quadro K1200 (one card, or two in tensor parallel), Quadro K6000, GeForce GTX 1080, GeForce RTX 3080. AMD: Radeon 780M (RDNA3, gfx1103) with 32 GB of computer memory or more; see [docs/AMD.md](docs/AMD.md). With no GPU, the CPU engine runs on x86-64 with AVX2. |
+| GPU | NVIDIA, compute capability 3.0 (Kepler) or later. Tested: Quadro K420 (1 GB and 2 GB), Quadro K1200 (one card, or two in tensor parallel), Quadro K6000, Tesla P100 16 GB, GeForce GTX 1080, GeForce RTX 3080. Supported, and `kindi verify` passes: the GeForce RTX 20, 30, 40 and 50 series (speed numbers are only for the cards in the tables below). AMD: Radeon 780M (RDNA3, gfx1103) with 32 GB of computer memory or more; see [docs/AMD.md](docs/AMD.md). With no GPU, the CPU engine runs on x86-64 with AVX2. |
 | Driver | Kepler: the NVIDIA **470** series (the last driver branch with Kepler support). Later cards: a current driver. The image has CUDA 10.2; the host needs only the driver. AMD: the `amdgpu` driver of Linux and the kernel option `amdgpu.cwsr_enable=0`; ROCm 6.3 is in the `kindi-rocm` image. |
 | OS | Linux x86-64 (developed on Ubuntu 24.04 with Docker; the image itself is Ubuntu 18.04) |
 | RAM / disk | 2B: 4 GB RAM, ~1.5 GB disk. 27B: ~14 GB of free RAM for its first start (two K1200 cards: ~5 GB) and ~19 GB of disk. The Docker image takes ~4 GB more. |
@@ -92,21 +126,21 @@ exactly that.
 
 ```sh
 git clone https://github.com/ahtx/kindi.git && cd kindi
-docker build -t kindi:0.3.0 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
+docker build -t kindi:0.4.0 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
 ```
 
-For AMD graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.3.0`, about 6 GB to download); see
+For AMD graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.4.0`, about 6 GB to download); see
 [docs/AMD.md](docs/AMD.md).
 
-You can also use the release archive. Download `kindi-0.3.0.tar.gz` from the
-[v0.3.0 release](https://github.com/ahtx/kindi/releases/tag/v0.3.0), then run
-`tar xzf kindi-0.3.0.tar.gz && cd kindi-0.3.0` and build the image with the same `docker build` command.
+You can also use the release archive. Download `kindi-0.4.0.tar.gz` from the
+[v0.4.0 release](https://github.com/ahtx/kindi/releases/tag/v0.4.0), then run
+`tar xzf kindi-0.4.0.tar.gz && cd kindi-0.4.0` and build the image with the same `docker build` command.
 
 Check that Docker sees the GPU (create `~/.kindi` first, so it belongs to you and not to root):
 
 ```sh
 mkdir -p ~/.kindi
-docker run --rm --gpus all -u $(id -u):$(id -g) -v ~/.kindi:/data kindi:0.3.0 info
+docker run --rm --gpus all -u $(id -u):$(id -g) -v ~/.kindi:/data kindi:0.4.0 info
 ```
 
 More in [docs/DOCKER.md](docs/DOCKER.md).
@@ -137,7 +171,7 @@ Convert it once into Kindi's weight pack (about a minute; exact - the same weigh
 
 ```sh
 # Docker
-docker run --rm -u $(id -u):$(id -g) -v ~/.kindi:/data kindi:0.3.0 convert /data/Ternary-Bonsai-2-2B-PTQ1_0.gguf
+docker run --rm -u $(id -u):$(id -g) -v ~/.kindi:/data kindi:0.4.0 convert /data/Ternary-Bonsai-2-2B-PTQ1_0.gguf
 # native
 python3 -m kindi convert ~/.kindi/Ternary-Bonsai-2-2B-PTQ1_0.gguf          # writes ~/.kindi/pack
 ```
@@ -145,7 +179,7 @@ python3 -m kindi convert ~/.kindi/Ternary-Bonsai-2-2B-PTQ1_0.gguf          # wri
 Check the engine against llama.cpp's reference output:
 
 ```sh
-docker run --rm --gpus all -u $(id -u):$(id -g) -v ~/.kindi:/data kindi:0.3.0 verify
+docker run --rm --gpus all -u $(id -u):$(id -g) -v ~/.kindi:/data kindi:0.4.0 verify
 ```
 
 ```
@@ -164,14 +198,14 @@ measures the generation speed (see [Performance](#performance)).
 Optional - build the cluster file for the fast output head (about 2 minutes):
 
 ```sh
-docker run --rm --gpus all -u $(id -u):$(id -g) -v ~/.kindi:/data kindi:0.3.0 fast-head
+docker run --rm --gpus all -u $(id -u):$(id -g) -v ~/.kindi:/data kindi:0.4.0 fast-head
 ```
 
 ## Run the server
 
 ```sh
 docker run -d --name kindi --restart unless-stopped --gpus all -u $(id -u):$(id -g) \
-    -p 127.0.0.1:8093:8093 -v ~/.kindi:/data kindi:0.3.0
+    -p 127.0.0.1:8093:8093 -v ~/.kindi:/data kindi:0.4.0
 # native:  python3 -m kindi serve
 ```
 
@@ -208,7 +242,8 @@ print(r.choices[0].message.content)
 
 Kindi supports these request fields: `messages` (system / user / assistant / tool, text content), `tools` and
 `tool_choice` (`"none"` disables tools), and `stream` and `stream_options.include_usage`. It also supports
-`temperature` (0 = greedy), `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `stop` and `seed`. It also
+`temperature` (0 = greedy), `top_p`, `top_k`, `min_p`, `repeat_penalty` and `repeat_last_n` (as in llama.cpp; see
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md)), `max_tokens` / `max_completion_tokens`, `stop` and `seed`. It also
 supports `chat_template_kwargs.enable_thinking` (off by default). When thinking is on, the thinking comes back as
 `reasoning_content` (also streamed as `delta.reasoning_content`). `thinking_budget_tokens` caps the thinking. At the
 budget, the server closes the thinking and the model then gives its answer.
@@ -299,6 +334,7 @@ The other cards, at a short context, exact head:
 | Quadro K1200 | 2B / 4B / 9B | 81.0 / 39.2 / 23.4 tokens/s | 194.5 / 77.4 / 41.7 tokens/s |
 | 2x Quadro K1200 | 27B | 12.6 | 19.5 |
 | Quadro K6000 | 27B | 20.4 | 36.2 |
+| Tesla P100 16 GB (SXM2, 300 W) | 27B | 36.0 | 167.6 |
 | GeForce GTX 1080 | 27B | 29.4 | 256.7 |
 | GeForce RTX 3080 (190 W) | 27B | 63.2 (99.9 with the 2B draft model, on agent prompts) | 1,093 |
 | AMD Radeon 780M | 27B | 10.6 | 103.7 |
@@ -307,12 +343,39 @@ llama.cpp on the same card, with the same model file and the same context: on th
 tokens/s and reads prompts at 1.2 tokens/s (512 tokens). The tables for each card, with their method, are in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 How Kindi works: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
-The settings for each tested card (K420, K1200, K6000, GTX 1080, RTX 3080, Radeon 780M, CPU): [docs/CARDS.md](docs/CARDS.md).
+The settings for each tested card (K420, K1200, K6000, Tesla P100, GTX 1080, RTX 3080, RTX 20/30/40/50, Radeon 780M, CPU): [docs/CARDS.md](docs/CARDS.md).
 
 ## Agent benchmark
 
 [kbench](https://github.com/ahtx/kindi-bench) has 65 agent tasks with hidden tests and a runner. It also has
 the results of our runs with Kindi on the K420. kbench works with any OpenAI-compatible server.
+
+## AH-Nanbeige4.3-33B IQ3_XXS
+
+Kindi has a backend for AH-Nanbeige4.3-33B IQ3_XXS (our calibrated IQ3_XXS quantization of Nanbeige4.3-33B), 13.1 GB. This model
+is a separate download from Hugging Face. It is not a part of Kindi. Model card: https://huggingface.co/ahtx/AH-Nanbeige4.3-33B-IQ3_XXS-GGUF
+
+It is a strong model for coding work, and it can do even better on a slightly faster GPU.
+
+- Cards: one card with 16 GB or more (for example an RTX 3090), or several cards with about 17 GB in total (for
+  example two RTX 3080 10 GB cards or two Tesla P100 cards). The engine puts the layers on the cards in order. On a
+  Quadro K6000 (12 GB), it keeps 13 layers in host memory and computes part of them on the CPU.
+- Get the model: `kindi use nanbeige-33b`, or `install.sh --model nanbeige`. Both check the sha256 of the file after
+  the download.
+- `kindi verify` compares the output with llama.cpp. A prompt can end at a llama.cpp tie; that is not a failure.
+- Prompt lookup is on by default. When the model copies or edits text, it writes about 2 times as fast.
+
+Speed, same cards and same file as llama.cpp. On two RTX 3080 cards (190 W, PCIe x1), Kindi writes 45.5, 44.3, 40.7
+and 37.0 tokens/s at 0, 2K, 8K and 16K of context. llama.cpp writes 32.3, 35.3, 33.3 and 31.0. On two Tesla P100
+cards, Kindi writes 21.0 tokens/s at 512 tokens and 19.6 at 8K; llama.cpp writes 9.6 and 8.9 (about 2.2 times). On
+one Quadro K6000, Kindi writes 3.56 tokens/s at 8K of context, and llama.cpp writes 1.52 (2.3 times). The tables are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+Agent test: in an initial test of 115 tasks (the 65 tasks of kbench and 50 LiveCodeBench problems, one run of each
+task), the 33B solved 98 and the 27B solved 96.
+
+Both models run on Kindi's OpenAI-compatible server, so an agent tool such as opencode can use both. For example,
+use the 27B for fast steps and the 33B for harder coding steps.
 
 ## Limits
 
@@ -320,7 +383,8 @@ the results of our runs with Kindi on the K420. kbench works with any OpenAI-com
 - **On the K420, Kindi reads prompts at about 25-33 tokens/s**, so a long new prompt takes time. A new prompt of
   5,000 tokens takes about 3 minutes there. The cache makes repeated prompts fast. Kindi reads text that is not in
   the cache (for example, a large file or long command output) at this speed.
-- **The Ternary-Bonsai-2 models only** (the PTQ1_0 GGUFs: 2B, 4B, 9B, 27B). The 27B needs 8 GB of card memory (GTX
+- **The Ternary-Bonsai-2 models** (the PTQ1_0 GGUFs: 2B, 4B, 9B, 27B), Nemotron 3.5 Bolt E4B and AH-Nanbeige4.3-33B
+  IQ3_XXS only. The 27B needs 8 GB of card memory (GTX
   1080, RTX 3080) or two 4 GB cards (2x K1200).
 - **At most two GPUs per model.** Two cards run one model in tensor parallel. More cards run more servers.
 - **Small models make mistakes.** The 2B is good at short code, shell and factual questions, tool calls and
@@ -333,6 +397,7 @@ See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). The usual causes are:
 - Another program uses the card (out of memory at start).
 - On Kepler, the driver is not the 470 branch.
 - A client timed out while it waited for a long first prompt.
+- On rootless Docker, the commands must not have `-u $(id -u):$(id -g)` (see [docs/DOCKER.md](docs/DOCKER.md)).
 
 ## About
 

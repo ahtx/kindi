@@ -188,6 +188,10 @@ class Plan(object):
         arr = (ctypes.c_void_p * len(hs))(*[ctypes.addressof(h) for h in hs])
         self.segs[-1].append((ctypes.c_void_p(kern.kernel.ptr), grid, block, arr, hs))
 
+    def call(self, fn):
+        """a host step in the plan: fn(n) runs at its place, with the number of tokens of the pass (chunk.feed)"""
+        self.segs[-1].append(("call", fn))
+
     def set(self, tok, pos):
         for h, d in self.dyn:
             h.value = d.a + d.b * (pos if d.var == "pos" else tok)
@@ -286,7 +290,7 @@ class Shard(object):
         t0 = time.time()
         tern, flt = self._slices()
         if self.g5:
-            key = "%s-w%d-c%d" % ((tp.man.get("source_sha256") or "pack")[:12], tp.W, self.card)
+            key = "%s-w%d%s-c%d" % ((tp.man.get("source_sha256") or "pack")[:12], tp.W, getattr(tp, "split_tag", ""), self.card)
             if os.path.exists(os.path.join(tp.pack, "g5_%s.json" % key)):
                 tern_load = {}                    # cached 5-trit weights: no slices to read
             else:
@@ -327,7 +331,7 @@ class Shard(object):
             do += S.size
         if self.g5:
             # g5cache: the repacked weights, kept next to the pack (keyed by the pack's source hash and the slice)
-            key = "%s-w%d-c%d" % ((tp.man.get("source_sha256") or "pack")[:12], tp.W, self.card)
+            key = "%s-w%d%s-c%d" % ((tp.man.get("source_sha256") or "pack")[:12], tp.W, getattr(tp, "split_tag", ""), self.card)
             cpath = os.path.join(tp.pack, "g5_%s.bin" % key)
             ipath = os.path.join(tp.pack, "g5_%s.json" % key)
             lpath = os.path.join(tp.pack, "g5n_%s.bin" % key)
@@ -704,6 +708,11 @@ class TPEngine(object):
                 raise SystemExit("kindi: the FFN width does not split over two cards")
             self.ffn_rows = [(0, (nb + 1) // 2 * self.HB), (nb // 2 * self.HB, self.NFFg)]
             self.ffn_cols = [(0, half), (half, self.NFFg)]
+            if os.environ.get("KINDI_TC", "0") == "1":
+                # the tc plans (spec.py) take whole 1024-column units: the odd middle block goes to card 0
+                m = (nb + 1) // 2 * self.HB
+                self.ffn_rows = self.ffn_cols = [(0, m), (m, self.NFFg)]
+                self.split_tag = "-b"
             self.head_split = [0, VOCAB // 2, VOCAB]
         self.idx = json.load(open(os.path.join(pack, "index.json")))
         self.bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]

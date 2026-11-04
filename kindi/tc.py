@@ -1,4 +1,5 @@
-"""Tensor-core (int8 mma.sync) products for sm_80+ cards, compiled at start like the other kernels.
+"""Tensor-core (int8 mma.sync) products for sm_80+ cards, compiled at start like the other kernels (Pascal sm_61:
+the same products with dp4a, tcp.cu; see spec.SpecKernels).
 
 The image's NVRTC (CUDA 10.2) only targets compute_75 and has no mma.sync m16n8k32, but it passes inline PTX through
 unchecked: tc.cu is compiled to PTX for compute_75, the PTX header is raised to ISA 7.1 / sm_8x, and the driver's
@@ -15,9 +16,34 @@ NAMES = ("k_tc_pack", "k_tc_q8", "k_tc_mv2", "k_tc_mv4", "k_tc_mv8", "k_tc_sum",
          "k_tc_mv3_2", "k_tc_mv3_4", "k_tc_mv3_8", "k_tc_mm2")
 
 
+# Pascal sm_61 / sm_62 (dp4a, no tensor cores): the same kernels on dp4a (tcp.cu), same names and arguments
+NAMES_PASCAL = ("k_tc_pack", "k_tc_q8", "k_tc_mv2", "k_tc_mv4", "k_tc_mv8", "k_tc_sum", "k_tc_mv3_2", "k_tc_mv3_4",
+                "k_tc_mv3_8", "k_tp_mm")
+
+
+def pascal(card=None):
+    """the dp4a kernels: sm_61 / sm_62, or any sm_61+ CUDA card with KINDI_TC_DP4A=1 (a test of tcp.cu on a newer
+    card: the products are bit-identical to the tensor-core ones)"""
+    if cp.cuda.runtime.is_hip:
+        return False
+    p = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id if card is None else card)
+    cc = p["major"] * 10 + p["minor"]
+    return cc in (60, 61, 62) or (cc >= 61 and os.environ.get("KINDI_TC_DP4A", "0") == "1")
+
+
+def lane(card=None):
+    """sm_60 (Tesla P100, no dp4a): the tc plans keep the 5-trit lane layout and run lane-table products (tcl.cu,
+    fp32); KINDI_TC_LANE=1 forces them on other CUDA cards (a test), 0 turns them off (tcp.cu, dp4a emulated)"""
+    if cp.cuda.runtime.is_hip:
+        return False
+    p = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id if card is None else card)
+    v = os.environ.get("KINDI_TC_LANE", "")
+    return v == "1" or (v != "0" and (p["major"], p["minor"]) == (6, 0))
+
+
 def supported(card=None):
     p = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id if card is None else card)
-    return p["major"] >= 8
+    return p["major"] >= 8 or p["major"] == 6     # sm_60 (P100): tcp.cu on kdp4a's integer fallback
 
 
 def ptx_target(arch):
@@ -27,9 +53,9 @@ def ptx_target(arch):
     return arch if arch in ("sm_80", "sm_86") else "sm_80"
 
 
-def _patched_module(src, arch):
+def _patched_module(src, arch, opts=()):
     prog = compiler._NVRTCProgram(src, "tc.cu")
-    ptx, _ = prog.compile(("-arch=compute_75",))
+    ptx, _ = prog.compile(("-arch=compute_75",) + tuple(opts))
     if isinstance(ptx, bytes):
         ptx = ptx.decode()
     ptx = re.sub(r"\.version \d+\.\d+", ".version 7.1", ptx, count=1)

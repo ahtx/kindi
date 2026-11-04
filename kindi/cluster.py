@@ -13,15 +13,19 @@ import numpy as np
 DEQ_SRC = r'''
 extern "C" __global__ void deq(const unsigned char* __restrict__ b, const unsigned short* __restrict__ s,
                                float* __restrict__ out, int n, int C){
-  const int r = blockIdx.x, t = threadIdx.x;      /* C/4 threads: one 4-column slot each */
-  const unsigned int v = b[(long long)r * (C >> 2) + t];
-  float sc; asm("cvt.f32.f16 %0, %1;" : "=f"(sc) : "h"(s[(long long)r * (C >> 7) + (t >> 5)]));
-  float* o = out + (long long)r * C + 4 * t;
-  o[0] = (float)((int)(v % 3u) - 1) * sc;
-  o[1] = (float)((int)((v / 3u) % 3u) - 1) * sc;
-  o[2] = (float)((int)((v / 9u) % 3u) - 1) * sc;
-  o[3] = (float)((int)((v / 27u) % 3u) - 1) * sc;
+  const int r = blockIdx.x;
+  /* one 4-column slot per iteration; the block has DEQ_THREADS threads, so C/4 may exceed 1,024 (the 27B: 1,280) */
+  for (int t = threadIdx.x; t < (C >> 2); t += blockDim.x) {
+    const unsigned int v = b[(long long)r * (C >> 2) + t];
+    float sc; asm("cvt.f32.f16 %0, %1;" : "=f"(sc) : "h"(s[(long long)r * (C >> 7) + (t >> 5)]));
+    float* o = out + (long long)r * C + 4 * t;
+    o[0] = (float)((int)(v % 3u) - 1) * sc;
+    o[1] = (float)((int)((v / 3u) % 3u) - 1) * sc;
+    o[2] = (float)((int)((v / 9u) % 3u) - 1) * sc;
+    o[3] = (float)((int)((v / 27u) % 3u) - 1) * sc;
+  }
 }'''
+DEQ_THREADS = 256                                  # threads per block of the deq kernel (at most 1,024)
 
 
 def build(pack, K=1024, iters=12, log=print):
@@ -41,7 +45,7 @@ def build(pack, K=1024, iters=12, log=print):
     def chunk(i0):
         n = min(CH, R - i0)
         out = cp.empty((n, C), dtype=cp.float32)
-        deq((n,), (C // 4,), (cp.asarray(np.ascontiguousarray(bc[:, i0:i0 + n].T)),
+        deq((n,), (min(DEQ_THREADS, C // 4),), (cp.asarray(np.ascontiguousarray(bc[:, i0:i0 + n].T)),
                               cp.asarray(np.ascontiguousarray(dp[:, i0:i0 + n].T)), out, np.int32(n), np.int32(C)))
         out /= cp.maximum(cp.sqrt((out * out).sum(axis=1, keepdims=True)), 1e-12)
         return out

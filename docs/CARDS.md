@@ -94,6 +94,10 @@ Replace `...` with the variables in the section for your card. To use one card o
 - The prompt products use int8 activations on this card. For fp32, set `KINDI_CHUNK_Q8=0` (110 tokens/s at 512
   tokens).
 - On a host with more than one GPU, set `CUDA_VISIBLE_DEVICES` to the GTX 1080.
+- On Windows (WSL2 or native), the WDDM driver keeps part of the card memory. Kindi fits the context to the free
+  memory, so an 8 GB card gets a smaller context. A GTX 1070 with no monitor connected got 43,008 tokens for the 27B.
+  `KINDI_MEM_RESERVE_MB` sets the memory that the fit keeps free. A smaller value gives more context, but the
+  risk of an out-of-memory error is higher.
 
 ## GeForce RTX 3080, 10 GB (Ampere, sm_86)
 
@@ -135,6 +139,82 @@ reading 1,093 tokens/s at 512 to 855 at 22K.
 - Speculative greedy output is the same as the output without speculation.
 - The cluster runs seven servers on one 4-core host with `--memory 6g`. One server on a computer of its own can use
   the default budgets.
+
+## Tesla P100, 16 GB (Pascal, sm_60)
+
+The Tesla P100 is a supported card in Kindi 0.4.0. A used card costs $78 to $160. It has 16 GB of HBM2 memory with a
+bandwidth of 732 GB/s. Photo: GP100 chip of a Tesla P100, by Fritzchens Fritz, Wikimedia Commons (CC0).
+
+| item | value |
+|---|---|
+| models | 2B, 4B, 9B, 27B; the 33B on two cards (`kindi use nanbeige-33b`) |
+| variables | `KINDI_CARDS=1`, `KINDI_REPEAT_STOP=1`, `KINDI_MAX_TOKENS=65536` (the installer sets them) |
+| docker | `--memory 14g` |
+| generation, 27B, one card (SXM2, 300 W) | 36.0 tokens/s at 512 tokens, 34.6 at 8K (llama.cpp: 18.7 and 17.7) |
+| generation, 27B, two cards | 39.7 at 512 tokens, 39.0 at 8K |
+| prompt reading, 27B, one card | 167.6 tokens/s at 512 tokens, 159.6 at 8K (llama.cpp: 146.4 and 142.7) |
+| generation, 33B, two cards (PCIe, 200 W) | 21.0 tokens/s at 512 tokens, 19.6 at 8K, 15.7 at 32K, 12.3 at 64K (llama.cpp: 9.6 at 512, 8.9 at 8K) |
+
+- On the same P100, Kindi writes the 27B 1.9 to 2.7 times as fast as llama.cpp (one card, SXM2 box: 1.9; PCIe box: 2.0
+  on one card and 2.5 to 2.7 on two cards).
+- The fp16 prompt path is on by default for sm_60 (`KINDI_P100_FP16_PROMPT=0` turns it off). With it, Kindi reads a
+  prompt 14% (512 tokens) and 12% (8K) faster than llama.cpp on the same card. Without it, the read speed is below
+  llama.cpp.
+- Two P100 cards (PCIe, 200 W) hold the full 262,144-token context of the 27B, with 8.6 GB free on each card. Kindi reads a prompt of 262,016 tokens at 67.6 tokens/s and writes 15.8 tokens/s at that depth. Two cards also run the 33B.
+- Speculative decoding is off on the P100. On this card, a verify pass over several tokens costs about as much as the
+  same number of single steps, so a draft cannot save time.
+- `kindi verify` passes on one P100 for the 2B, 4B and 27B (token-exact), and on two P100 cards for the 33B.
+- The numbers come from two rented machines (SXM2 with NVLink, and PCIe). `docs/dev/bench-0.4.0/p100.md` has the
+  conditions of each row.
+
+## GeForce RTX 20, 30, 40 and 50 series
+
+Kindi 0.4.0 supports all four series. The tensor-core path and speculative decoding use cards of compute capability
+8.0 and later (RTX 30, 40 and 50). The RTX 20 series (Turing, sm_75) uses the default engine.
+
+| card | what we measured |
+|---|---|
+| RTX 3080 (190 W) | 27B: 62.3 tokens/s at 512 tokens. With the 2B draft model: 91.1 (1.46 times) at 512 tokens, 103.2 (1.68 times) at 8K with k=2, and 111.5 (1.82 times) at 8K with k=3. The same output as without the draft model. Against llama.cpp: see [BENCHMARKS.md](BENCHMARKS.md) |
+| RTX 3060 12 GB | 27B: 41.1 tokens/s at 512 tokens; with the 2B draft model 60.6 (1.48 times), 73.5 (1.82 times) at 8K, 66.7 (1.81 times) at 24K |
+| RTX 4060 Laptop 8 GB | a user report with Kindi 0.3.0: the 27B writes 28.0 tokens/s at 100 tokens and 25.2 at 24,000, `kindi verify` passes |
+| other RTX 20, 40 and 50 cards | supported; `kindi verify` passes. We give no speed numbers |
+
+## AH-Nanbeige4.3-33B IQ3_XXS
+
+| item | value |
+|---|---|
+| model | AH-Nanbeige4.3-33B IQ3_XXS (our calibrated IQ3_XXS quantization of Nanbeige4.3-33B): AH-Nanbeige4.3-33B-IQ3_XXS.gguf (`kindi use nanbeige-33b`); model card: https://huggingface.co/ahtx/AH-Nanbeige4.3-33B-IQ3_XXS-GGUF |
+| cards | one card with 16 GB or more (for example an RTX 3090), or several cards with about 17 GB in total (measured: 2x RTX 3080, 2x Tesla P100); a Quadro K6000 with layers in host memory |
+| variables | `KINDI_CTX=16384`, `KINDI_REPEAT_STOP=1`, `CUDA_VISIBLE_DEVICES=<the two cards>` |
+| docker | `--memory 10g` |
+| generation | 2x RTX 3080 (190 W): 45.5 tokens/s at a short context, 44.3 at 2K, 40.7 at 8K, 37.0 at 16K |
+| generation | 2x Tesla P100: 21.0 tokens/s at 512 tokens, 19.6 at 8K. Quadro K6000: 3.56 tokens/s at 8K |
+| prompt reading | 1,047 tokens/s at 512 tokens, 1,209 at 16K (2x RTX 3080) |
+
+It is a strong model for coding work, and it can do even better on a slightly faster GPU.
+
+The backend puts the layers in order on the cards. Only the hidden state goes between the cards, so PCIe x1 is
+sufficient. The GGUF file has no MTP head. Prompt lookup is on by default: when the model copies or edits text, it
+writes about 2 times as fast (91.6 against 45.1 tokens/s on two RTX 3080 cards at 8K).
+
+On one Quadro K6000 (12 GB), 13 layers stay in host memory (at a context of 8,448 tokens). The card copies them in
+while it computes, and the CPU computes 55% of the FFN rows of each host layer. Kindi writes 3.9 tokens/s at 480
+tokens and 3.56 at 8,160 tokens, and llama.cpp (the same card, 10 layers on the CPU) writes 2.19 and 1.52.
+
+An agent tool such as opencode can use the 27B and the 33B together, because both run on Kindi's OpenAI-compatible
+server. Use the 27B for fast steps and the 33B for harder coding steps.
+
+## AMD Radeon 780M (RDNA3, gfx1103)
+
+The Radeon 780M is the graphics unit of the Ryzen 7 7840HS and Ryzen 9 7940HS. It has no memory of its own and uses the
+memory of the computer (32 GB or more for the 27B). Kindi runs it through ROCm, in the `kindi-rocm` image, with the kernel
+option `amdgpu.cwsr_enable=0`. [AMD.md](AMD.md) gives the settings.
+
+| item | value |
+|---|---|
+| model | Ternary-Bonsai-2-27B, Nemotron or the 2B |
+| generation | 10.6 tokens/s at 512 tokens (27B) |
+| prompt reading | 103.7 tokens/s at 512 tokens (27B) |
 
 ## CPU (x86-64 with AVX2)
 

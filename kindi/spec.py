@@ -1,4 +1,5 @@
-"""Tensor-core decode and speculative decoding for the one-card plan engine (sm_80+, KINDI_TC=1).
+"""Tensor-core decode and speculative decoding for the one-card plan engine (sm_80+, KINDI_TC=1; on Pascal sm_61
+the same plans run the dp4a kernels of tcp.cu, bit-identical products).
 
 One plan per token count T = 1 .. 8: T tokens at positions pos .. pos + T - 1 in one pass, every matrix product an
 int8 tensor-core product of all T tokens (tc.cu: each token's result is bit-identical to a pass of that token
@@ -36,6 +37,7 @@ from . import tp as _tp
 from . import chunk as _chunk
 from . import tc as _tc
 from . import sampling
+from . import mtp as _mtp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 i32, f32t = np.int32, np.float32
@@ -46,6 +48,15 @@ FUSED = ("k_rmsfold_qT", "k_smfold_qT", "k_fold_fwht_qT", "k_softmax_m", "k_attn
          "k_rmsfold2_1024", "k_rmsfold2_512", "k_att_tc_T")
 FD_CH = 512                              # positions per block of the split flash-decode attention (tcf.cu)
 QB = 4                                   # queries per verify attention launch (k_attn_sq8m)
+# KINDI_SPEC=auto thresholds (positions), measured on an RTX 3080 at 190 W and an RTX 3060 (docs/MTP.md,
+# docs/dev/bench-0.4.0/mtp.md): the 2B's own head k=2 up to 8K, off above; the 27B with the 2B drafter k=2 below
+# 1K and k=3 from 1K. B2 (the 2B's head extends the 2B draft) was slower than B0 on both cards: off by default
+AUTO_MTP_K2_MAX = int(os.environ.get("KINDI_SPEC_MTP_K2_MAX", "8192"))
+AUTO_B0_K2_MAX = int(os.environ.get("KINDI_SPEC_B0_K2_MAX", "1024"))
+AUTO_B2_MAX = int(os.environ.get("KINDI_SPEC_B2_MAX", "0"))
+# the speculation guard works from this position on: below it, speculation was faster on every measured card, and
+# the guard's pauses cost 9-12% (RTX 3060, 512 and 24K)
+GUARD_FROM = int(os.environ.get("KINDI_SPEC_GUARD_FROM", "32768"))
 
 
 def wanted():
@@ -106,7 +117,16 @@ class SpecKernels(object):
         hip = cp.cuda.runtime.is_hip
         tcs = open(os.path.join(HERE, "tc_hip.cu" if hip else "tc.cu"), encoding="utf-8").read()
         tcf = open(os.path.join(HERE, "tcf.cu"), encoding="utf-8").read()
-        if hip:
+        pas = not hip and _tc.pascal()
+        names = _tc.NAMES_PASCAL if pas else _tc.NAMES
+        if pas:
+            # Pascal (sm_61): tcp.cu, the same products with dp4a on the pl layout; tca.cu (k_att_tc_T) is mma.sync
+            # only. Compiled for the card itself (no PTX patch).
+            tcs = open(os.path.join(HERE, "tcp.cu"), encoding="utf-8").read()
+            if _tc.lane():
+                tcs += "\n" + open(os.path.join(HERE, "tcl.cu"), encoding="utf-8").read()
+            mod = cp.RawModule(code=base + "\n" + wr + "\n" + own + "\n" + tcs + "\n" + tcf)
+        elif hip:
             # RDNA3: dp4a is v_dot4_i32_iu8; tca.cu (k_att_tc_T) is mma.sync only
             tcf = tcf.replace('asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));',
                               "d = __builtin_amdgcn_sudot4(true, a, true, b, c, false);")
@@ -121,11 +141,13 @@ class SpecKernels(object):
             mod = _tc._patched_module(base + "\n" + wr + "\n" + own + "\n" + tcs + "\n" + tcf,
                                       "sm_%d%d" % (p["major"], p["minor"]))
         self.mod = mod
-        for k in ([w + "_T" for w in WRAP] + ["k_sgdn_pre_T", "k_sgdn_deltan_T", "k_sgdn_deltan_C", "k_sconv_C"] +
-                  list(_tc.NAMES) + [f for f in FUSED if not (hip and f == "k_att_tc_T")]):
+        for k in ([w + "_T" for w in WRAP] + ["k_sgdn_pre_T", "k_sgdn_deltan_T", "k_sgdn_deltan_C", "k_sconv_C", "k_xsum_T"] +
+                  list(names) + (["k_g5t4"] + ["k_g5t2_%d" % n for n in (2, 3, 4)] + ["k_g5t1_%d" % n for n in (5, 6, 7, 8)]
+                   if pas and _tc.lane() else []) +
+                  [f for f in FUSED if not ((hip or pas) and f == "k_att_tc_T")]):
             f = mod.get_function(k)
             w = _Fn(f)
-            if hip:                                  # a RawKernel: the plans want its driver function (.ptr)
+            if hip or pas:                                # a RawKernel: the plans want its driver function (.ptr)
                 w.kernel = f.kernel
             setattr(self, k, w)
         self.mv = {2: self.k_tc_mv2, 4: self.k_tc_mv4, 8: self.k_tc_mv8}
@@ -243,6 +265,10 @@ if cp.cuda.runtime.is_hip and os.environ.get("KINDI_TC_GRAPHS", "0") != "1":
 def repack(s, log):
     """the card's 5-trit lane weights -> the tc layout, tensor by tensor through a scratch buffer"""
     t0 = time.time()
+    if _tc.lane(s.card):                     # sm_60: the lane-table products read the lane layout as it is
+        s.tc_layout = s.tc_lane = True
+        log("card %d: lane-table products (sm_60), weights in the 5-trit lane layout" % s.card)
+        return
     SK = s.sk
     big = max(int(R) * (int(C) // 128) * 7 for _, (_, _, R, C) in s.w.items())
     tmp = cp.empty(big, dtype=cp.uint32)
@@ -270,7 +296,15 @@ def repack(s, log):
     del tmp
     cp.get_default_memory_pool().free_all_blocks()
     s.tc_layout = True
-    log("card %d: weights repacked for the tensor cores (%.1fs)" % (s.card, time.time() - t0))
+    log("card %d: weights repacked for the %s (%.1fs)" % (s.card, "dp4a kernels" if _tc.pascal(s.card) else "tensor cores",
+                                                         time.time() - t0))
+
+
+def lane_sp(s, R, C):
+    """the lane path's column splits of an R x C product: enough blocks for two per SM (one config for every token
+    count, so a token's result never depends on how many share the pass)"""
+    bx = -(-(R // 16) // 32)                 # the decode kernel's blocks (k_g5n4: 8 warps of 4 tiles)
+    return max(1, min(8, C // 128, -(-2 * s.nsm // bx)))
 
 
 def tune(s, R, C, rowpar=None):
@@ -379,8 +413,20 @@ def mv3_args(ws, ys, Rs, NU, XQ, XS, XA, T):
 
 # ====================================================================================== buffers and plans
 def reserve(eng):
-    """buffers for T <= 8 token passes, allocated before the context fit"""
-    s = eng.cards[0]
+    """buffers for T <= 8 token passes, allocated before the context fit (on each card)"""
+    if eng.W == 2:
+        # the exchange of a T pass (k_xsum_T): per token slot [2 parities][2 cards][D] floats and a flag pair, in mapped
+        # host memory (its own slots: the decode plans' k_xrms keep theirs)
+        flags = cp.cuda.runtime.hostAllocMapped | cp.cuda.runtime.hostAllocPortable
+        D = eng.cards[0].D
+        eng.tcx_mem = cp.cuda.PinnedMemory(TMAX * 4 * D * 4, flags=flags)
+        eng.tcx_flags = cp.cuda.PinnedMemory(TMAX * 2 * 4, flags=flags)
+        np.ctypeslib.as_array((ctypes.c_int32 * (TMAX * 2)).from_address(eng.tcx_flags.ptr))[:] = 0
+    for s in eng.cards:
+        _reserve_card(eng, s)
+
+
+def _reserve_card(eng, s):
     with cp.cuda.Device(s.card):
         z = lambda n, t=cp.float32: cp.zeros(int(n), dtype=t)  # noqa: E731
         D, NFF, HK, HD = s.D, s.NFF, s.HK, s.HD
@@ -399,7 +445,10 @@ def reserve(eng):
         b["XQ"], b["XS"], b["XA"] = cp.zeros(T * NGm * 32, dtype=cp.uint32), z(T * NGm), cp.zeros(T * NGm, dtype=cp.int32)
         b["YH"], b["AOUT"] = z(T * s.R_head), cp.zeros(T, dtype=cp.int32)
         b["ctl"] = cp.zeros(16, dtype=cp.int32)
-        if os.environ.get("KINDI_CKPT_VRAM", "0") == "1" and not _building_drafter[0]:   # the cache's VRAM slot
+        if eng.W == 2:
+            b["YX"] = z(T * D)                    # the row-parallel sums after the exchange
+            s.tcctr = cp.zeros(TMAX, dtype=cp.int32)
+        if os.environ.get("KINDI_CKPT_VRAM", "0") == "1" and not _building_drafter[0] and eng.W == 1:   # the cache's VRAM slot
             from .cache import _Slot
             eng.ckpt_slot = _Slot(list(s.M) + list(s.conv), len(s.M))
         # verify attention: scores and value parts of QB queries (k_attn_sq8m and the _m kernels)
@@ -419,14 +468,15 @@ def reserve(eng):
         # split products: the parts buffer for the largest sp x T x R of the tuned configs
         mx = 0
         for name, (_, _, R, C) in s.w.items():
-            nw, sp = tune(s, int(R), int(C))
+            nw, sp = (8, lane_sp(s, int(R), int(C))) if getattr(s, "tc_lane", False) else tune(s, int(R), int(C))
             if sp > 1:
                 mx = max(mx, sp * T * int(R))
         b["PART"] = z(max(mx, 1))
         p0 = "blk.0."
         ia = s.dims["full_attention_interval"] - 1
-        for names in ([p0 + "attn_qkv.weight", p0 + "attn_gate.weight"], [p0 + "ffn_gate.weight", p0 + "ffn_up.weight"],
-                      ["blk.%d.attn_q.weight" % ia, "blk.%d.attn_k.weight" % ia, "blk.%d.attn_v.weight" % ia]):
+        for names in () if getattr(s, "tc_lane", False) else (
+                [p0 + "attn_qkv.weight", p0 + "attn_gate.weight"], [p0 + "ffn_gate.weight", p0 + "ffn_up.weight"],
+                ["blk.%d.attn_q.weight" % ia, "blk.%d.attn_k.weight" % ia, "blk.%d.attn_v.weight" % ia]):
             tune3(s, [int(s.w[n][2]) for n in names], int(s.w[names[0]][3]))
 
 
@@ -452,6 +502,23 @@ def build_plan(s, T, head, wb, aout=None, tokp=None):
         _, Wt, R, C = s.w[name]
         R, C = int(R), int(C)
         NG, NU = C // 128, C // 1024
+        if getattr(s, "tc_lane", False):
+            # sm_60: the lane-table product of the fp32 rows X (k_g5t4 for one token: four tiles per warp)
+            sp = lane_sp(s, R, C)
+            # (one token: kindi.cu's k_g5n4 itself, the faster of the two on the P100; tcl.cu's kernels give the same bits)
+            out = Yo if sp == 1 else PART
+            if T == 1:
+                P.add(K.k_g5n4, (-(-(R // 16) // 32), sp), (256,), (Wt, out, i32(R), i32(NG), X))
+            else:
+                U = 2 if T <= 4 else 1
+                P.add(getattr(SK, "k_g5t%d_%d" % (U, T)), (-(-(R // 16) // (9 * U)), sp), (288,),
+                      (Wt, out, i32(R), i32(NG), X, i32(ldx), TT))
+            if sp == 1:
+                return 1
+            if resid:
+                return sp
+            P.add(SK.k_tc_sum, ((R * T + 255) // 256,), (256,), (PART, Yo, i32(R), TT, i32(sp)))
+            return 1
         nw, sp = tune(s, R, C)
         if quant:
             P.add(SK.k_tc_q8, (NG, T), (128,), (X, i32(ldx), XQ, XS, XA, i32(NG), TT))
@@ -467,6 +534,10 @@ def build_plan(s, T, head, wb, aout=None, tokp=None):
 
     def gemm3(names, outs):
         """products of the same input in one launch (no splits)"""
+        if getattr(s, "tc_lane", False):
+            for n, o in zip(names, outs):
+                gemm(n, XP, work, o, False)
+            return
         ws = [s.w[n][1] for n in names]
         Rs = [int(s.w[n][2]) for n in names]
         C = int(s.w[names[0]][3])
@@ -477,12 +548,21 @@ def build_plan(s, T, head, wb, aout=None, tokp=None):
         """the residual add, RMS norm and Hadamard fold of every token, and their int8 rows for the next products"""
         add = st["pending"]
         r = PART if add > 1 else Y
+        if add and tp.W == 2:
+            # two cards: this card's row-parallel partial (its add column parts) + the other card's, for every token
+            P.add(SK.k_xsum_T, (T,), (1024,), (r, i32(add), i32(D), np.uint64(tp.tcx_mem.ptr), np.uint64(tp.tcx_flags.ptr),
+                                              i32(s.card), s.fail, s.tcctr, b["YX"]))
+            add, r = 1, b["YX"]
+        if _tc.pascal(s.card):
+            # the one-pass fold (tcf.cu k_rmsfold2) is the default on Pascal (P40, 27B: 2.2 vs 3.7 ms per token); set in
+            # the environment so that the prompt cache's engine fingerprint sees it
+            os.environ.setdefault("KINDI_D1", "1")
         rf2 = os.environ.get("KINDI_D1", "0") == "1" and HB in (512, 1024)
         P.add({512: SK.k_rmsfold2_512, 1024: SK.k_rmsfold2_1024}[HB] if rf2 else SK.k_rmsfold_qT, (D // HB, T),
               (HB if rf2 else 512,), (st["h"], r, st["h2"], s.f(wname), s.sD, XN, XP, i32(D), i32(add),
                                                        i32(HB), TT, i32(D), i32(max(add, 1) * D), i32(D), i32(D), i32(work),
                                                        XQ, XS, XA))
-        if add:
+        if st["pending"]:
             st["h"], st["h2"] = st["h2"], st["h"]
         st["pending"] = 0
 
@@ -633,15 +713,16 @@ def build_commit(s):
 
 
 def build(eng, log):
-    s = eng.cards[0]
     t0 = time.time()
-    with cp.cuda.Device(s.card):
-        s.tc_plans = {}
-        for T in range(1, TMAX + 1):
-            for head in (True, False):
-                wb = 0 if (head and T > 1) else 1
-                s.tc_plans[(T, head)] = Graph(build_plan(s, T, head, wb))
-        s.tc_commit = Graph(build_commit(s))
+    for s in eng.cards:
+        with cp.cuda.Device(s.card):
+            s.tc_plans = {}
+            for T in range(1, TMAX + 1):
+                for head in (True, False):
+                    wb = 0 if (head and T > 1) else 1
+                    s.tc_plans[(T, head)] = Graph(build_plan(s, T, head, wb))
+            s.tc_commit = Graph(build_commit(s))
+    s = eng.cards[0]
     eng.tc = True
     with cp.cuda.Device(s.card):
         free = rt_free()
@@ -658,9 +739,13 @@ def run(eng, toks, pos, head):
     T = len(toks)
     if pos + T > eng.ctx:
         raise OverflowError("position %d is past the context (%d)" % (pos + T - 1, eng.ctx))
-    s = eng.cards[0]
-    g = s.tc_plans[(T, head)]
-    g.launch(list(toks) + [0] * (TMAX - T), pos)
+    tk = list(toks) + [0] * (TMAX - T)
+    for s in eng.cards:
+        s.tc_plans[(T, head)].launch(tk, pos)
+    if eng.W == 2:
+        _gdrv().cuCtxSetCurrent(eng.cards[0].tc_plans[(T, head)].ctx)   # CuPy work after the pass stays on card 0
+    if head and _mtp.DUMP is not None:
+        _mtp.DUMP.rows(eng, toks, pos)
 
 
 def _hist(self):
@@ -827,18 +912,26 @@ def tc_step(self, tok, pos):
     _spec_flush(self)
     _hist_set(self, pos, [tok])
     k = getattr(self, "spec_k", 0) if getattr(self, "spec_ok", False) else 0
+    if k and getattr(self, "spec_auto", False) and self.spec_mode == "mtp":
+        k = 2 if pos <= AUTO_MTP_K2_MAX else 0      # measured: k=2 best up to 8K; above, no gain (off)
+    elif k and getattr(self, "spec_auto", False) and self.spec_mode == "draft2b":
+        k = 2 if pos < AUTO_B0_K2_MAX else 3        # measured: k=2 best at 512, k=3 from 1K
     k = min(k, self.ctx - pos - 1)
-    G = _guard(self) if k > 0 and os.environ.get("KINDI_SPEC_GUARD", "1") == "1" else None
+    G = _guard(self) if k > 0 and os.environ.get("KINDI_SPEC_GUARD", "1") == "1" and pos >= GUARD_FROM else None
     if G is not None:
         G.at(pos)
         if not G.want_spec():
             k = 0
     t0 = time.perf_counter()
     dr2 = getattr(self, "drafter", None) if k > 0 and self.spec_mode in ("draft2b", "both") else None
+    mt = getattr(self, "mtp", None)
     d = []
-    if k > 0:
+    if k > 0 and self.spec_mode == "mtp":
+        d = mt.draft(tok, pos, k)
+    elif k > 0:
         d = _hist(self).propose(k) if self.spec_mode in ("ngram", "both") else []
         if dr2 is not None and len(d) < (2 if self.spec_mode == "both" else 1):   # "both": n-gram if it has 2+
+            dr2.b2_on = getattr(self, "spec_b2", True) and (not getattr(self, "spec_auto", False) or pos < AUTO_B2_MAX)
             d = dr2.draft(_hist(self).h, pos, k)
         else:
             dr2 = None
@@ -858,6 +951,8 @@ def tc_step(self, tok, pos):
                 j += 1
         if dr2 is not None:
             dr2.accept(j)
+        if mt is not None:
+            mt.seen(pos, j + 1, A[:j + 1])
         self._spq = [(pos + i, d[i - 1], A[i], i) for i in range(1, j + 1)]
         self._sppend, self._spn = True, 0
         st = self.spec_stats
@@ -873,8 +968,9 @@ def tc_step(self, tok, pos):
             self.spec_presampled = A[0]
         return A[0]
     run(self, [tok], pos, True)
-    s = self.cards[0]
-    best = int(s.tcb["AOUT"][0])
+    best = argmaxes(self, 1)[0]
+    if mt is not None:
+        mt.seen(pos, 1, [best])
     if G is not None:
         G.note(False, 1, G.span(t0))
     if k:
@@ -886,12 +982,25 @@ def tc_step(self, tok, pos):
 def tc_feed(self, tok, pos):
     _spec_flush(self)
     _hist_set(self, pos, [tok])
-    run(self, [tok], pos, False)
+    if getattr(self, "mtp", None) is not None:
+        self.mtp.gap()
+    run(self, [tok], pos, _mtp.DUMP is not None)
 
 
 def tc_feed_batch(self, toks, pos):
     _spec_flush(self)
     _hist_set(self, pos, toks)
+    if getattr(self, "mtp", None) is not None:
+        self.mtp.gap()
+    if _mtp.DUMP is not None:                    # the recorder hook (tools): every row with the head
+        i = 0
+        while i < len(toks):
+            n = min(TMAX, len(toks) - i)
+            run(self, toks[i:i + n], pos + i, True)
+            if n > 1:
+                commit(self, n)
+            i += n
+        return
     i = _chunk.feed(self, toks, pos)             # whole chunks first (tensor-core GEMMs), the rest T <= 8 at a time
     while i < len(toks):
         n = min(TMAX, len(toks) - i)
@@ -903,13 +1012,30 @@ def spec_begin(self, greedy, temperature=0.0, top_p=1.0, top_k=0, rng=None):
     """speculative decoding for the steps that follow: greedy requests, or sampled ones when the server passes its
     sampling settings and generator (speculative sampling)"""
     mode = os.environ.get("KINDI_SPEC", "0")
+    self.spec_auto = mode == "auto"
+    if mode == "auto":
+        # KINDI_SPEC=auto (the measured choice on a 3080): a model with its own MTP head drafts with it (greedy);
+        # a model with the 2B drafter uses it, plus the 2B's head (B2) below KINDI_SPEC_B2_MAX tokens of context
+        if getattr(self, "drafter", None) is not None:
+            mode = "draft2b"
+        elif getattr(self, "mtp", None) is not None and greedy:
+            mode = "mtp"
+        else:
+            mode = "0"
     if mode in ("draft2b", "both") and getattr(self, "drafter", None) is None:
         mode = "ngram"
+    if mode == "mtp" and (getattr(self, "mtp", None) is None or not greedy):
+        mode = "0"                               # the MTP head drafts for greedy requests only (for now)
+    if _mtp.DUMP is not None:
+        mode = "0"
     self.spec_mode = mode
-    self.spec_k = int(os.environ.get("KINDI_SPEC_K", "4")) if mode in ("ngram", "draft2b", "both") else 0
+    self.spec_k = int(os.environ.get("KINDI_SPEC_K", "4")) if mode in ("ngram", "draft2b", "both", "mtp") else 0
+    if self.spec_auto and mode == "draft2b":
+        self.spec_k = 3
+    self.spec_b2 = greedy                        # B2 (the 2B's head extends the draft): greedy requests only
     self.spec_k = max(0, min(self.spec_k, TMAX - 1))
     self.spec_sp = None
-    if not greedy and rng is not None and os.environ.get("KINDI_SPEC_SAMPLE", "1") == "1":
+    if not greedy and rng is not None and os.environ.get("KINDI_SPEC_SAMPLE", "1") == "1" and self.W == 1:
         self.spec_sp = (float(temperature), float(top_p), int(top_k), rng)
         if getattr(self, "_spsampler", None) is None:
             self._spsampler = sampling.Sampler(self)
@@ -934,9 +1060,21 @@ def tc_ylog(self):
     s = self.cards[0]
     r = getattr(self, "_ylog_row", 0)
     if getattr(self, "_aout_for", None) != (r, self._best):      # the sampler's band is relative to this row's best
-        self.aout[0] = self._best
+        with cp.cuda.Device(s.card):
+            self.aout[0] = self._best
         self._aout_for = (r, self._best)
-    return s.tcb["YH"][r * s.R_head:(r + 1) * s.R_head]
+    if self.W == 1:
+        return s.tcb["YH"][r * s.R_head:(r + 1) * s.R_head]
+    if getattr(self, "_ylog_for", None) != (r, self._best):      # two cards: both halves of the row on card 0
+        c1 = self.cards[1]
+        with cp.cuda.Device(c1.card):
+            y1 = cp.asnumpy(c1.tcb["YH"][r * c1.R_head:(r + 1) * c1.R_head])
+        with cp.cuda.Device(s.card):
+            h = self.head_split[1]
+            self._ylog[:h] = s.tcb["YH"][r * s.R_head:(r + 1) * s.R_head]
+            self._ylog[h:] = cp.asarray(y1)
+        self._ylog_for = (r, self._best)
+    return self._ylog
 
 
 def _dist(self, row, best):
@@ -1006,13 +1144,36 @@ def spec_accept(dists, d, rng):
 def verify(eng, toks, pos):
     """the T = len(toks) argmaxes after each token, the GDN state left as it was"""
     run(eng, toks, pos, True)
-    return [int(x) for x in cp.asnumpy(eng.cards[0].tcb["AOUT"][:len(toks)])]
+    return argmaxes(eng, len(toks))
+
+
+def argmaxes(eng, T):
+    """the argmaxes of the last pass's T rows; two cards: each card's best of its half of the vocabulary, the larger
+    logit wins (a tie goes to card 0, as in TPEngine.step)"""
+    if eng.W == 1:
+        return [int(x) for x in cp.asnumpy(eng.cards[0].tcb["AOUT"][:T])]
+    best = None
+    for s in eng.cards:
+        with cp.cuda.Device(s.card):
+            b = s.tcb
+            i = b["AOUT"][:T]
+            v = cp.asnumpy(b["YH"][cp.arange(T, dtype=cp.int64) * s.R_head + i])
+            g = cp.asnumpy(i).astype(np.int64) + eng.head_split[s.card]
+        if best is None:
+            best = [v, g]
+        else:
+            m = v > best[0]
+            best = [np.where(m, v, best[0]), np.where(m, g, best[1])]
+    return [int(x) for x in best[1]]
 
 
 def commit(eng, n):
-    s = eng.cards[0]
-    s.tcb["ctl"][0] = n
-    s.tc_commit.launch()
+    for s in eng.cards:
+        with cp.cuda.Device(s.card):
+            s.tcb["ctl"][0] = n
+        s.tc_commit.launch()
+    if eng.W == 2:
+        _gdrv().cuCtxSetCurrent(eng.cards[0].tc_commit.ctx)
 
 
 # ====================================================================================== drafters
@@ -1134,6 +1295,9 @@ class Draft2B(object):
         self.pend = None
         self.refeeds = 0
         self.resumes = 0
+        self.mtp = None                          # KINDI_SPEC_DRAFT_HEAD: the 2B's own MTP head extends its draft
+        self.b2 = False
+        self.b2_on = True
 
     def begin(self):
         self.want_snap = True
@@ -1192,15 +1356,35 @@ class Draft2B(object):
             with cp.cuda.Device(s.card):
                 g = self.g[k] = Graph(build_draft(s, k, self.M0, self.C0))
         x = hist[pos]
+        if self.mtp is not None and self.b2_on:
+            # mode B2: one 2B step, then the 2B's head guesses the rest of the draft from that step's hidden state
+            # (unchecked by the 2B; the main model verifies every token)
+            g = self.g.get(1)
+            if g is None:
+                with cp.cuda.Device(s.card):
+                    g = self.g[1] = Graph(build_draft(s, 1, self.M0, self.C0))
+            g.launch([x] + [0] * TMAX, p2)
+            d = [int(cp.asnumpy(s.tcb["AOUT"][:1])[0])]
+            if k > 1:
+                self.mtp.gap()
+                self.mtp.seen(p2, 1, d)
+                d += self.mtp.draft(d[0], p2 + 1, k - 1)
+            self.pend, self.b2 = (p2, x, d), True
+            return d
         g.launch([x] + [0] * TMAX, p2)
         d = [int(t) for t in cp.asnumpy(s.tcb["AOUT"][:k])]
-        self.pend = (p2, x, d)
+        self.pend, self.b2 = (p2, x, d), False
         return d
 
     def accept(self, j):
         """the verify accepted d[:j]: the draft model's history becomes hist[base:pos] + [x] + d[:j]"""
         p2, x, d = self.pend
         self.pend = None
+        if self.b2:                              # B2: the 2B read only x; back to before it, read x + the accepted
+            self.restore.launch()
+            self.e.feed_batch([x] + d[:j], p2)
+            self.h[p2:] = [x] + d[:j]
+            return
         if j == len(d):                          # all accepted: it read x, d[:-1]; d[-1] is still to read
             self.e.feed(d[-1], p2 + len(d))
             self.h[p2:] = [x] + d
@@ -1215,7 +1399,7 @@ def load_stream(self):
     """Shard._load for one card from the cached lane-layout weights, read in 256 MB pieces straight into card
     memory (the full load holds the 5.6 GB file plus a pinned staging copy in host memory). False: not cached."""
     tp = self.tp
-    key = "%s-w%d-c%d" % ((tp.man.get("source_sha256") or "pack")[:12], tp.W, self.card)
+    key = "%s-w%d%s-c%d" % ((tp.man.get("source_sha256") or "pack")[:12], tp.W, getattr(tp, "split_tag", ""), self.card)
     ipath = os.path.join(tp.pack, "g5_%s.json" % key)
     lpath = os.path.join(tp.pack, "g5n_%s.bin" % key)
     if not (os.path.exists(ipath) and os.path.exists(lpath)):
@@ -1301,9 +1485,9 @@ def install(log=print):
     _tp.Shard._slices, _tp.Shard.build_plans = _slices, _bplans
 
     def _load(self):
-        if not (self.tp.W == 1 and self.g5l and _tc.supported(self.card) and load_stream(self)):
+        if not (self.tp.W in (1, 2) and self.g5l and _tc.supported(self.card) and load_stream(self)):
             o_load(self)
-        if self.tp.W == 1 and self.g5l and _tc.supported(self.card):
+        if self.tp.W in (1, 2) and self.g5l and _tc.supported(self.card):
             self.sk = SpecKernels()
             repack(self, self.log)
 
@@ -1319,6 +1503,10 @@ def install(log=print):
             if _drafter[0] is not None and eng is not _drafter[0]:
                 eng.drafter = Draft2B(_drafter[0])
                 eng.log("speculative draft model attached: %s, ctx %d" % (_drafter[0].pack, _drafter[0].ctx))
+                if os.environ.get("KINDI_SPEC_DRAFT_HEAD"):
+                    eng.drafter.mtp = _mtp.MTPDraft(_drafter[0], os.environ["KINDI_SPEC_DRAFT_HEAD"], log=eng.log)
+            if os.environ.get("KINDI_SPEC") in ("mtp", "auto") and os.environ.get("KINDI_MTP_HEAD") and not _building_drafter[0]:
+                eng.mtp = _mtp.MTPDraft(eng, os.environ["KINDI_MTP_HEAD"], log=eng.log)
 
     _tp.Shard._load = _load
     _chunk.reserve = _reserve
@@ -1343,21 +1531,39 @@ def install(log=print):
         self._req_ctx = int(ctx)                  # the verify attention buffers are sized before the context fit
         os.environ["KINDI_BATCH"] = "1"           # (the tensor-core plans replace the batch plan)
         os.environ.setdefault("KINDI_MEM_RESERVE_MB", "256")   # the graphs are instantiated after the context fit
+        sm = os.environ.get("KINDI_SPEC")
+        hps = [os.environ.get("KINDI_MTP_HEAD") if sm in ("mtp", "auto") else None,
+               os.environ.get("KINDI_SPEC_DRAFT_HEAD") if sm in ("draft2b", "both", "auto") else None]
+        hps = [h for h in hps if h]
+        if hps and not _building_drafter[0] and not getattr(self, "_mtp_rsv", 0):
+            # the MTP heads' weights and buffers: kept out of the context fit (loaded after the build)
+            self._mtp_rsv = sum(os.path.getsize(h) // 2 ** 20 + 160 for h in hps)
+            os.environ["KINDI_MEM_RESERVE_MB"] = str(int(os.environ["KINDI_MEM_RESERVE_MB"]) + self._mtp_rsv)
         o_init(self, pack, ctx, *a, **k)
 
     _tp.TPEngine.__init__ = init_
     # KINDI_SPEC=draft2b|both: the draft model (KINDI_SPEC_PACK, a Ternary-Bonsai-2 2B pack) on the same card, built
     # first so the main model's context fit sees the memory it takes
-    if os.environ.get("KINDI_SPEC", "0") in ("draft2b", "both") and os.environ.get("KINDI_SPEC_PACK"):
+    if os.environ.get("KINDI_SPEC", "0") in ("draft2b", "both", "auto") and os.environ.get("KINDI_SPEC_PACK"):
         _building_drafter[0] = True
-        _drafter[0] = _tp.TPEngine(os.environ["KINDI_SPEC_PACK"], ctx=int(os.environ.get("KINDI_SPEC_CTX") or os.environ.get("KINDI_SPEC_WINDOW", "8192")),
-                                   log=lambda *a: log("draft: " + " ".join(str(x) for x in a)))
+        cards = os.environ.get("KINDI_CARDS")
+        os.environ["KINDI_CARDS"] = "1"
+        try:
+            _drafter[0] = _tp.TPEngine(os.environ["KINDI_SPEC_PACK"], ctx=int(os.environ.get("KINDI_SPEC_CTX") or os.environ.get("KINDI_SPEC_WINDOW", "8192")),
+                                       log=lambda *a: log("draft: " + " ".join(str(x) for x in a)))
+        finally:
+            if cards is None:
+                os.environ.pop("KINDI_CARDS", None)
+            else:
+                os.environ["KINDI_CARDS"] = cards
         _building_drafter[0] = False
     o_reset = _tp.TPEngine.reset
 
     def reset_(self):
         self._sppend, self._spq = False, []
         _hist(self).truncate(0)
+        if getattr(self, "mtp", None) is not None:
+            self.mtp.reset()
         return o_reset(self)
 
     _tp.TPEngine.step, _tp.TPEngine.feed, _tp.TPEngine.feed_batch = step, feed, feed_batch

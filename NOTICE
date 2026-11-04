@@ -1,9 +1,10 @@
-Kindi 0.1.0 - third-party notices
+Kindi 0.4.0 - third-party notices
 
 Kindi is licensed under the GNU Affero General Public License v3.0 (see LICENSE). Commercial licenses are
 available (see COMMERCIAL-LICENSE.md).
 
-Kindi is distributed without any model weights or third-party code. It is designed to be used with, and at run time
+Kindi is distributed without any model weights. It contains no third-party code, except the file-format data
+listed at the end of this file. It is designed to be used with, and at run time
 depends on, the following, which are obtained separately and governed by their own licenses:
 
 Ternary-Bonsai-2-2B (model weights, GGUF)          Apache License 2.0
@@ -22,4 +23,26 @@ NVIDIA CUDA Toolkit 10.2                            NVIDIA CUDA Toolkit End User
 
 Interoperability: Kindi reads the GGUF file format and reproduces the numerical behaviour and the tokenizer of
 llama.cpp (MIT License, the ggml authors) for this model, so that its output can be checked against llama.cpp's. The
-reference outputs in kindi/reference.json were produced with llama.cpp. No llama.cpp source code is included.
+reference outputs in kindi/reference*.json were produced with llama.cpp. No llama.cpp source code is included,
+except the GGUF codebook tables listed below, which are file-format data.
+
+GGUF codebook tables (IQ2_S, IQ3_XXS and IQ3_S grids; IQ4_NL values), used in kindi/nbq_grids.h and
+kindi/gemma4.cu, are file-format data from ggml, MIT License, Copyright (c) 2023-2026 The ggml authors:
+
+  MIT License
+
+  Copyright (c) 2023-2026 The ggml authors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+  documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+  the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and
+  to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+  the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+  THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+  CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+  IN THE SOFTWARE.

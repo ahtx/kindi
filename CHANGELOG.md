@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.4.0 (2026-11-04)
+
+### New
+
+- **Speculative decoding by default on tensor-core cards.** On NVIDIA sm_80 and later, the installer sets
+  `KINDI_SPEC=auto`. The 27B uses the 2B as its draft model: k=2 below 1K tokens of context, k=3 from 1K. On an
+  RTX 3080 at 190 W, the 27B writes 1.46 times as fast at 512 tokens of context and 1.82 times as fast at 8K. The
+  output is the same as without speculation. [docs/MTP.md](docs/MTP.md) gives the measurements.
+- **An MTP head for the 2B.** `kindi-mtp-2b-v1.npz` drafts tokens for Ternary-Bonsai-2-2B, up to 8K tokens of context
+  (about 1.1 times as fast). The installer downloads it from
+  [Hugging Face](https://huggingface.co/ahtx/kindi-mtp-heads) and checks its sha256.
+- **The Tesla P100 (sm_60) is a supported card.** The 27B writes 36.0 tokens/s on one P100 (SXM2, 300 W) at 512 tokens, against
+  18.7 for llama.cpp on the same card. A new fp16 prompt path is on by default for sm_60 (`KINDI_P100_FP16_PROMPT=0`
+  turns it off). With it, Kindi reads prompts 12% to 14% faster than llama.cpp. Speculation is off on the P100. The
+  33B runs on two P100 cards at about 2.2 times the speed of llama.cpp. [docs/CARDS.md](docs/CARDS.md) has the numbers.
+- **The GeForce RTX 20, 30, 40 and 50 series.** All four series are supported. `kindi verify` passes on them. The
+  speed numbers are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the cards that we measured.
+- **AH-Nanbeige4.3-33B IQ3_XXS.** Kindi has a backend for AH-Nanbeige4.3-33B IQ3_XXS (our calibrated IQ3_XXS quantization of Nanbeige4.3-33B). It puts the layers on one or more NVIDIA
+  cards (two RTX 3080, two Tesla P100, one RTX 3090), and on a Quadro K6000 with layers in host memory (3.56 tokens/s at 8K, 1.52 for llama.cpp). Use `kindi use nanbeige-33b` or `install.sh --model nanbeige`. On two RTX 3080 cards, it writes 45.5
+  tokens/s, and llama.cpp writes 32.3 with the same file. Prompt lookup is on by default (2 times as fast on copy and edit
+  work). In an initial test of 115 tasks, the 33B solves 98 and the 27B solves 96. Model card:
+  https://huggingface.co/ahtx/AH-Nanbeige4.3-33B-IQ3_XXS-GGUF
+- **A start-up self-check for the 33B.** The AH-Nanbeige4.3-33B server checks itself at start-up. If the check
+  fails, the server stops, so the service restarts it before it gives a wrong reply.
+- **Sampler settings.** Requests can set `min_p`, `repeat_penalty` and `repeat_last_n` (#4).
+- **Pinned checkpoints.** `KINDI_CKPT_PINNED` keeps the host copies of the prompt-cache checkpoints in pinned
+  memory. It is on by default under WSL2 (#4).
+
+### Changed
+
+- The speculation guard works from 32K tokens of context (`KINDI_SPEC_GUARD_FROM`). Below 32K, speculation was
+  faster on each card that we measured.
+- The installer works with rootless Docker, and it checks `--gpus` before `kindi verify` (#8).
+- The README tells what to do after the install: the port, `/health`, clients, curl and Python (#11).
+
+### Fixed
+
+- The CPU engine restores a cached state in place (#9).
+- `kindi bench` times the CPU engine with the host clock when there is no CuPy (#10).
+- A streaming request with a prompt that is too long gets HTTP 400 (`context_length_exceeded`) before the first
+  byte. Before, the server sent HTTP 200 and then an error in the stream (#18).
+- `kindi fast-head` works on a model with more than 4,096 hidden values, for example the 27B (1,280 threads in one
+  block was more than the limit of 1,024) (#4).
+- `/health` shows the head that runs. A model that has no fast head (the 27B, Nanbeige) shows `exact` also when
+  `kindi head fast` was set (#4).
+- The installer finds the compute capability of the Tesla K10 and K20 (Kepler) and of the GTX TITAN X (Maxwell,
+  sm_52) from the card name. The Quadro K2000 and K4000 are no longer taken for a K20 and a K40 (#19).
+
 ## 0.3.0 (2026-10-28)
 
 ### New

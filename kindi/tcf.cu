@@ -118,9 +118,13 @@ extern "C" __global__ void k_copyf(const float* __restrict__ src, float* __restr
    whether it runs alone (decode) or with others (verify). */
 #define FD_CH 512
 __device__ __forceinline__ int fd_dp4a(int a, int b, int c){
+#if !KHIP && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+  return kdp4a(a, b, c);                 /* sm_60 (P100): kindi.cu's integer fallback */
+#else
   int d;
   asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
   return d;
+#endif
 }
 template <int G>
 __device__ __forceinline__ void fd_q8(const uint4* __restrict__ Kq, const unsigned short* __restrict__ Kd,

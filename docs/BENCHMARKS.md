@@ -9,6 +9,100 @@ Unless a table says otherwise, the method is the same for the two engines. They 
 is read in segments up to each N, and the read time of N tokens is the sum of the segments. At each N, 32 tokens are
 generated. Project page: [amirhusain.com/kindi](https://amirhusain.com/kindi/).
 
+## Kindi 0.4.0: AH-Nanbeige4.3-33B IQ3_XXS and the 27B, initial agent test
+
+In the initial test (the 65 tasks of kbench and 50 LiveCodeBench problems, one run each), the 33B solved 98 and the 27B solved 96.
+
+## Kindi 0.4.0: Tesla P100 (sm_60)
+
+Two rented machines gave the numbers. Do not mix them. Box A: 2x Tesla P100-SXM2-16GB (NVLink, 300 W), driver 535.230.02,
+Kindi pascal-p100 b8c6e3f and p100-fp16-prompt 56d896d. Box B: 2x Tesla P100 16 GB (PCIe, 200 W). llama.cpp: Prism fork
+c96baf4, CUDA 12.8, `-ngl 99 -fa 1`, 3 runs. The 27B uses q8_0 K/V in both engines. Details and raw rows:
+`docs/dev/bench-0.4.0/p100.md`.
+
+27B, box A. Read: a prompt of N tokens from position 0. Write: generation at depth N.
+
+| Setup | Read 512 | Read 8K | Write 512 | Write 8K |
+|---|---|---|---|---|
+| Kindi, one card, fp16 prompt path on | 167.6 | 159.6 | 36.0 | 34.6 |
+| Kindi, one card, fp16 prompt path off | 97.5 | 94.6 | 36.1 | 34.6 |
+| Kindi, 2 cards, fp16 on | 146.8 | 143.7 | 39.7 | 39.0 |
+| llama.cpp, one card | 146.4 | 142.7 | 18.7 | 17.7 |
+
+27B, box B, write:
+
+| Setup | 512 | 8K | 30K |
+|---|---|---|---|
+| Kindi, 2 cards | 40.4 | 39.5 | 34.9 |
+| llama.cpp, 2 cards | 14.9 | 15.9 | 13.6 |
+| Kindi, one card | 29.6 | 26.8 | |
+| llama.cpp, one card | 14.4 | 13.3 | |
+
+AH-Nanbeige4.3-33B IQ3_XXS, 2 cards (box B), write:
+
+| Setup | 512 | 8K | 32K | 64K |
+|---|---|---|---|---|
+| Kindi | 21.0 | 19.6 | 15.7 | 12.3 |
+| llama.cpp | 9.6 | 8.9 | | |
+
+27B on two cards, full context (box B, PCIe, stock 200 W, tensor parallel): the full 262,144 tokens of context fit, with 8.6 GB free on each card.
+Kindi reads a prompt of 262,016 tokens at 67.6 tokens/s (3,877 s) and writes 15.8 tokens/s at a depth of 262,016.
+
+For the 2B on one card (box B), Kindi writes 166 / 162 / 149 tokens/s at 512 / 8K / 24K or deeper, and llama.cpp 129 /
+122 / 120. llama.cpp reads the 2B faster (2,701 against 1,365 at 512). Speculation is off on the P100.
+
+## Kindi 0.4.0: AH-Nanbeige4.3-33B IQ3_XXS, one Quadro K6000
+
+One K6000 12 GB (a VM, driver 470.256.02), f16 K/V, context 8,448. Kindi keeps 13 layers in host memory and computes 55%
+of their FFN rows on the CPU (8 threads). llama.cpp ad1b88c with `-ngl 42` (the other 10 layers on the CPU). Write is
+the speed of 32 tokens after the prompt.
+
+| Prompt | Kindi write | llama.cpp write |
+|---|---|---|
+| 480 tokens | 3.85 | 2.19 |
+| 2,016 tokens | 3.55 | 1.96 |
+| 8,160 tokens | 3.56 | 1.52 |
+
+At a context of 1,024 (6 host layers), Kindi writes 4.4 to 5.0 tokens/s (two runs), and llama.cpp (4 layers on the CPU) writes 2.5 to 2.7.
+`kindi verify` passes: 9 of 11 prompts token-exact, 2 end at a llama.cpp tie, 0 fail.
+
+## Kindi 0.4.0: AH-Nanbeige4.3-33B IQ3_XXS, two RTX 3080 cards
+
+| Item | Value |
+|---|---|
+| Cards | 2x GeForce RTX 3080 10 GB, 190 W limit, PCIe gen1/2 x1 |
+| Model | AH-Nanbeige4.3-33B-IQ3_XXS.gguf (13.1 GB, sha256 9d4f18e8...a6c239), 52 layers |
+| Layer split | Kindi 26 + 26; llama.cpp `-sm layer` |
+| K/V cache | f16 for both engines |
+| llama.cpp | build 11382 (11fe02151), `llama-bench -ngl 99 -fa 1 -sm layer` |
+| Verify | `kindi verify` PASS: 8 of 11 prompts token-exact, 3 end at a llama.cpp tie, 0 fail |
+
+Write speed (Kindi: 64 tokens at each depth; llama.cpp: tg128 at each depth, 3 runs):
+
+| Context depth | Kindi | llama.cpp |
+|---|---|---|
+| 0 | 45.5 | 32.3 |
+| 2,048 | 44.3 | 35.3 |
+| 8,192 | 40.7 | 33.3 |
+| 16,384 | 37.0 | 31.0 |
+
+Read speed (a prompt of N tokens from position 0):
+
+| Prompt | Kindi | llama.cpp |
+|---|---|---|
+| 512 | 1,047 | 447 to 539 (it changed from run to run) |
+| 2,048 | 1,267 | 1,120 |
+| 8,192 | 1,259 | 1,238 |
+| 16,384 | 1,209 | 1,190 |
+
+Prompt lookup (context 8,192, `kindi serve`, 400 tokens out): a file copied with changes 91.6 tokens/s against 45.1
+without it (2.03 times); a tool call 1.17 times; prose the same.
+
+The 33B also runs on a single RTX 3090 (24 GB). We give no 3090 speed numbers here.
+
+Through `kindi serve`: 45.4 tokens/s greedy, 44.2 sampled (temperature 0.7, top-k 20, top-p 0.8). Build: branch
+nanbeige-iq3 (engine fde34d6, server 1ca5066).
+
 ## Kindi 0.3.0: Nemotron, the CPU engine and the prompt cache
 
 The tables in this section are new in 0.3.0. The Bonsai tables after them are from Kindi 0.2.0. We measured the

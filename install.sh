@@ -19,7 +19,7 @@
 # password or a key. Copyright (c) 2026 Amir Husain. SPDX-License-Identifier: AGPL-3.0-only.
 set -euo pipefail
 
-KINDI_VERSION="0.3.0"
+KINDI_VERSION="0.4.0"
 SOURCE_URL="https://github.com/ahtx/kindi/archive/refs/tags/v${KINDI_VERSION}.tar.gz"
 HF="https://huggingface.co/prism-ml"
 # model: GGUF file, sha256 (= the Hugging Face file hash), size in bytes
@@ -33,6 +33,15 @@ GGUF[nemotron]="NVIDIA-Nemotron-3.5-Bolt-E4B-UD-Q3_K_XL.gguf"; SHA[nemotron]="3f
 declare -A URL
 for p in 2b 4b 9b 27b; do URL[$p]="$HF/Ternary-Bonsai-2-${p^^}-gguf/resolve/main/${GGUF[$p]}"; done
 URL[nemotron]="https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF/resolve/main/${GGUF[nemotron]}"
+# AH-Nanbeige4.3-33B IQ3_XXS (a separate model; the Kindi Nanbeige backend, NVIDIA sm_80 and later)
+GGUF[nanbeige]="AH-Nanbeige4.3-33B-IQ3_XXS.gguf"; SHA[nanbeige]="9d4f18e8a22573c94b18a455147e807a8b9d2cd4b30302f2a4639c2db0a6c239"; SIZE[nanbeige]=13108685952
+NB_CARD_URL="https://huggingface.co/ahtx/AH-Nanbeige4.3-33B-IQ3_XXS-GGUF"
+URL[nanbeige]="${NB_CARD_URL}/resolve/main/${GGUF[nanbeige]}"
+# MTP head for the 2B (docs/MTP.md, tensor-core cards only).
+# The files are on Hugging Face (https://huggingface.co/ahtx/kindi-mtp-heads); KINDI_MTP_URL overrides the location.
+MTP_URL="${KINDI_MTP_URL:-https://huggingface.co/ahtx/kindi-mtp-heads/resolve/main}"
+MTPF="kindi-mtp-2b-v1.npz"; MTPSHA="1b5c0c790a594af368c3646370c527c319cdb3bb0592dd3e523e752f721a5520"; MTPSIZE=60960552
+mtp_ready() { [ -f "$DIR/mtp/$MTPF" ] && [ -f "$DIR/mtp/$MTPF.sha256-ok" ]; }
 
 DIR="${KINDI_HOME:-$HOME/.kindi}"
 PORT=8093
@@ -66,7 +75,7 @@ Options:
   --config N       take setup N of the list that the installer prints (see --dry-run); N,M runs several setups
                    side by side, one server each (for example a 27B on each of two cards); NxK runs setup N on
                    K cards of that kind. Each server gets its own container (kindi, kindi-2, ...) and port.
-  --model M        2b | 4b | 9b | 27b | nemotron (default: the recommended model for the card)
+  --model M        2b | 4b | 9b | 27b | nemotron | nanbeige (default: the recommended model for the card)
   --ctx N          context length in tokens (default: the profile's; the engine fits it to the free memory)
   --gpu G          N (one NVIDIA card), N,M (two cards), amd or amdN (an AMD card), all, or cpu (default: choose)
   --port P         server port on 127.0.0.1 (default ${PORT})
@@ -187,9 +196,11 @@ if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
     n=$(echo "$n" | sed 's/^ *//; s/ *$//'); c=$(echo "$c" | tr -d ' ')
     if [ "$c" = "?" ] || [ -z "$c" ]; then   # older drivers (Kepler's 470) do not report it: from the name
       case "$n" in
-        *K6000*|*K5200*|*K40*|*"GTX TITAN"*|*"GTX 780"*) c=3.5 ;;                      # GK110
+        *"GTX TITAN X"*) c=5.2 ;;                                                      # GM200 (Maxwell): before "GTX TITAN"
+        # the K20 and K40 patterns must not match the K2000 and the K4000: a digit after "K20" or "K40" is another card
+        *K6000*|*K5200*|*K40[!0-9]*|*K40|*K20[!0-9]*|*K20|*"GTX TITAN"*|*"GTX 780"*) c=3.5 ;;   # GK110
         *K80*) c=3.7 ;;                                                                # GK210
-        *K420*|*K600*|*K2000*|*K4000*|*K4200*|*K5000*|*"GTX 6"*|*"GTX 7"[0-4]*|*"GT 7"*) c=3.0 ;;
+        *K420*|*K600*|*K2000*|*K4000*|*K4200*|*K5000*|*K520*|*K10[!0-9]*|*K10|*"GTX 6"*|*"GTX 7"[0-4]*|*"GT 7"*) c=3.0 ;;   # GK104, GK106, GK107
         *K620*|*K1200*|*K2200*|*"GTX 75"*|*"GTX 9"*|*M[0-9]*) c=5.0 ;;
         *"GTX 10"*|*"Quadro P"*|*"TITAN X"*|*Tesla\ P*) c=6.1 ;;
         *"RTX 20"*|*"GTX 16"*|*"Quadro RTX"*|*T4*) c=7.5 ;;
@@ -316,6 +327,14 @@ if [ "$DRY" = 0 ] && ! docker info >/dev/null 2>&1; then
   else die "Docker does not answer (is the daemon running? 'sudo systemctl start docker')"; fi
 fi
 ok "Docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,)"
+# rootless Docker maps the container's root to this user: '-u' would make /data read-only, and the daemon is a user service
+ROOTLESS=0
+if [ "$DRY" = 0 ] && $DOCKER info -f '{{println .SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+  ROOTLESS=1; ok "rootless Docker: the containers run as your user without '-u'"
+fi
+restart_docker() {
+  if [ "$ROOTLESS" = 1 ]; then run systemctl --user restart docker; else run $SUDO systemctl restart docker; fi
+}
 
 GPU_MODE=none
 if [ "$NG" -gt 0 ] && [ "$GPU" != cpu ]; then
@@ -329,7 +348,9 @@ if [ "$NG" -gt 0 ] && [ "$GPU" != cpu ]; then
         run sh -c "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | $SUDO gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
         run sh -c "curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | $SUDO tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null"
         run $SUDO apt-get update -qq; run $SUDO apt-get install -y -qq nvidia-container-toolkit
-        run $SUDO nvidia-ctk runtime configure --runtime=docker; run $SUDO systemctl restart docker
+        if [ "$ROOTLESS" = 1 ]; then run nvidia-ctk runtime configure --runtime=docker --config="$HOME/.config/docker/daemon.json"
+        else run $SUDO nvidia-ctk runtime configure --runtime=docker; fi
+        restart_docker
         GPU_MODE=toolkit
       fi
     fi
@@ -379,17 +400,32 @@ pick_card() {     # the NVIDIA GPU with the most memory (first on a tie)
   echo $best
 }
 card_k() { local k; for k in $(seq 0 $((NG - 1))); do [ "${GIDX[$k]}" = "$1" ] && { echo "$k"; return 0; }; done; return 1; }
-card_class() {    # NVIDIA card position -> tc | pascal8 | maxwell | kepler
+card_class() {    # NVIDIA card position -> tc | pascal8 | p100 | maxwell | kepler
   local V=${GMEM[$1]} c=${GCC[$1]/./}
   if [ "$c" -ge 80 ] && [ "$V" -ge 9500 ]; then echo tc
   elif [ "$c" -ge 61 ] && [ "$V" -ge 7500 ]; then echo pascal8
+  elif [ "$c" -eq 60 ] && [ "$V" -ge 12000 ]; then echo p100     # Tesla P100 (sm_60, no dp4a): docs/CARDS.md
   elif [ "$c" -lt 50 ]; then echo kepler
   else echo maxwell; fi
+}
+# Nanbeige 33B: the engine puts its layers in order on 1..N cards. The cards together must hold the 13.1 GB of
+# weights, the K/V of a short context and about 700 MiB on each card. sm_80 and later only in 0.4.0 (sm_61 reads
+# prompts in 8-token passes there and is not tested on a Pascal card)
+NB_MIB=15500; NB_CARD_MIB=700
+nb_cards() {      # NVIDIA card positions (candidates) -> the fewest of them, largest first, that hold Nanbeige
+  local k got="" n=0 have=0 order
+  order=$(for k in "$@"; do { [ "${GCC[$k]/./}" -ge 80 ] || [ "${GCC[$k]/./}" -eq 60 ]; } 2>/dev/null && echo "${GMEM[$k]} $k"; done | sort -k1,1nr -k2,2n | awk '{print $2}')
+  for k in $order; do
+    got="${got:+$got,}${GIDX[$k]}"; n=$((n + 1)); have=$((have + ${GMEM[$k]}))
+    [ "$have" -ge $((NB_MIB + NB_CARD_MIB * n)) ] && { echo "$got"; return 0; }
+  done
+  return 1
 }
 card_models() {   # NVIDIA card position -> the models that run on it, the best first
   local V=${GMEM[$1]}
   case "$(card_class "$1")" in
     tc|pascal8) echo "27b nemotron 9b 4b 2b" ;;
+    p100) echo "27b 9b 4b 2b" ;;
     kepler) if [ "$V" -ge 11000 ]; then echo "27b 9b 4b 2b"; elif [ "$V" -ge 3800 ]; then echo "9b 4b 2b"   # no Nemotron on Kepler
             elif [ "$V" -ge 1900 ]; then echo "4b 2b"; else echo "2b"; fi ;;
     *) if [ "$V" -ge 3800 ]; then echo "9b nemotron 4b 2b"; elif [ "$V" -ge 3300 ]; then echo "4b nemotron 2b"
@@ -411,12 +447,13 @@ model_label() {
   case "$1" in
     27b) echo "Ternary-Bonsai-2 27B" ;;
     nemotron) echo "NVIDIA Nemotron 3.5 Bolt E4B" ;;
+    nanbeige) echo "AH-Nanbeige4.3-33B IQ3_XXS" ;;
     *) echo "Ternary-Bonsai-2 ${1^^}" ;;
   esac
 }
 # A setup is one or more servers. Each server is "backend|model|cards", where cards is a card list ("0,1": one model
 # split over both), "kind:0 3 5" (any free card of this kind: each pick takes the next one) or "" (the CPU).
-short() { if [ "$1" = nemotron ]; then echo Nemotron; else echo "${1^^}"; fi; }
+short() { case "$1" in nemotron) echo Nemotron ;; nanbeige) echo Nanbeige ;; *) echo "${1^^}" ;; esac; }
 CFG=()            # the servers of each setup, separated by ";"
 CFG_N=()          # the label of each setup
 add_cfg() { CFG+=("$1"); CFG_N+=("$2"); }
@@ -433,7 +470,7 @@ if [ "$GPU" != cpu ]; then
       PAIR="${GIDX[$pa]},${GIDX[$pb]}"
       want 27b && add_cfg "cuda|27b|$PAIR" "$(model_label 27b) on GPUs ${PAIR}, split over both cards"
       want nemotron && add_cfg "cuda|nemotron|$PAIR" "$(model_label nemotron) on GPUs ${PAIR}, split over both cards"
-    elif [[ "$GPU" == *,* ]]; then die "GPUs ${GPU} cannot run one model together (two Maxwell cards of 4 GB, such as two K1200s, can)"
+    elif [[ "$GPU" == *,* ]] && ! { want nanbeige && nb_cards "$pa" "$pb" >/dev/null; }; then die "GPUs ${GPU} cannot run one model together (two Maxwell cards of 4 GB, such as two K1200s, can; Nanbeige 33B needs sm_80 cards or Tesla P100s with 16.2 GB in total, plus 0.7 GB for each more card)"
     fi
     if [[ "$GPU" != *,* ]] && [[ "$GPU" != amd* ]]; then
       # one card: the card with the most memory first, then each other kind of card. A setup on a kind of card
@@ -454,6 +491,12 @@ if [ "$GPU" != cpu ]; then
           [ "$first" = 1 ] && SINGLE+=("cuda|$m|kind:$same|$n") && first=0
         done
       done
+    fi
+  fi
+  if [ "$NG" -gt 0 ] && want nanbeige && [[ "$GPU" != amd* ]]; then
+    case "$GPU" in auto|all) cand=$(seq 0 $((NG - 1))) ;; *,*) cand="$pa $pb" ;; *) cand=$(card_k "$GPU") || cand="" ;; esac
+    if nbc=$(nb_cards $cand); then
+      add_cfg "cuda|nanbeige|$nbc" "$(model_label nanbeige) on GPU$([[ "$nbc" == *,* ]] && echo "s ${nbc}, layers split over the cards" || echo " ${nbc}")"
     fi
   fi
   if [ "$NA" -gt 0 ] && { [ "$GPU" = auto ] || [ "$GPU" = all ] || [[ "$GPU" == amd* ]]; }; then
@@ -555,22 +598,33 @@ profile_of() {
     [ "${AGFX[$CARDS]}" = gfx1103 ] && ENV+=(-e HSA_OVERRIDE_GFX_VERSION=11.0.2 -e HSA_ENABLE_SDMA=0)
   else
     k=$(card_k "${CARDS%%,*}"); V=${GMEM[$k]}
-    if [[ "$CARDS" == *,* ]]; then
+    if [ "$M" = nanbeige ]; then   # the Nanbeige backend: layers in order over one or more cards (bench-0.4.0)
+      PROFILE=nanbeige; C=${CTX/auto/16384}; MEM=10g
+      ENV+=(-e KINDI_REPEAT_STOP=1 -e KINDI_MAX_TOKENS=16384)
+    elif [[ "$CARDS" == *,* ]]; then
       PROFILE=k1200x2; C=${CTX/auto/24576}; MEM=12g
       ENV+=(-e KINDI_CARDS=2 -e KINDI_REPEAT_STOP=1 -e KINDI_CHECKPOINT_BUDGET_MB=4096)
     else
       PROFILE=$(card_class "$k")
       case "$PROFILE" in
-        tc) C=${CTX/auto/131072}; MEM=14g
+        tc) C=${CTX/auto/131072}; MEM=14g; [ "$M" = 2b ] && NEED_MTP=1
             ENV+=(-e KINDI_CARDS=1 -e KINDI_REPEAT_STOP=1 -e KINDI_CHECKPOINT_BUDGET_MB=1280 -e KINDI_PARK_MAX=1
                   -e KINDI_DENSE_SPACING=2048 -e KINDI_PREFIX_MAX=2 -e KINDI_MAX_TOKENS=65536)
             if [ "$M" = 27b ]; then   # the profile of the RTX 3080 cluster servers (docs/CARDS.md)
               ENV+=(-e KINDI_TC=1 -e KINDI_FD=1 -e KINDI_ATT_TC=1 -e KINDI_CKPT_VRAM=1
-                    -e KINDI_SPEC=draft2b -e KINDI_SPEC_K=3 -e KINDI_SPEC_PACK=/data/pack-2b -e KINDI_SPEC_WINDOW=8192
+                    -e KINDI_SPEC_K=3 -e KINDI_SPEC_PACK=/data/pack-2b -e KINDI_SPEC_WINDOW=8192
                     -e KINDI_TC_TMAX=4 -e KINDI_MEM_RESERVE_MB=160)
+              # auto (docs/MTP.md): the 2B drafter, k=2 below 1K tokens of context and k=3 from 1K
+              ENV+=(-e KINDI_SPEC=auto)
               XPACKS+=(2b)
+            elif [ "$M" = 2b ] && mtp_ready; then   # the 2B with its own MTP head: the plan engine on the tensor cores
+              ENV+=(-e KINDI_TC=1 -e KINDI_TP=1 -e KINDI_FD=1 -e KINDI_ATT_TC=1 -e KINDI_TC_TMAX=4
+                    -e KINDI_SPEC=auto -e "KINDI_MTP_HEAD=/data/mtp/$MTPF")
             fi ;;
         pascal8) C=${CTX/auto/65536}; MEM=14g; ENV+=(-e KINDI_CARDS=1 -e KINDI_REPEAT_STOP=1 -e KINDI_MAX_TOKENS=65536) ;;
+        # Tesla P100 (sm_60, no dp4a): the plain engines, no speculation (on sm_60 a verify pass costs about one
+        # step per token, so drafting is slower: docs/CARDS.md)
+        p100) C=${CTX/auto/65536}; MEM=14g; ENV+=(-e KINDI_CARDS=1 -e KINDI_REPEAT_STOP=1 -e KINDI_MAX_TOKENS=65536) ;;
         kepler) if [ "$V" -ge 1500 ]; then C=${CTX/auto/65536}; else C=${CTX/auto/24576}; fi
                 # the 4B on a 2 GB card: the context that the engine fits on the Quadro K420 2 GB (849 MiB free)
                 [ "$M" = 4b ] && [ "$V" -lt 2500 ] && C=${CTX/auto/23808}
@@ -588,16 +642,17 @@ profile_of() {
   [ -n "$MEMORY" ] && MEM="$MEMORY"
   return 0
 }
-model_name() { if [ "$1" = nemotron ]; then echo "nemotron-bolt-e4b"; else echo "bonsai2-$1"; fi; }
+model_name() { case "$1" in nemotron) echo "nemotron-bolt-e4b" ;; nanbeige) echo "nanbeige-33b-iq3" ;; *) echo "bonsai2-$1" ;; esac; }
 
 PACKS=(); BACKENDS=" "; ram_need=0; cwsr=0
 for i in $(seq 0 $((NS - 1))); do
   profile_of "$i"; M=${SV_M[$i]}
-  [ -n "${GGUF[$M]:-}" ] || die "unknown model '${M}' (2b, 4b, 9b, 27b or nemotron)"
+  [ -n "${GGUF[$M]:-}" ] || die "unknown model '${M}' (2b, 4b, 9b, 27b, nemotron or nanbeige)"
   for p in "$M" ${XPACKS[@]+"${XPACKS[@]}"}; do case " ${PACKS[*]+${PACKS[*]}} " in *" $p "*) ;; *) PACKS+=("$p") ;; esac; done
   case "$BACKENDS" in *" ${SV_B[$i]} "*) ;; *) BACKENDS="$BACKENDS${SV_B[$i]} " ;; esac
   [[ "$MEM" =~ ^[0-9]+g$ ]] && ram_need=$((ram_need + ${MEM%g} * 1024))
   [ "${SV_B[$i]}" = rocm ] && [ "${AGFX[${SV_C[$i]}]}" = gfx1103 ] && cwsr=1
+  [ "$M" = nanbeige ] && info "model card: ${NB_CARD_URL}"
   ok "server $((i + 1)): $(model_label "$M") ($(model_name "$M")) on $([ "${SV_B[$i]}" = cpu ] && echo "the CPU" || echo "$([ "${SV_B[$i]}" = rocm ] && echo "AMD ")GPU(s) ${SV_C[$i]}"), context ${C}, profile ${PROFILE}; container ${SV_NAME[$i]} on port ${SV_PORT[$i]}"
 done
 info "(each engine fits its context to the free memory and reports what it got)"
@@ -639,6 +694,7 @@ gpu_args() {
 }
 image_of() { if [ "$1" = rocm ]; then echo "kindi-rocm:${KINDI_VERSION}"; else echo "kindi:${KINDI_VERSION}"; fi; }
 UIDGID="$(id -u):$(id -g)"
+USERARG=(-u "$UIDGID"); [ "$ROOTLESS" = 1 ] && USERARG=()
 
 # ------------------------------------------------------------------------------------------------ 4. image
 src_id=""
@@ -677,9 +733,21 @@ for b in $BACKENDS; do
     ok "the Kindi modules load"
   fi
 done
+# the daemon finds the NVIDIA toolkit only when it starts: check '--gpus' before convert and verify
+nv=0; for b in $BACKENDS; do [ "$b" != cpu ] && [ "$b" != rocm ] && nv=1; done
+if [ "$GPU_MODE" = toolkit ] && [ "$nv" = 1 ] && [ "$DRY" = 0 ]; then
+  gpu_ok() { $DOCKER run --rm --gpus all --entrypoint true "kindi:${KINDI_VERSION}" >/dev/null 2>&1; }
+  if ! gpu_ok; then
+    warn "Docker cannot give the container the GPUs ('could not select device driver'): restart the Docker daemon after the toolkit install"
+    if ask "Restart the Docker daemon now?"; then [ "$ROOTLESS" = 1 ] || need_sudo; restart_docker; fi
+    if [ "$ROOTLESS" = 1 ]; then rc="systemctl --user restart docker"; else rc="sudo systemctl restart docker"; fi
+    gpu_ok || die "'docker run --gpus all' does not work. Run '${rc}', then run this installer again"
+  fi
+  ok "docker run --gpus all works"
+fi
 
 # ------------------------------------------------------------------------------------------------ 5. download
-step "Download the model$([ "${#PACKS[@]}" -gt 1 ] && echo s)" "From Hugging Face (Prism ML; unsloth for Nemotron). The sha256 of each file must match the value in this script."
+step "Download the model$([ "${#PACKS[@]}" -gt 1 ] && echo s)" "From Hugging Face (Prism ML; unsloth for Nemotron; ahtx for Nanbeige). The sha256 of each file must match the value in this script."
 [ "$DRY" = 1 ] || mkdir -p "$DIR/models"
 for p in ${PACKS[@]+"${PACKS[@]}"}; do
   f="$DIR/models/${GGUF[$p]}"
@@ -695,6 +763,26 @@ for p in ${PACKS[@]+"${PACKS[@]}"}; do
   ok "${GGUF[$p]}: sha256 ${SHA[$p]:0:16}... matches"
 done
 
+# the MTP head, for tensor-core profiles (sha256 pinned above); without it the servers run as before
+if [ "${NEED_MTP:-0}" = 1 ] && ! mtp_ready; then
+  if [[ "$MTP_URL" == *downloads.invalid* ]]; then
+    info "MTP head: no download location is set yet (KINDI_MTP_URL); MTP stays off"
+  else
+    [ "$DRY" = 1 ] || mkdir -p "$DIR/mtp"
+    f="$DIR/mtp/$MTPF"
+    if run curl -fL --retry 5 --retry-delay 5 -C - -sS -o "$f.part" "$MTP_URL/$MTPF"; then
+      if [ "$DRY" = 0 ]; then
+        got=$(sha256sum "$f.part" | cut -d' ' -f1)
+        if [ "$got" = "$MTPSHA" ]; then mv "$f.part" "$f"; touch "$f.sha256-ok"
+        else rm -f "$f.part"; info "MTP head: sha256 ${got} is not the expected ${MTPSHA} (deleted); MTP stays off"; fi
+      fi
+    else
+      info "MTP head: the download failed; MTP stays off"
+    fi
+  fi
+fi
+mtp_ready && ok "MTP is on: KINDI_SPEC=auto with ${MTPF} (sha256 ${MTPSHA:0:16}...; docs/MTP.md)"
+
 # ------------------------------------------------------------------------------------------------ 6. convert + verify
 step "Convert and verify" "kindi convert builds Kindi's weight pack; kindi verify checks the output against llama.cpp, token for token, once for each model on each kind of card."
 state_of() {      # the cache folder of server i: one per model, and one per card when a model runs more than once
@@ -704,14 +792,14 @@ state_of() {      # the cache folder of server i: one per model, and one per car
 }
 base_of() {
   local sd; sd=$(state_of "$1")
-  BASE=(-u "$UIDGID" -v "$DIR:/data" -e HOME=/tmp -e "CUPY_CACHE_DIR=/data/${sd}/cupy" -e "CUDA_CACHE_PATH=/data/${sd}/cudacache"
+  BASE=(${USERARG[@]+"${USERARG[@]}"} -v "$DIR:/data" -e HOME=/tmp -e "CUPY_CACHE_DIR=/data/${sd}/cupy" -e "CUDA_CACHE_PATH=/data/${sd}/cudacache"
         -e "KINDI_STATE_DIR=/data/${sd}" -e KINDI_CPU_CACHE=/data/cpu)
 }
 for p in ${PACKS[@]+"${PACKS[@]}"}; do
   pk="$DIR/pack-$p"
   if [ -f "$pk/kindi_pack.json" ] && grep -q "${SHA[$p]}" "$pk/kindi_pack.json"; then ok "pack-$p is up to date"; continue; fi
-  base_of 0
-  run $DOCKER run --rm ${BASE[@]+"${BASE[@]}"} "$(image_of "${SV_B[0]}")" convert "/data/models/${GGUF[$p]}" --out "/data/pack-$p" --force
+  base_of 0; ci=$(image_of "${SV_B[0]}")
+  run $DOCKER run --rm ${BASE[@]+"${BASE[@]}"} "$ci" convert "/data/models/${GGUF[$p]}" --out "/data/pack-$p" --force
   ok "pack-$p converted"
 done
 # this installer's servers hold the GPUs: stop them for the checks (the chosen ones start again below)
@@ -734,7 +822,8 @@ for i in $(seq 0 $((NS - 1))); do
     if $DOCKER run --rm ${VX[@]+"${VX[@]}"} ${BASE[@]+"${BASE[@]}"} ${GARGS[@]+"${GARGS[@]}"} ${ENV[@]+"${ENV[@]}"} -e "KINDI_PACK=/data/pack-$M" -e KINDI_HEAD=exact "$IMAGE" verify > "$VERIFY_OUT" 2>&1; then
       grep -E "PASS|FAIL" "$VERIFY_OUT" | sed 's/^\[[^]]*\] /    /' | sed -n 1,6p
       sp=$(grep -o '[0-9.]* tokens/s over the run' "$VERIFY_OUT" | awk '{print $1}')
-      if [ "$M" = nemotron ]; then ok "server $((i + 1)): agrees with llama.cpp on the first 12 tokens or more of each prompt (${sp} tokens/s over the check)"
+      if [ "$M" = nanbeige ]; then ok "server $((i + 1)): agrees with llama.cpp on each prompt, up to a llama.cpp tie (${sp} tokens/s over the check)"
+      elif [ "$M" = nemotron ]; then ok "server $((i + 1)): agrees with llama.cpp on the first 12 tokens or more of each prompt (${sp} tokens/s over the check)"
       else ok "server $((i + 1)): token-exact with llama.cpp (${sp} tokens/s over the check, prompt tokens included)"; fi
     else
       tail -15 "$VERIFY_OUT" | sed 's/^/    /'

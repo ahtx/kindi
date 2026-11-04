@@ -29,6 +29,10 @@ MODELS = {
     "nemotron-e4b": dict(file="NVIDIA-Nemotron-3.5-Bolt-E4B-UD-Q3_K_XL.gguf", repo="unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF",
                          sha="3f8032b9d2c18536c4ac51b97959a563cc27434de99823640c98147edc62ce9b", size=4219133120,
                          one=3300, two=2400, what="NVIDIA Nemotron 3.5 Bolt E4B (Gemma 4), UD-Q3_K_XL"),
+    "nanbeige-33b": dict(file="AH-Nanbeige4.3-33B-IQ3_XXS.gguf", repo="ahtx/AH-Nanbeige4.3-33B-IQ3_XXS-GGUF",
+                         sha="9d4f18e8a22573c94b18a455147e807a8b9d2cd4b30302f2a4639c2db0a6c239", size=13108685952,
+                         one=16200, two=0, split=(15500, 700), what="AH-Nanbeige4.3-33B, IQ3_XXS",
+                         card="https://huggingface.co/ahtx/AH-Nanbeige4.3-33B-IQ3_XXS-GGUF"),
 }
 
 
@@ -47,9 +51,17 @@ def _cards():
 
 
 def fits(m, cards):
-    """'one card', 'two cards' or '' for this machine"""
+    """'one card', 'two cards' (or 'N cards' for a model that splits its layers over any number) or '' for this
+    machine"""
     if any(mb >= m["one"] for _, mb in cards):
         return "one card"
+    if m.get("split"):                    # (total MiB, MiB on each card): the largest cards first
+        need, each, have = m["split"][0], m["split"][1], 0
+        for n, mb in enumerate(sorted((mb for _, mb in cards), reverse=True), 1):
+            have += mb
+            if have >= need + each * n:
+                return "%d cards" % n
+        return ""
     if m["two"] and len(cards) >= 2 and sorted(mb for _, mb in cards)[-2] >= m["two"]:
         return "two cards"
     return ""
@@ -128,8 +140,13 @@ def use(cfg, mid, gguf=None, log=print):
     if mid not in MODELS:
         raise SystemExit("kindi: unknown model %r (kindi models lists them)" % mid)
     m = MODELS[mid]
+    if m.get("card"):
+        log("model card: %s" % m["card"])
     cards = _cards()
-    if cards and not fits(m, cards):
+    if cards and not fits(m, cards) and m.get("split"):
+        log("note: %s needs %d MiB on one card, or %d MiB in total on several (NVIDIA sm_80 and later); this machine "
+            "may not hold it" % (mid, m["one"], m["split"][0] + 2 * m["split"][1]))
+    elif cards and not fits(m, cards):
         log("note: %s needs a card with %d MiB%s; this machine may not hold it" %
             (mid, m["one"], " (or two with %d MiB each)" % m["two"] if m["two"] else ""))
     if not gguf:

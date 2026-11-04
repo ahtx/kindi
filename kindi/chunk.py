@@ -71,6 +71,59 @@ def _wrappers(src, names=WRAP):
     return "\n".join(out), nptr
 
 
+class F16Kernels(object):
+    """f16p.cu (the fp16 prompt path)"""
+    def __init__(self):
+        m = cp.RawModule(code=open(os.path.join(HERE, "f16p.cu"), encoding="utf-8").read(), options=("-std=c++11",))
+        for n in ("k_f16_dq", "k_f16_dq5", "k_f16_x", "k_f16_acc"):
+            setattr(self, n, m.get_function(n))
+
+
+def f16_prompt(card):
+    """the fp16 prompt path (f16p.cu): on by default for sm_60 (Tesla P100); KINDI_P100_FP16_PROMPT=1 turns it on for any
+    card of sm_53 or later, =0 turns it off"""
+    if cp.cuda.runtime.is_hip:
+        return False
+    p = cp.cuda.runtime.getDeviceProperties(card)
+    cc = p["major"] * 10 + p["minor"]
+    v = os.environ.get("KINDI_P100_FP16_PROMPT", "")
+    return cc >= 53 and (v == "1" or (v != "0" and cc == 60))
+
+
+def _gemm_f16(s, Wt, R, C, X, ldx, Yb, ldy, quant, lane=False):
+    """the plan step of one product on the fp16 path: Y[t][r] = sum over pieces of 512 columns of the fp16 GEMM of
+    the piece, added in fp32 (f16p.cu). lane: Wt in the 5-trit lane layout (else the pl layout of tcp.cu)"""
+    try:
+        from cupy_backends.cuda.libs import cublas
+    except ImportError:
+        from cupy.cuda import cublas
+    c = s.chunk
+    F, X16, W16, C16 = c["F16"], c["X16"], c["W16"], c["C16"]
+    NG = C // 128
+    one, zero = np.array([1.0], np.float16), np.array([0.0], np.float16)
+    # cublasGemmEx's compute type: a cudaDataType before CUDA 11, a cublasComputeType_t since
+    ct = 64 if cp.cuda.runtime.runtimeGetVersion() >= 11000 else 2     # CUBLAS_COMPUTE_16F / CUDA_R_16F
+    R16 = 2                                                            # CUDA_R_16F
+
+    def step(n):
+        with cp.cuda.Device(s.card):
+            if quant:
+                F.k_f16_x((min(4096, (n * C + 255) // 256),), (256,), (X, i32(ldx), i32(C), i32(n), X16))
+            h = cp.cuda.device.get_cublas_handle()
+            cublas.setStream(h, 0)
+            for g0 in range(0, NG, 4):
+                ng = min(4, NG - g0)
+                if lane:
+                    F.k_f16_dq5(((R * ng * 26 + 255) // 256,), (256,), (Wt, i32(R), i32(NG), i32(g0), i32(ng), W16))
+                else:
+                    F.k_f16_dq(((R * ng * 7 + 255) // 256,), (256,), (Wt, i32(R), i32(NG), i32(g0), i32(ng), W16))
+                cublas.gemmEx(h, cublas.CUBLAS_OP_T, cublas.CUBLAS_OP_N, R, n, 128 * ng,
+                              one.ctypes.data, W16.data.ptr, R16, 128 * ng, X16.data.ptr + 2 * 128 * g0, R16, C,
+                              zero.ctypes.data, C16.data.ptr, R16, R, ct, -1)
+                F.k_f16_acc((min(4096, (n * R + 255) // 256),), (256,), (C16, i32(R), i32(n), Yb, i32(ldy), i32(g0 == 0)))
+    return step
+
+
 class ChunkKernels(object):
     def __init__(self):
         base = open(os.path.join(HERE, "kindi.cu"), encoding="utf-8").read()
@@ -94,7 +147,7 @@ def reserve(eng):
     eng.chunk_ok = False
     if not enabled(eng):
         return
-    T = int(os.environ.get("KINDI_CHUNK", "256"))
+    T = int(os.environ.get("KINDI_CHUNK", "512" if all(f16_prompt(s.card) for s in eng.cards) else "256"))
     for s in eng.cards:
         with cp.cuda.Device(s.card):
             z = lambda n, t=cp.float32: cp.zeros(int(n), dtype=t)  # noqa: E731
@@ -107,8 +160,9 @@ def reserve(eng):
             c["U1"], c["U2"] = z(T * uw), z(T * uw)
             c["OUT"] = z(T * max(s.NV * HK, s.NH * HD))
             # split parts: the 5-trit path splits only the small K/V products; the 2-bit path may split D-row ones
-            ctc = getattr(s, "tc_layout", False) and getattr(s, "wl", None) is None   # (HIP keeps the lane copy: no tc GEMMs)
-            c["SPL"] = z(1 if ctc else 8 * T * (s.NHKV * HD if s.g5 else max(s.NHKV * HD, D)))   # (tc: not used)
+            ctc = getattr(s, "tc_layout", False) and getattr(s, "wl", None) is None and not getattr(s, "tc_lane", False)
+            # (HIP keeps the lane copy, sm_60 the lane layout itself: no tc GEMMs)
+            c["SPL"] = z(1 if ctc else 8 * T * max(s.NHKV * HD, D))   # (small models split D-row products too)   # (tc: not used)
             c["YP"] = z(T * D) if eng.W == 2 else None          # the other card's row-parallel part
             tv = os.environ.get("KINDI_CHUNK_TILE", "")
             c["small"] = tv == "64" or (tv != "128" and cp.cuda.runtime.getDeviceProperties(s.card)["major"] < 5)
@@ -119,6 +173,13 @@ def reserve(eng):
             if c["q8"] and not ctc:   # int8 activations (dp4a): XQ[k4][t], XS[group][t]
                 c["XQ"], c["XS"] = cp.zeros(T * work // 4, dtype=cp.uint32), z(T * work // 128)
             c["tc"] = ctc                               # tc layout (spec.py): tensor-core GEMMs, XQ in the tc order
+            c["f16"] = f16_prompt(s.card) and (ctc or s.g5)
+            if c["f16"]:                                # the fp16 prompt path (f16p.cu): inputs, a weight piece, a result
+                rw = max(NFF, D, uw, s.NV * HK, s.NH * HD)
+                c["X16"] = cp.zeros(T * work, dtype=cp.float16)
+                c["W16"] = cp.zeros(rw * 512, dtype=cp.float16)
+                c["C16"] = cp.zeros(T * rw, dtype=cp.float16)
+                c["F16"] = F16Kernels()
             if c["tc"]:
                 c["XQ"], c["XS"] = cp.zeros(T * work // 4, dtype=cp.uint32), z(T * work // 128)
                 c["XA"] = cp.zeros(T * work // 128, dtype=cp.int32)
@@ -177,6 +238,9 @@ def _build(s):
             return gemm4(name, X, ldx, Yb, ldy)
         _, W5, R, C = (getattr(s, "wl", None) or s.w)[name]       # the lane layout (a second copy when decode is row)
         R, C = int(R), int(C)
+        if c["f16"]:                                     # KINDI_P100_FP16_PROMPT=1: cuBLAS fp16 (f16p.cu)
+            P.call(_gemm_f16(s, W5, R, C, X, ldx, Yb, ldy, quant, lane=True))
+            return
         NG = C // 128
         gx, gy = R // 128, (T + 127) // 128
         if c["q8"]:
@@ -201,8 +265,15 @@ def _build(s):
         _, Wt, R, C = s.w[name]
         R, C = int(R), int(C)
         NG = C // 128
+        if c["f16"]:                                     # KINDI_P100_FP16_PROMPT=1: cuBLAS fp16 (f16p.cu)
+            P.call(_gemm_f16(s, Wt, R, C, X, ldx, Yb, ldy, quant))
+            return
         if quant:
             P.add(SK.k_tc_q8, (NG, T), (128,), (X, i32(ldx), c["XQ"], c["XS"], c["XA"], i32(NG), TT))
+        if hasattr(SK, "k_tp_mm"):                       # Pascal (tcp.cu): dp4a, 128 rows x 128 tokens per block
+            P.add(SK.k_tp_mm, (R // 128, (T + 127) // 128), (256,),
+                  (Wt, i32(R), i32(C // 1024), c["XQ"], c["XS"], c["XA"], Yb, i32(ldy), TT))
+            return
         if os.environ.get("KINDI_TC_MM", "2") == "2":     # activations staged in shared memory (k_tc_mm2)
             P.add(SK.k_tc_mm2, ((R // 16 + 7) // 8, (T + 63) // 64), (256,),
                   (Wt, i32(R), i32(C // 1024), c["XQ"], c["XS"], c["XA"], Yb, i32(ldy), TT))
@@ -419,7 +490,12 @@ def feed(eng, toks, pos):
             for j in range(len(P0.segs)):
                 for s in cs:
                     ctx_set(s.ctxh)
-                    for fn, g, b, arr, _ in s.plan_chunk.segs[j]:
+                    for e in s.plan_chunk.segs[j]:
+                        if e[0] == "call":                     # a host step (the fp16 path: cuBLAS)
+                            e[1](n)
+                            ctx_set(s.ctxh)
+                            continue
+                        fn, g, b, arr, _ = e
                         if L(fn, g[0], g[1], g[2], b[0], b[1], b[2], 0, None, arr, None):
                             raise RuntimeError("kindi: a chunk kernel launch failed on card %d" % s.card)
                 if j in P0.xch:

@@ -147,8 +147,9 @@ class Engine(object):
                                       mats[p + "attn_output.weight"])
                 L.q_norm, L.k_norm = f(p + "attn_q_norm.weight"), f(p + "attn_k_norm.weight")
                 Kc, Vc = z(self.ctx * NHKV * HD, np.uint16), z(self.ctx * NHKV * HD, np.uint16)
-                self.Kc.append(Kc)
-                self.Vc.append(Vc)
+                # token-major views ([ctx][NHKV][HD], as on the GPU engines) for the prompt cache; same memory
+                self.Kc.append(Kc.reshape(self.ctx, NHKV, HD))
+                self.Vc.append(Vc.reshape(self.ctx, NHKV, HD))
                 L.Kc, L.Vc = _p(Kc, PU16), _p(Vc, PU16)
             else:
                 L.qkv, L.gate, L.ssm_out = mats[p + "attn_qkv.weight"], mats[p + "attn_gate.weight"], mats[p + "ssm_out.weight"]

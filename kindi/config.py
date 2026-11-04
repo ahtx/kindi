@@ -29,17 +29,22 @@ DEFAULTS = {
     "park_max": "3",                    # other conversations kept in host RAM
     "checkpoint_budget_mb": "0",        # host RAM for checkpoints and parked conversations (0: 20% of the RAM)
     "repeat_stop": "0",                 # 1: stop a reply caught in a repeating loop (close it while thinking)
+    "lookup": "5",                      # Nanbeige: prompt-lookup drafting, up to this many tokens per check (0: off)
+    "mtp_head": "",                     # Nanbeige: an MTP head file, a second draft source (empty: none)
     "reasoning_effort": "",             # 27B template: xhigh | medium | low (empty: the template default, xhigh)
     # generation defaults (a request's own values win)
     "max_tokens": "1024",
     "temperature": "0.7",
     "top_p": "0.8",
     "top_k": "20",
+    "min_p": "0",                       # 0: off; else drop the tokens below min_p times the best one's probability
+    "repeat_penalty": "1.0",            # 1.0: off; llama.cpp's repeat penalty (the output is then not token-exact)
+    "repeat_last_n": "64",              # the tokens that repeat_penalty looks at (-1: the whole context)
 }
 
-INT_KEYS = {"repeat_stop", "port", "ctx", "fast_clusters", "checkpoint_every", "checkpoint_budget_mb", "prefix_max", "prefix_min", "park_max",
-            "max_tokens", "top_k"}
-FLOAT_KEYS = {"temperature", "top_p"}
+INT_KEYS = {"repeat_stop", "lookup", "port", "ctx", "fast_clusters", "checkpoint_every", "checkpoint_budget_mb", "prefix_max", "prefix_min", "park_max",
+            "max_tokens", "top_k", "repeat_last_n"}
+FLOAT_KEYS = {"temperature", "top_p", "min_p", "repeat_penalty"}
 PATH_KEYS = {"pack", "state_dir"}
 
 

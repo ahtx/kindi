@@ -224,3 +224,54 @@ extern "C" __global__ void __launch_bounds__(256) k_attn_sq8m(const uint4* __res
     }
   }
 }
+
+/* ---------------------------------------------------------------- two cards: the row-parallel exchange of a T pass */
+
+extern "C" __global__ void __launch_bounds__(1024) k_xsum_T(
+    const float* __restrict__ pin0, int nparts, int C, float* hb0, volatile int* flags0, int me, int* fail, int* ctr0,
+    float* __restrict__ out0){
+  /* block b = token b of a pass: this card's partial (the sum of its nparts column parts, pin0 + b nparts C) is
+     swapped with the other card's through mapped host memory (slot b: hb0 + 4 b C, flags0[2 b], epoch ctr0[b]),
+     and out = mine + other's. Float addition is commutative, so both cards get the same bits. */
+  __shared__ int ok, ep;
+  const int t = threadIdx.x, b = blockIdx.x;
+  const float* pin = pin0 + (long long)b * nparts * C;
+  float* hb = hb0 + (long long)b * 4 * C;
+  volatile int* flags = flags0 + 2 * b;
+  float* out = out0 + (long long)b * C;
+  if(t == 0) ep = ++ctr0[b];
+  __syncthreads();
+  const int epoch = ep, par = epoch & 1;
+  float* hm = hb + (long long)(par * 2 + me) * C;
+  const float* ho = hb + (long long)(par * 2 + (1 - me)) * C;
+  for(int e = t * 4; e < C; e += 4096){
+    float4 v = *(const float4*)(pin + e);
+    for(int i = 1; i < nparts; ++i){
+      const float4 q = *(const float4*)(pin + (long long)i * C + e);
+      v.x += q.x; v.y += q.y; v.z += q.z; v.w += q.w;
+    }
+    *(float4*)(hm + e) = v;
+    *(float4*)(out + e) = v;
+  }
+  __threadfence_system();
+  __syncthreads();
+  if(t == 0){
+    flags[me] = epoch;
+    __threadfence_system();
+    long long spins = 0; ok = 1;
+    while(flags[1 - me] < epoch){ if(++spins > 4000000000LL){ *fail = epoch; ok = 0; break; } }
+  }
+  __syncthreads();
+  if(!ok) return;
+  for(int e = t * 4; e < C; e += 4096){
+    float a, bb, c, d;
+#if KHIP
+    { float4 v4 = *(const float4*)(ho + e); a = v4.x; bb = v4.y; c = v4.z; d = v4.w; }
+#else
+    asm volatile("ld.global.cv.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(a), "=f"(bb), "=f"(c), "=f"(d) : "l"(ho + e));
+#endif
+    float4 v = *(const float4*)(out + e);
+    v.x += a; v.y += bb; v.z += c; v.w += d;
+    *(float4*)(out + e) = v;
+  }
+}

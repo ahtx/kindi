@@ -169,9 +169,12 @@ extern "C" __global__ void k_g4_bf16_mv(const unsigned short* w,const float* x,f
     }
 }
 
+// 6-bit scale and min j (0..7) of a Q4_K/Q5_K block from its 12 scale bytes s. Let k = j mod 4 and u = j / 4; with
+// x = s[k], y = s[k+4], z = s[k+8]: the low 4 bits come from x/y (u = 0) or from the two nibbles of z (u = 1), and
+// bits 4-5 come from bits 4-5 (u = 0) or 6-7 (u = 1) of x for the scale and of y for the min
 __device__ __forceinline__ void g4_scale_min(int j,const unsigned char* s,int* sc,int* mn) {
-    if(j<4){*sc=s[j]&63;*mn=s[j+4]&63;}
-    else {*sc=(s[j+4]&15)|((s[j-4]>>6)<<4);*mn=(s[j+4]>>4)|((s[j]>>6)<<4);}
+    const int k=j&3,u=j>>2; const unsigned int x=s[k],y=s[k+4],z=s[k+8],sh=2*u;
+    *sc=(int)(((u?z:x)&15u)|((x>>sh)&48u)); *mn=(int)(((u?z>>4:y)&15u)|((y>>sh)&48u));
 }
 template<int TYPE> __device__ __forceinline__ float g4_qweight(const unsigned char* row,int col) {
     const int block=col>>8, i=col&255;
@@ -893,7 +896,7 @@ template<int TYPE> __device__ __forceinline__ void g4_kfrom(const unsigned char*
 #pragma unroll
         for(int k=0;k<4;k++)v[k]=((g4_wk(q,k)>>(4*hs))&0x0f0f0f0fu)|(((g4_wk(h,k)>>is)&0x01010101u)<<4);
         const unsigned char* c=blk+4; int a,m;
-        if(is<4){a=c[is]&63;m=c[is+4]&63;} else {a=(c[is+4]&15)|((c[is-4]>>6)<<4);m=(c[is+4]>>4)|((c[is]>>6)<<4);}
+        g4_scale_min(is,c,&a,&m);
         sc=g4_half(blk)*(float)a; mn=g4_half(blk+2)*(float)m;
     }
 }

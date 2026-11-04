@@ -1,0 +1,10 @@
+{
+  "kindi-mtp-2b-v1.npz": {
+    "sha256": "1b5c0c790a594af368c3646370c527c319cdb3bb0592dd3e523e752f721a5520",
+    "bytes": 60960552,
+    "model": "Ternary-Bonsai-2-2B by Prism ML (Apache-2.0), https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf",
+    "source": "contains weights derived from Qwen/Qwen3.5-2B (Apache-2.0)",
+    "url": "https://huggingface.co/ahtx/kindi-mtp-heads/resolve/main/kindi-mtp-2b-v1.npz",
+    "use": "KINDI_MTP_HEAD with KINDI_SPEC=auto (the 2B, up to 8K tokens of context); docs/MTP.md"
+  }
+}
