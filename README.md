@@ -352,7 +352,7 @@ the results of our runs with Kindi on the K420. kbench works with any OpenAI-com
 
 ## AH-Nanbeige4.3-33B IQ3_XXS
 
-Kindi has a backend for AH-Nanbeige4.3-33B IQ3_XXS (our calibrated IQ3_XXS quantization of Nanbeige4.3-33B), 13.1 GB. This model
+Kindi has a backend for AH-Nanbeige4.3-33B IQ3_XXS (our IQ3_XXS quantization of Nanbeige4.3-33B, made with bartowski's imatrix), 13.1 GB. This model
 is a separate download from Hugging Face. It is not a part of Kindi. Model card: https://huggingface.co/ahtx/AH-Nanbeige4.3-33B-IQ3_XXS-GGUF
 
 It is a strong model for coding work, and it can do even better on a slightly faster GPU.
