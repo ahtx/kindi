@@ -176,7 +176,6 @@ Kindi 0.4.0 supports all four series. The tensor-core path and speculative decod
 |---|---|
 | RTX 3080 (190 W) | 27B: 62.3 tokens/s at 512 tokens. With the 2B draft model: 91.1 (1.46 times) at 512 tokens, 103.2 (1.68 times) at 8K with k=2, and 111.5 (1.82 times) at 8K with k=3. The same output as without the draft model. Against llama.cpp: see [BENCHMARKS.md](BENCHMARKS.md) |
 | RTX 3060 12 GB | 27B: 41.1 tokens/s at 512 tokens; with the 2B draft model 60.6 (1.48 times), 73.5 (1.82 times) at 8K, 66.7 (1.81 times) at 24K |
-| RTX 4060 Laptop 8 GB | a user report with Kindi 0.3.0: the 27B writes 28.0 tokens/s at 100 tokens and 25.2 at 24,000, `kindi verify` passes |
 | other RTX 20, 40 and 50 cards | supported; `kindi verify` passes. We give no speed numbers |
 
 ## AH-Nanbeige4.3-33B IQ3_XXS
