@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/kindi-banner.svg" alt="Kindi 0.3.0: modern 2B to 27B language models on low-cost NVIDIA cards and AMD Radeon 780M graphics, from a 1 GB Quadro K420 to an RTX 3080. Two Quadro K1200 cards work as one 8 GB card." width="100%"></p>
+<p align="center"><img src="assets/kindi-banner.svg" alt="Kindi 0.4.0: modern 2B to 33B language models on low-cost GPUs, from a 1 GB Quadro K420 to an RTX 3080. Ternary Bonsai 2B, 4B, 9B and 27B, and AH-Nanbeige4.3-33B." width="100%"></p>
 
 # Kindi 0.4.0
 
