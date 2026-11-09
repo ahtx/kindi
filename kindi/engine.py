@@ -57,7 +57,10 @@ KERNELS = ("k_g4", "k_g4l", "k_fold_fwht", "k_rmsfold", "k_smfold", "k_l2w", "k_
            "k_xrms", "k_gdn_pre", "k_gdn_deltan", "k_rmsw_s", "k_rope2", "k_store_q8", "k_q8row",
            "k_attn_sq8", "k_attn_vq8",
            "k_attn_sq8f", "k_attn_vq8f", "k_deq_emb4",
-           "k_attn_sq8t", "k_attn_vq8u", "k_attn_vq8g", "k_xrmsN", "k_attn_vq8w", "k_g5r4", "k_g5r8", "k_attn_sq8d", "k_g5r1", "k_g5r2", "k_g5n4")
+           "k_attn_sq8t", "k_attn_vq8u", "k_attn_vq8g", "k_xrmsN", "k_attn_vq8w", "k_g5r4", "k_g5r8", "k_attn_sq8d", "k_g5r1", "k_g5r2", "k_g5n4",
+           "k_g5r1s", "k_g5r2s", "k_g5r4s", "k_g5r8s",
+           "k_g5a1", "k_g5a2", "k_g5a4", "k_g5a8",
+           "k_g5a1s", "k_g5a2s", "k_g5a4s", "k_g5a8s")
 
 
 
@@ -74,12 +77,38 @@ def _no_thp():
 
 _no_thp()
 
+def _upload(a):
+    """host array -> card with a plain synchronous copy: cp.asarray stages it in a pinned host buffer of the same size,
+    and a GB-sized cudaHostAlloc fails (cudaErrorInvalidValue) on a host that is short of free RAM"""
+    g = cp.empty(a.shape, dtype=a.dtype)
+    g.set(np.ascontiguousarray(a), stream=cp.cuda.Stream.null)
+    return g
+
+
 class Kernels(object):
     def __init__(self):
         mod = cp.RawModule(code=open(CU, encoding="utf-8").read())
         for k in KERNELS:
             setattr(self, k, mod.get_function(k))
 
+
+
+def file_to_card(path, dtype, chunk=1 << 28):
+    """a binary file -> device array, read 256 MB at a time; each chunk's page cache is dropped after the copy"""
+    dt = np.dtype(dtype)
+    n = os.path.getsize(path) // dt.itemsize
+    out = cp.empty(n, dtype=dt)
+    step = max(1, chunk // dt.itemsize)
+    with open(path, "rb") as f:
+        o = 0
+        while o < n:
+            a = np.fromfile(f, dtype=dt, count=min(step, n - o))
+            out[o:o + a.size].set(a)
+            if hasattr(os, "posix_fadvise"):
+                os.posix_fadvise(f.fileno(), o * dt.itemsize, a.size * dt.itemsize, os.POSIX_FADV_DONTNEED)
+            o += a.size
+            del a
+    return out
 
 class Engine(object):
     """One sequence at a time. step(tok, pos) -> next token (greedy) with the logits left in self.ylog;
@@ -118,8 +147,6 @@ class Engine(object):
                                                    prop["totalGlobalMem"] // 2 ** 20))
         self.idx = json.load(open(os.path.join(pack, "index.json")))
         self.bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
-        bc = np.fromfile(os.path.join(pack, "bcodes.bin"), dtype=np.uint8)
-        dp = np.fromfile(os.path.join(pack, "dpm.bin"), dtype=np.uint16)
         self.hsl = None
         self.hs_force = None
         if clusters is not None:
@@ -131,13 +158,30 @@ class Engine(object):
             self.hs_force = cent.shape[0]
             assign[FIRST_SPECIAL:] = self.hs_force
             clusters = {"assign": assign, "centroids": np.vstack([cent, np.zeros((1, cent.shape[1]), np.float32)])}
+            bc = np.fromfile(os.path.join(pack, "bcodes.bin"), dtype=np.uint8)
+            dp = np.fromfile(os.path.join(pack, "dpm.bin"), dtype=np.uint16)
             bc, dp, self.hsl = layout.reorder_head(self.bi, bc, dp, clusters, self.head_name)
-        dims = layout.repack(self.bi, bc, dp)
-        self.bc, self.dp = cp.asarray(bc), cp.asarray(dp)
-        del bc, dp
+            dims = layout.repack(self.bi, bc, dp)
+            self.bc, self.dp = _upload(bc), _upload(dp)
+            del bc, dp
+        else:
+            # tensor by tensor from memory maps of the pack, repacked on the host and copied to the card: the host
+            # holds one tensor, not the weights (a 2 GiB container runs the 9B)
+            bcm = np.memmap(os.path.join(pack, "bcodes.bin"), dtype=np.uint8, mode="r")
+            dpm = np.memmap(os.path.join(pack, "dpm.bin"), dtype=np.uint16, mode="r")
+            self.bc, self.dp = cp.zeros(bcm.size, dtype=cp.uint8), cp.zeros(dpm.size, dtype=cp.uint16)
+            dims = {}
+            for name, rec in self.bi.items():
+                ns, P = rec["ne0"] // 4, rec["ne0"] // 128
+                o, d = rec["bc_off"], rec["dpm_off"] // 2
+                b, q = np.array(bcm[o:o + ns * rec["rows"]]), np.array(dpm[d:d + P * rec["rows"]])
+                dims.update(layout.repack({name: dict(rec, bc_off=0, dpm_off=0)}, b, q))
+                self.bc[o:o + b.size].set(b)
+                self.dp[d:d + q.size].set(q)
+            del bcm, dpm
         self.w = {n: (self.bc[self.bi[n]["bc_off"]:], self.dp[self.bi[n]["dpm_off"] // 2:], np.int32(R), np.int32(C))
                   for n, (R, C) in dims.items()}
-        self.fl = cp.asarray(np.fromfile(os.path.join(pack, "f32.bin"), dtype=np.float32))
+        self.fl = file_to_card(os.path.join(pack, "f32.bin"), cp.float32)
         # Hadamard sign vectors, one per folded input width: D (norm outputs), NV*HK (GDN output), NH*HD (attention
         # output; 2048 = D on the 2B, 4096 != D on the 4B) and NFF (FFN down)
         sg = lambda w: cp.asarray(np.fromfile(os.path.join(pack, "signs_%d.f32" % w), dtype=np.float32))  # noqa: E731
@@ -405,6 +449,9 @@ class Engine(object):
         return out
 
 
+PLAN_SMALL_HIP = ("gfx1151",)      # the AMD GPUs where the 2B / 4B / 9B take the plan engine (measured)
+
+
 def make_engine(pack, ctx=4096, clusters=None, log=print):
     """Engine on one GPU, or the two-card tensor parallel engine (kindi.tp) when the weights do not fit one card and
     two GPUs are present. KINDI_TP=1 / 0 forces the choice."""
@@ -423,6 +470,12 @@ def make_engine(pack, ctx=4096, clusters=None, log=print):
     # the plan engine (kindi.tp) also runs on one card: it is the one that has the 27B's kernels (6 q heads per K/V
     # head, Hadamard blocks of 1024, q8_0 K/V)
     plan_model = dims.get("heads", 8) != 4 * dims.get("kv_heads", 2) or int(man.get("hadamard_block", 512)) == 1024
+    # AMD GPUs with many CUs (Strix Halo, gfx1151): the 2B, 4B and 9B (512- and 4096-point folds) also run faster on
+    # the plan engine's 5-trit products (2B write 173 -> 259, 9B 52 -> 89 tokens/s); measured there only
+    if cp.cuda.runtime.is_hip and int(man.get("hadamard_block", 512)) in (512, 4096) and not two:
+        arch = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id).get("gcnArchName", b"")
+        arch = (arch.decode() if isinstance(arch, bytes) else str(arch)).split(":")[0]
+        plan_model = plan_model or arch in PLAN_SMALL_HIP
     if force == "1" or (force != "0" and (plan_model or (two and weights > 0.9 * cp.cuda.runtime.memGetInfo()[1]))):
         from .tp import TPEngine
         from . import spec

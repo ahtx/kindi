@@ -10,6 +10,20 @@ CU_EVENT_BLOCKING_SYNC = 1
 _done = [False]
 
 
+def _kfd_gfx():
+    """the gfx target versions of the AMD GPUs in the KFD topology (110501 = gfx1151)"""
+    out = set()
+    try:
+        root = "/sys/class/kfd/kfd/topology/nodes"
+        for n in os.listdir(root):
+            for line in open(os.path.join(root, n, "properties")):
+                if line.startswith("gfx_target_version"):
+                    out.add(int(line.split()[1]))
+    except OSError:
+        pass
+    return out
+
+
 def blocking_sync(log=print):
     """set CU_CTX_SCHED_BLOCKING_SYNC on the primary context of every visible card (once per process)"""
     if _done[0] or os.environ.get("KINDI_BLOCKING_SYNC", "1") != "1":
@@ -17,6 +31,12 @@ def blocking_sync(log=print):
     _done[0] = True
     from . import gpudrv
     if gpudrv.HIP:
+        # Strix Halo (gfx1151): the blocking waits woke late and at random (9B write 21-41 tokens/s against 51.6
+        # spinning); spin there, unless KINDI_BLOCKING_SYNC=1 is set
+        if "KINDI_BLOCKING_SYNC" not in os.environ and _kfd_gfx() & {110501}:
+            os.environ["KINDI_BLOCKING_SYNC"] = "0"
+            log("blocking sync: off on gfx1151 (spin wait)")
+            return
         # ROCm: no libcuda; hipSetDeviceFlags(hipDeviceScheduleBlockingSync) on every device
         try:
             hip = gpudrv.hip_lib()

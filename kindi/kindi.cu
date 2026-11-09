@@ -41,8 +41,9 @@ __device__ __forceinline__ float h2f(unsigned short h){ float f; asm("cvt.f32.f1
 /* e^x with no special-function unit: x = k ln2 + r with k the nearest integer to x / ln2 and |r| <= ln2 / 2, r found
    with ln2 split in a 16-bit-exact high part and a low part (Cody-Waite), e^r from its Taylor series to r^7 / 7!
    in Horner form, then scaled by 2^k in two halves so that results near the float limits (k = 128, subnormals) stay
-   right. Only round-to-nearest fma/mul/add are used, so every compiler version gives the same bits. */
-#if !KHIP
+   right. Only round-to-nearest fma/mul/add are used, so every compiler version gives the same bits.
+   KINDI_NO_KEXPF (spec.py, KINDI_KEXPF=0): NVRTC's own expf instead. */
+#if !KHIP && !defined(KINDI_NO_KEXPF)
 __device__ __forceinline__ float kexpf(float x){
     const float INV_LN2 = 1.44269502162933349609375f, LN2_HI = 0.693145751953125f, LN2_LO = 1.428606765330187045e-06f;
     float c = fminf(fmaxf(x, -104.0f), 89.0f);
@@ -552,6 +553,20 @@ extern "C" __global__ void k_deq_emb3(const unsigned char* __restrict__ bc, cons
   }
   /* larger blocks: an in-place FWHT of each block (the first 512 threads), then signs and scale */
   for(int c0 = 0; c0 < C; c0 += HB){
+#if KHIP
+    /* HIP has no named 512-thread barrier, and a __syncthreads() that only the first 512 threads reach pairs with
+       the other waves' later barriers (wrong sums: the 9B's embeddings): every thread runs the stages and the barrier */
+    for(int hh = 1; hh < HB; hh <<= 1){
+      if(t < 512){
+        for(int q = t; q < (HB >> 1); q += 512){
+          const int i = c0 + (q / hh) * 2 * hh + (q % hh);
+          const float a = w[i], b = w[i + hh];
+          w[i] = a + b; w[i + hh] = a - b;
+        }
+      }
+      __syncthreads();
+    }
+#else
     if(t < 512){
       for(int hh = 1; hh < HB; hh <<= 1){
         for(int q = t; q < (HB >> 1); q += 512){
@@ -559,13 +574,10 @@ extern "C" __global__ void k_deq_emb3(const unsigned char* __restrict__ bc, cons
           const float a = w[i], b = w[i + hh];
           w[i] = a + b; w[i + hh] = a - b;
         }
-#if KHIP
-        __syncthreads();
-#else
         asm volatile("bar.sync 1, 512;");
-#endif
       }
     }
+#endif
   }
   __syncthreads();
   const float sc = rsqrtf((float)HB);
@@ -1465,9 +1477,10 @@ extern "C" __global__ void k_attn_vq8f(const float* __restrict__ s, const unsign
 
 extern "C" __global__ void k_deq_emb4(const unsigned char* __restrict__ bc, const unsigned short* __restrict__ dpb,
                                       const float* __restrict__ sg, float* __restrict__ h, int row, int C, int HB){
-  /* k_deq_emb3 for Hadamard blocks of HB = 1024, one block of 512 threads per Hadamard block (grid C / HB): the
-     same dequantisation, butterflies and scaling per element, so the result is bit-identical */
-  __shared__ float w[1024];
+  /* k_deq_emb3 for Hadamard blocks of HB <= 4096, one block of 512 threads per Hadamard block (grid C / HB): the
+     same dequantisation, butterflies and scaling per element, so the result is bit-identical (the 9B's HB = 4096
+     overran a 1024-float buffer: an illegal address on the tc path) */
+  __shared__ float w[4096];
   const int t = threadIdx.x, c0 = blockIdx.x * HB;
   const long long r4 = row >> 2, rl = row & 3, g16 = row >> 4;
   const int rr = row & 15;
@@ -1915,6 +1928,125 @@ extern "C" __global__ void __launch_bounds__(512) k_g5r1(const unsigned int* __r
                                                          int R, int NG, const float* __restrict__ x){
   g5_core<1>(W, y, R, NG, x, 0);
 }
+
+/* k_g5a*: k_g5r* without the 5832-entry tables. A block builds only the 24 x 36 three- and two-column sums (AB) and the
+   two 81-entry four-column tables, and looks each byte up as AB[c % 27] + AB[27 + c / 27], the same fp32 add that
+   g5_tables makes, so the products are bit-identical. Fewer table entries per group make small blocks cheap: more
+   blocks and fewer column splits on GPUs with many CUs (Strix Halo). */
+template <int RPT>
+__device__ __forceinline__ void g5_core_ab(const unsigned int* __restrict__ W, float* __restrict__ y, int R, int NG,
+                                           const float* __restrict__ x){
+  __shared__ float T4[2 * 81];
+  __shared__ float AB[24 * 36];
+  const int t = threadIdx.x, nt = blockDim.x;
+  const int g_lo = (int)((long long)blockIdx.y * NG / gridDim.y), g_hi = (int)((long long)(blockIdx.y + 1) * NG / gridDim.y);
+  const int r0 = blockIdx.x * nt * RPT + t;
+  float acc[RPT];
+#pragma unroll
+  for(int k = 0; k < RPT; ++k) acc[k] = 0.f;
+  for(int g = g_lo; g < g_hi; ++g){
+    __syncthreads();
+    const float* xg = x + g * 128;
+    for(int e = t; e < 24 * 36 + 2 * 81; e += nt){
+      if(e < 24 * 36){
+        const int j = e / 36, k = e - j * 36;
+        float s;
+        if(k < 27){
+          const int t0 = k % 3, t1 = (k / 3) % 3, t2 = k / 9;
+          s = (float)(t0 - 1) * xg[5 * j] + (float)(t1 - 1) * xg[5 * j + 1] + (float)(t2 - 1) * xg[5 * j + 2];
+        } else {
+          const int k2 = k - 27, t3 = k2 % 3, t4 = k2 / 3;
+          s = (float)(t3 - 1) * xg[5 * j + 3] + (float)(t4 - 1) * xg[5 * j + 4];
+        }
+        AB[e] = s;
+      } else {
+        const int e2 = e - 24 * 36, m = e2 / 81;
+        int c = e2 - m * 81;
+        float s = 0.f;
+#pragma unroll
+        for(int i = 0; i < 4; ++i){ const int tr = c % 3; c /= 3; s += (float)(tr - 1) * xg[120 + 4 * m + i]; }
+        T4[e2] = s;
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for(int k = 0; k < RPT; ++k){
+      const int r = r0 + k * nt;
+      if(r < R){
+        const unsigned int* b = W + ((long long)g * R + r) * 7;
+        unsigned int w[7];
+#pragma unroll
+        for(int i = 0; i < 7; ++i) w[i] = KLDG(b + i);
+        float s = 0.f;
+#pragma unroll
+        for(int i = 0; i < 6; ++i){
+#pragma unroll
+          for(int q = 0; q < 4; ++q){
+            const unsigned int c = (w[i] >> (8 * q)) & 255u, hi = (c * 2428u) >> 16, lo = c - 27u * hi;
+            const float* A = AB + (i * 4 + q) * 36;
+            s += A[lo] + A[27 + hi];
+          }
+        }
+        const unsigned int c0 = w[6] & 255u, c1 = (w[6] >> 8) & 255u;
+        s += T4[c0];
+        s += T4[81 + c1];
+        acc[k] += s * h2f((unsigned short)(w[6] >> 16));
+      }
+    }
+  }
+#pragma unroll
+  for(int k = 0; k < RPT; ++k){
+    const int r = r0 + k * nt;
+    if(r < R) y[(long long)blockIdx.y * R + r] = acc[k];
+  }
+}
+#define G5RA(N) extern "C" __global__ void __launch_bounds__(512) k_g5a##N(const unsigned int* __restrict__ W, \
+    float* __restrict__ y, int R, int NG, const float* __restrict__ x){ g5_core_ab<N>(W, y, R, NG, x); }
+G5RA(1)
+G5RA(2)
+G5RA(4)
+G5RA(8)
+
+/* k_g5r*s: a column-split product that adds its parts in the same launch (no k_sumparts launch). Each block writes its
+   part as k_g5r* does, then counts itself in cnt[blockIdx.x]; the last block of a row range adds the parts of its rows
+   in k_sumparts' order (bit-identical to the two launches) and sets the counter back to 0. The tuner takes these when
+   they are faster: on AMD a launch costs ~2 us (Strix Halo), and small blocks keep the added pass short. */
+template <int RPT>
+__device__ __forceinline__ void g5_sum_last(const float* part, float* __restrict__ out, unsigned int* cnt, int R){
+  __shared__ unsigned int last;
+  __threadfence();
+  __syncthreads();
+  if(threadIdx.x == 0) last = atomicAdd(cnt + blockIdx.x, 1u) == gridDim.y - 1;
+  __syncthreads();
+  if(!last) return;
+  __threadfence();
+  const volatile float* vp = part;
+  const int r0 = blockIdx.x * blockDim.x * RPT + threadIdx.x;
+  float v[RPT];
+#pragma unroll
+  for(int k = 0; k < RPT; ++k){ const int r = r0 + k * blockDim.x; v[k] = r < R ? vp[r] : 0.f; }
+  for(int i = 1; i < (int)gridDim.y; ++i){
+#pragma unroll
+    for(int k = 0; k < RPT; ++k){ const int r = r0 + k * blockDim.x; if(r < R) v[k] += vp[(long long)i * R + r]; }
+  }
+#pragma unroll
+  for(int k = 0; k < RPT; ++k){ const int r = r0 + k * blockDim.x; if(r < R) out[r] = v[k]; }
+  if(threadIdx.x == 0) cnt[blockIdx.x] = 0u;
+}
+#define G5RS(N) extern "C" __global__ void __launch_bounds__(512) k_g5r##N##s(const unsigned int* __restrict__ W, \
+    float* __restrict__ y, int R, int NG, const float* __restrict__ x, float* __restrict__ out, unsigned int* cnt){ \
+  g5_core<N>(W, y, R, NG, x, 0); g5_sum_last<N>(y, out, cnt, R); }
+G5RS(1)
+G5RS(2)
+G5RS(4)
+G5RS(8)
+#define G5RAS(N) extern "C" __global__ void __launch_bounds__(512) k_g5a##N##s(const unsigned int* __restrict__ W, \
+    float* __restrict__ y, int R, int NG, const float* __restrict__ x, float* __restrict__ out, unsigned int* cnt){ \
+  g5_core_ab<N>(W, y, R, NG, x); g5_sum_last<N>(y, out, cnt, R); }
+G5RAS(1)
+G5RAS(2)
+G5RAS(4)
+G5RAS(8)
 
 /* ---------------------------------------------------------------- q8_0 attention scores with dp4a (sm_61+) */
 

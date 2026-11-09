@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.5.0 (2026-11-09)
+
+### New
+
+- **The NVIDIA CMP 170HX (GA100, sm_80) is a supported card.** The board that we measured has 40 GB of HBM2e
+  (device id 0x2082) on PCIe gen4 x16, and its FP32 FMA rate is not limited. Kindi writes faster than llama.cpp on
+  the same card for the 27B (one and two cards) and for AH-Nanbeige4.3-33B IQ3_XXS (one and two cards, up to 32K
+  tokens of context). We did not test the CMP 170HX board with 8 GB.
+  [docs/CARDS.md](docs/CARDS.md) and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) have the numbers.
+- **The b2 weight copy (sm_80).** On sm_80 cards with 20 GB or more, the decode products read a second copy of the
+  ternary weights with 2 bits for each digit. Each mma register then needs one logic operation instead of the
+  five-trit decode. The products are bit-identical. The copy is 1.29 times the size of the weights. `KINDI_TC_B2=0`
+  turns it off.
+- **The 4B on the tensor-core path.** Widths that are not a multiple of 1024 (the 4B: 2560) use padded units. On an
+  RTX 3080 at 190 W, the 4B writes 258 tokens/s at 512 tokens (the single-card engine: 118).
+- **The AMD Radeon 840M (RDNA 3.5, gfx1152) is a supported graphics unit.** It is the graphics unit of the Ryzen AI 5
+  340. ROCm runs it natively, without `HSA_OVERRIDE_GFX_VERSION`. On the same computer and with the same model files,
+  Kindi writes faster than llama.cpp for the 2B, 4B, 9B and 27B, at 512 and 8K tokens, and it reads the 27B faster.
+  [docs/CARDS.md](docs/CARDS.md) and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) have the numbers.
+- **AMD Radeon 8060S (Strix Halo, Ryzen AI MAX+ 395, gfx1151).** Kindi runs the 2B, 4B, 9B and 27B on it, and
+  `kindi verify` passes on all four. On the same computer and with the same model files, Kindi writes and reads
+  faster than llama.cpp for all four models, at 512 and 8K tokens. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the
+  numbers.
+- **The `kindi-rocm7` image for RDNA 3.5.** The installer finds gfx1150, gfx1151 and gfx1152 graphics and builds
+  `kindi-rocm7:0.5.0` (`docker/Dockerfile.rocm7`: ROCm 7 with HIP 7.16 and CuPy 14.2.0). These graphics units do not
+  need `HSA_OVERRIDE_GFX_VERSION`. The installer offers the 27B, 9B, 4B and 2B on them. We did not measure Strix Point
+  (gfx1150). RDNA3 graphics (gfx1100-gfx1103, the Radeon 780M) keep the `kindi-rocm` image (ROCm 6.3.3).
+
+### Changed
+
+- The new decode defaults (128-position flash-decode chunks, 4-warp product blocks and the one-pass RMS fold on
+  cards with 80 SMs or more, the thread-per-element SiLU fold, NVRTC's own `expf` in the tensor-core kernels) are on
+  for sm_80 and sm_86 only. Other cards keep the 0.4.0 behaviour until we measure them. `KINDI_TESTED_CC` adds a
+  compute capability (for example `8.9`).
+- The bank-free IQ3_XXS codebook of the 33B decode is on for sm_80 only (on an RTX 3090 it was 14% slower).
+- `kindi verify` counts a first difference as a tie when llama.cpp's own top-2 gap there is under 0.01 nats, or when
+  another llama.cpp run of the same file gives Kindi's token. This is the rule of the 33B backend. The 4B and 27B
+  references have the gaps (`tools/bonsai_gaps.py` makes them from a running llama-server).
+- Weights go to the card with a plain synchronous copy (a large pinned staging buffer failed on hosts with little
+  free memory).
+- On AMD graphics, the GEMV configurations are set for each graphics unit (the Radeon 780M and the Radeon 840M).
+  Kindi times the configurations at start on other AMD graphics units. On AMD, a row-parallel product uses 8 column
+  splits at most, because 16 splits changed the 27B output on the 840M.
+- On the Radeon 8060S (gfx1151), the 2B, 4B and 9B use the plan engine, with GEMV kernels and settings for this
+  unit. Kindi waits for the graphics unit in a loop instead of a blocking wait (the blocking wait woke late at
+  random). `KINDI_BLOCKING_SYNC=1` keeps the blocking wait.
+- The installer finds AMD graphics on computers and containers without `lspci`.
+- Kindi copies the weights to the card in pieces, one tensor at a time. The host does not keep a full copy of the
+  weights. A computer or container with 2 GB of free memory can load the 9B and the 27B.
+
+### Fixed
+
+- The 9B on the tensor-core path stopped with an illegal memory access (the embedding fold had a 1024-value buffer
+  for Hadamard blocks of 4096).
+- The 9B on the tensor-core path differed from llama.cpp at prompt 1 token 36 with Kindi's own `expf`; it is
+  token-exact with NVRTC's `expf`.
+- The 9B on AMD graphics gave wrong output (`kindi verify` FAIL). A barrier in the embedding kernel was inside a
+  condition, so on AMD the waves did not wait for each other. The 9B is now token-exact on the Radeon 780M and 840M.
+- On AMD graphics, prompts were read one token at a time when the weight cache had no lane-layout copy (Radeon 780M,
+  27B: 10.8 tokens/s). Kindi now makes the missing copy (105 tokens/s).
+
 ## 0.4.0 (2026-11-04)
 
 ### New

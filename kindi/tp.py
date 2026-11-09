@@ -67,18 +67,59 @@ def g5_gx(R, nt, rpt):
     return (R // 16 + nt // 8 - 1) // (nt // 8) if rpt == 0 else (R + nt * rpt - 1) // (nt * rpt)
 
 
-# (rows, 128-column groups, row-parallel) -> (threads, rows per thread, splits): the Radeon 780M's measured bests
-G5_PINNED_HIP = {(1024, 40, False): (512, 8, 32), (5120, 48, True): (512, 4, 4), (5120, 136, True): (512, 4, 8),
-                 (6144, 40, False): (512, 4, 8), (10240, 40, False): (512, 8, 4), (12288, 40, False): (512, 4, 4),
-                 (17408, 40, False): (512, 8, 2), (248320, 40, False): (512, 8, 1)}
+# (rows, 128-column groups, row-parallel) -> (threads, rows per thread, splits): measured bests per GPU (the best
+# split count follows the number of compute units; 16 row-parallel splits fail the 27B verify on the 840M).
+# Other AMD GPUs are timed at start.
+_G5_780M = {(1024, 40, False): (512, 8, 32), (5120, 48, True): (512, 4, 4), (5120, 136, True): (512, 4, 8),
+            (6144, 40, False): (512, 4, 8), (10240, 40, False): (512, 8, 4), (12288, 40, False): (512, 4, 4),
+            (17408, 40, False): (512, 8, 2), (248320, 40, False): (512, 8, 1)}
+_G5_840M = {(1024, 40, False): (512, 8, 8), (5120, 48, True): (512, 4, 4), (5120, 136, True): (512, 4, 8),
+            (6144, 40, False): (512, 8, 16), (10240, 40, False): (512, 8, 8), (12288, 40, False): (512, 8, 2),
+            (17408, 40, False): (512, 8, 4), (248320, 40, False): (512, 8, 2)}
+# Strix Halo: (threads, rows per thread, splits, kernel), timed over the layers' tensors (DRAM, not the 32 MB cache);
+# "a" = k_g5a* (no 5832-entry tables), "as" = k_g5a*s (and the parts added in the same launch)
+_G5_8060S = {
+    # 27B
+    (10240, 40, False): (512, 1, 4, "as"), (6144, 40, False): (512, 1, 4, "as"), (5120, 48, True): (512, 1, 8, "a"),
+    (17408, 40, False): (512, 2, 2, "as"), (5120, 136, True): (512, 1, 4, "a"), (12288, 40, False): (256, 2, 4, "a"),
+    (1024, 40, False): (512, 1, 16, "as"), (248320, 40, False): (512, 1, 2, "as"),
+    # 9B
+    (8192, 32, False): (512, 1, 4, "as"), (4096, 32, False): (512, 1, 4, "as"), (4096, 32, True): (512, 1, 8, "a"),
+    (12288, 32, False): (512, 2, 4, "as"), (4096, 96, True): (512, 1, 8, "a"), (1024, 32, False): (512, 1, 16, "as"),
+    (248320, 32, False): (512, 1, 1, "a"),
+    # 4B
+    (8192, 20, False): (512, 1, 4, "as"), (4096, 20, False): (512, 1, 4, "as"), (2560, 32, True): (512, 1, 8, "a"),
+    (9216, 20, False): (512, 1, 2, "as"), (2560, 72, True): (512, 1, 8, "a"), (1024, 20, False): (512, 1, 16, "as"),
+    (248320, 20, False): (512, 1, 1, "a"),
+    # 2B
+    (6144, 16, False): (512, 1, 4, "as"), (2048, 16, False): (512, 1, 8, "as"), (2048, 16, True): (512, 1, 8, "a"),
+    (2048, 48, True): (512, 1, 8, "a"), (4096, 16, False): (512, 1, 8, "as"), (512, 16, False): (512, 1, 16, "as"),
+    (248320, 16, False): (512, 1, 1, "a")}
+G5_PINNED_HIP = {"gfx1103": _G5_780M, "gfx1102": _G5_780M,     # Radeon 780M, 12 CUs (run as gfx1102)
+                 "gfx1152": _G5_840M,                            # Radeon 840M (Ryzen AI 5 340), 4 CUs
+                 "gfx1151": _G5_8060S}                           # Radeon 8060S (Ryzen AI MAX+ 395, Strix Halo), 40 CUs
+
+
+def _g5_pins(s):
+    if "g5pins" not in s.__dict__:
+        arch = rt.getDeviceProperties(cp.cuda.Device().id).get("gcnArchName", b"")
+        arch = (arch.decode() if isinstance(arch, bytes) else str(arch)).split(":")[0]
+        s.g5pins = dict(G5_PINNED_HIP.get(arch, {}))
+        # KINDI_G5_PINS="R,NG,rowpar,threads,rpt,splits;...": replace single shapes (a test of other configs)
+        for e in filter(None, os.environ.get("KINDI_G5_PINS", "").split(";")):
+            v = [int(x) for x in e.split(",")]
+            s.g5pins[(v[0], v[1], bool(v[2]))] = tuple(v[3:6])
+    return s.g5pins
 
 
 def g5_tuned(s, name, R, NG, rowpar):
     """(threads, rows per thread, splits) for a 5-trit product of shape (R, 128 NG) on card s: timed once per shape."""
-    if (rt.is_hip and not s.g5l and os.environ.get("KINDI_G5_PIN", "1") == "1" and (R, NG, rowpar) in G5_PINNED_HIP
-            and G5_PINNED_HIP[(R, NG, rowpar)][2] * R <= s.gpart.size):
-        s.__dict__.setdefault("g5cfg", {})[(R, NG, rowpar)] = G5_PINNED_HIP[(R, NG, rowpar)]
-        return G5_PINNED_HIP[(R, NG, rowpar)]
+    pins = _g5_pins(s) if rt.is_hip and not s.g5l and os.environ.get("KINDI_G5_PIN", "1") == "1" else {}
+    if (R, NG, rowpar) in pins and pins[(R, NG, rowpar)][2] * R <= s.gpart.size:
+        c = tuple(pins[(R, NG, rowpar)])
+        s.__dict__.setdefault("g5cfg", {})[(R, NG, rowpar)] = c[:3]
+        s.__dict__.setdefault("g5var", {})[(R, NG, rowpar)] = c[3] if len(c) > 3 else "r"   # (threads, rpt, splits, kernel)
+        return c[:3]
     if os.environ.get("KINDI_G5_TUNE", "1") != "1":
         nt, rpt, sp = g5_shape(R, NG)
         if s.g5l:
@@ -90,6 +131,12 @@ def g5_tuned(s, name, R, NG, rowpar):
         return cache[key]
     K = s.k
     W5 = s.w[name][1]
+    Ws = [W5]
+    if rt.is_hip:
+        # time the configs over the layers' tensors of this shape: one tensor run again and again stays in the
+        # 32 MB cache of Strix Halo (400-480 "GB/s" there) and picks configs that lose when the weights come from DRAM
+        Ws = [w[1] for w in s.w.values() if w[0] == "g5" and int(w[2]) == R and int(w[3]) == 128 * NG][:24] or [W5]
+    Wt = (Ws * 10)[:max(10, len(Ws))]
     x = cp.zeros(128 * NG, dtype=cp.float32)
     fns = {0: K.k_g5n4, 1: K.k_g5r1, 2: K.k_g5r2, 4: K.k_g5r4, 8: K.k_g5r8}
     best = None
@@ -98,7 +145,8 @@ def g5_tuned(s, name, R, NG, rowpar):
         for nt in ((256,) if s.g5l else (256, 512)):
             gx = g5_gx(R, nt, rpt)
             for sp in (1, 2, 4, 8, 16, 32):
-                if sp > NG or (rowpar and sp > 16) or sp * R > s.gpart.size or gx * sp < 4:
+                # HIP: row-parallel products with 16 splits fail the 27B verify (840M), so 8 at most there
+                if sp > NG or (rowpar and sp > (8 if rt.is_hip else 16)) or sp * R > s.gpart.size or gx * sp < 4:
                     continue
                 f = fns[rpt]
 
@@ -109,13 +157,78 @@ def g5_tuned(s, name, R, NG, rowpar):
                 for _ in range(3):
                     run()
                 ev0.record()
-                for _ in range(10):
+                for W5 in Wt:
                     run()
                 ev1.record()
                 ev1.synchronize()
-                ms = cp.cuda.get_elapsed_time(ev0, ev1) / 10 + (0.00002 * sp if rowpar else 0.0)   # k_sumparts reads the parts
+                ms = cp.cuda.get_elapsed_time(ev0, ev1) / len(Wt) + (0.00002 * sp if rowpar else 0.0)   # k_sumparts reads the parts
                 if best is None or ms < best[0]:
                     best = (ms, nt, rpt, sp)
+    fz = None
+    if rt.is_hip and not rowpar and not s.g5l and os.environ.get("KINDI_G5_FUSED", "1") == "1":
+        # HIP: the column-split products that add their parts in the same launch (k_g5r*s), smaller blocks too
+        ffn = {1: K.k_g5r1s, 2: K.k_g5r2s, 4: K.k_g5r4s, 8: K.k_g5r8s}
+        for rpt in (1, 2, 4, 8):
+            for nt in (128, 256, 512):
+                gx = g5_gx(R, nt, rpt)
+                for sp in (2, 4, 8, 16, 32):
+                    if sp > NG or sp * R > s.gpart.size or gx > s.g5cnt.size or gx * sp < 4:
+                        continue
+                    f = ffn[rpt]
+                    out = s.y if R <= s.y.size else s.qkv
+                    for _ in range(3):
+                        f((gx, sp), (nt,), (W5, s.gpart, i32(R), i32(NG), x, out, s.g5cnt))
+                    ev0.record()
+                    for W5 in Wt:
+                        f((gx, sp), (nt,), (W5, s.gpart, i32(R), i32(NG), x, out, s.g5cnt))
+                    ev1.record()
+                    ev1.synchronize()
+                    ms = cp.cuda.get_elapsed_time(ev0, ev1) / len(Wt)
+                    if ms < best[0]:
+                        best, fz = (ms, nt, rpt, sp), True
+    var = "s" if fz else "r"
+    if rt.is_hip and not s.g5l and os.environ.get("KINDI_G5_AB", "1") == "1":
+        # HIP: k_g5a* (no 5832-entry tables, bit-identical): small blocks become cheap, so more blocks, fewer splits
+        fab = {1: K.k_g5a1, 2: K.k_g5a2, 4: K.k_g5a4, 8: K.k_g5a8}
+        for rpt in (1, 2, 4, 8):
+            for nt in (64, 128, 256, 512):
+                gx = g5_gx(R, nt, rpt)
+                for sp in (1, 2, 4, 8, 16, 32):
+                    if sp > NG or (rowpar and sp > 8) or sp * R > s.gpart.size or gx * sp < 4:
+                        continue
+                    f = fab[rpt]
+
+                    def run():
+                        f((gx, sp), (nt,), (W5, s.gpart, i32(R), i32(NG), x))
+                        if sp > 1 and not rowpar:
+                            K.k_sumparts(((R + 255) // 256,), (256,), (s.gpart, s.y if R <= s.y.size else s.gpart, i32(R), i32(sp)))
+                    for _ in range(3):
+                        run()
+                    ev0.record()
+                    for W5 in Wt:
+                        run()
+                    ev1.record()
+                    ev1.synchronize()
+                    ms = cp.cuda.get_elapsed_time(ev0, ev1) / len(Wt) + (0.00002 * sp if rowpar else 0.0)
+                    if ms < best[0]:
+                        best, var = (ms, nt, rpt, sp), "a"
+                    if sp > 1 and not rowpar and gx <= s.g5cnt.size:
+                        # the same with the parts added by the last block (k_g5a*s: no k_sumparts launch)
+                        fs = {1: K.k_g5a1s, 2: K.k_g5a2s, 4: K.k_g5a4s, 8: K.k_g5a8s}[rpt]
+                        out = s.y if R <= s.y.size else s.qkv
+                        for _ in range(3):
+                            fs((gx, sp), (nt,), (W5, s.gpart, i32(R), i32(NG), x, out, s.g5cnt))
+                        ev0.record()
+                        for W5 in Wt:
+                            fs((gx, sp), (nt,), (W5, s.gpart, i32(R), i32(NG), x, out, s.g5cnt))
+                        ev1.record()
+                        ev1.synchronize()
+                        ms = cp.cuda.get_elapsed_time(ev0, ev1) / len(Wt)
+                        if ms < best[0]:
+                            best, var = (ms, nt, rpt, sp), "as"
+    s.__dict__.setdefault("g5var", {})[key] = var
+    if os.environ.get("KINDI_G5_TUNELOG"):
+        print("g5 tune %s: %s %s %.1f us, %.0f GB/s" % (key, best[1:], var, best[0] * 1e3, R * NG * 28 / best[0] / 1e6), flush=True)
     cache[key] = best[1:]
     return best[1:]
 
@@ -289,14 +402,7 @@ class Shard(object):
         tp = self.tp
         t0 = time.time()
         tern, flt = self._slices()
-        if self.g5:
-            key = "%s-w%d%s-c%d" % ((tp.man.get("source_sha256") or "pack")[:12], tp.W, getattr(tp, "split_tag", ""), self.card)
-            if os.path.exists(os.path.join(tp.pack, "g5_%s.json" % key)):
-                tern_load = {}                    # cached 5-trit weights: no slices to read
-            else:
-                tern_load = tern
-        else:
-            tern_load = tern
+        tern_load = {} if self.g5 else tern       # 5-trit weights: the cache files, made from the slices below if missing
         bparts, dparts, bi = [], [], {}
         bo = do = 0
         if not self.g5:
@@ -322,8 +428,7 @@ class Shard(object):
                 B, S = B[cols[0] // 4:cols[1] // 4], S[cols[0] // 128:cols[1] // 128]
             bi[name] = {"bc_off": bo, "dpm_off": do * 2, "rows": B.shape[1], "ne0": B.shape[0] * 4}
             if self.g5:
-                bparts.append(np.ascontiguousarray(B))
-                dparts.append(np.ascontiguousarray(S))
+                pass                              # 5-trit blobs are made tensor by tensor below, straight to the cache file
             else:
                 np.copyto(bc_all[bo:bo + B.size].reshape(B.shape), B)
                 np.copyto(dp_all[do:do + S.size].reshape(S.shape), S)
@@ -336,55 +441,60 @@ class Shard(object):
             ipath = os.path.join(tp.pack, "g5_%s.json" % key)
             lpath = os.path.join(tp.pack, "g5n_%s.bin" % key)
             lane = False
-            if os.path.exists(cpath) and os.path.exists(ipath):
-                offs = {n: tuple(v) for n, v in json.load(open(ipath)).items()}
-                lane = self.g5l and os.path.exists(lpath)
-                if lane and os.environ.get("KINDI_STREAM_LOAD", "1") == "1":
-                    host = None                     # streamed to the card below, 256 MB at a time
-                else:
-                    host = np.fromfile(lpath if lane else cpath, dtype=np.uint32)
-                del bparts, dparts
-            else:
-                blobs, offs, o = [], {}, 0
-                for name, B, S in zip(tern_load, bparts, dparts):
-                    rec = bi[name]
+            dual = not self.g5l and os.environ.get("KINDI_G5_DUAL", "1" if rt.is_hip else "0") == "1"
+            # (re)built when a file this card uses is missing: a row cache made without the lane copy (by an older
+            # build, or a run with dual off) left HIP prompts token by token (780M 27B read 10.8 tok/s)
+            # a cache without one of this card's tensors (made before the tied-head alias: the 2B / 4B's output.weight)
+            # is made again
+            stale = os.path.exists(ipath) and not set(tern) <= set(json.load(open(ipath)))
+            if stale or not (os.path.exists(cpath) and os.path.exists(ipath)) or \
+                    ((self.g5l or dual) and not os.path.exists(lpath)):
+                # one tensor at a time, from the pack's memory maps to the cache files (the row layout, and the 16-row
+                # lane layout when it is used: k_g5n4 decode, or the chunked prompt GEMM next to row decode): the host
+                # holds one tensor's blob, not the card's weights (a 2 GiB container loads the 27B)
+                offs, o = {}, 0
+                fr = open(cpath + ".tmp", "wb")
+                fl = open(lpath + ".tmp", "wb") if (self.g5l or dual) else None
+                for name, (rows, cols) in tern.items():
+                    rec = tp.bi[name]
                     R, C = rec["rows"], rec["ne0"]
-                    blob = g5_blob(B.reshape(C // 4, R), S.reshape(C // 128, R))
+                    ns, P = C // 4, C // 128
+                    B = tp.bcm[rec["bc_off"]:rec["bc_off"] + ns * R].reshape(ns, R)
+                    S = tp.dpm[rec["dpm_off"] // 2:rec["dpm_off"] // 2 + P * R].reshape(P, R)
+                    if rows is not None:
+                        B, S = B[:, rows], S[:, rows]
+                    if cols is not None:
+                        B, S = B[cols[0] // 4:cols[1] // 4], S[cols[0] // 128:cols[1] // 128]
+                    R, C = B.shape[1], B.shape[0] * 4
+                    blob = g5_blob(B, S)
+                    del B, S
                     offs[name] = (o, R, C)
                     o += blob.size
-                    blobs.append(blob)
-                del bparts, dparts
-                host = np.concatenate(blobs)
-                del blobs
-                try:
-                    host.tofile(cpath + ".tmp")
-                    os.replace(cpath + ".tmp", cpath)
-                    json.dump(offs, open(ipath, "w"))
-                except OSError as e:
-                    self.log("could not cache the 5-trit weights: %s" % e)
-            if self.g5l and not lane:
-                # 16-row tiles, byte position major: tile m of group g = 28 x 16 bytes, byte p of rows 16m .. 16m+15
-                for n, (o, R, C) in offs.items():
-                    NG = C // 128
-                    v = host[o:o + NG * R * 7].view(np.uint8).reshape(NG, R // 16, 16, 28)
-                    v[...] = v.transpose(0, 1, 3, 2).copy().reshape(NG, R // 16, 16, 28)
-                try:
-                    host.tofile(lpath + ".tmp")
+                    blob.tofile(fr)
+                    if fl is not None:
+                        # 16-row tiles, byte position major: tile m of group g = 28 x 16 bytes, byte p of rows 16m .. 16m+15
+                        NG = C // 128
+                        v = blob.view(np.uint8).reshape(NG, R // 16, 16, 28)
+                        np.ascontiguousarray(v.transpose(0, 1, 3, 2)).tofile(fl)
+                    del blob
+                fr.close()
+                os.replace(cpath + ".tmp", cpath)
+                if fl is not None:
+                    fl.close()
                     os.replace(lpath + ".tmp", lpath)
-                except OSError as e:
-                    self.log("could not cache the lane-layout weights: %s" % e)
-            if host is None:
-                self.bc = _stream_to_card(lpath)
-            else:
-                self.bc = cp.asarray(host)
-            del host
+                json.dump(offs, open(ipath, "w"))
+            offs = {n: tuple(v) for n, v in json.load(open(ipath)).items()}
+            lane = self.g5l and os.path.exists(lpath)
+            if self.g5l and not lane:
+                raise SystemExit("kindi: the lane-layout cache %s is missing; delete %s to rebuild both" % (lpath, cpath))
+            del bparts, dparts
+            self.bc = _stream_to_card(lpath if lane else cpath)       # 256 MB at a time
             self.dp = cp.zeros(1, dtype=cp.uint16)
             self.w = {n: ("g5", self.bc[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
             # row-layout decode weights plus the lane-layout copy for the chunked prompt GEMM (k_mm_g5n needs it):
             # KINDI_G5_DUAL=1, the default on HIP, where the card's memory is the host's (unified memory)
             self.wl = None
-            if not self.g5l and os.path.exists(lpath) and \
-                    os.environ.get("KINDI_G5_DUAL", "1" if rt.is_hip else "0") == "1":
+            if dual and os.path.exists(lpath):
                 self.bcl = _stream_to_card(lpath)
                 self.wl = {n: ("g5", self.bcl[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
         else:
@@ -440,6 +550,7 @@ class Shard(object):
         self.part = z(self.nsm * work)
         if self.g5:
             self.gpart = z(16 * max(self.R_head, self.NFF, 2 * self.NH * HD, self.CONV_CH))
+            self.g5cnt = cp.zeros(4096, dtype=cp.uint32)     # k_g5r*s: blocks done for each row range (back to 0 after)
         self.fail = cp.zeros(1, dtype=cp.int32)
         self.xctr = cp.zeros(8, dtype=cp.int32)
         self.qkv, self.cs = z(self.CONV_CH), z(self.CONV_CH)
@@ -491,9 +602,19 @@ class Shard(object):
         s, tp, K = self, self.tp, self.k
         D, HB, HK, HD = s.D, s.HB, s.HK, s.HD
         NK, NV, NH, NHKV, NFF = s.NK, s.NV, s.NH, s.NHKV, s.NFF
-        if HB != 1024:
+        if HB != 1024 and not (HB in (512, 4096) and tp.W == 1):   # one card: the 2B / 4B / 9B folds work as well
             raise SystemExit("kindi: the tensor parallel engine needs Hadamard blocks of 1024")
         st = {"h": s.hA, "h2": s.hB, "pending": 0}
+
+        def fold(P, kern, width, args, out):
+            """a fold kernel over `width` values: Hadamard blocks of 512 / 1024 in one launch; larger blocks (the 9B's
+            4096) as 512-point chunks on many blocks (HB = -512, as the single-card engine) and k_fwht_hi for the
+            stages above 512 (one block for each 4096 values was slow on the 40-CU Strix Halo)"""
+            if HB > 1024:
+                P.add(kern, (width // 512,), (512,), tuple(args) + (i32(-512),))
+                P.add(K.k_fwht_hi, ((width // 512 // (HB // 512) * 512 + 255) // 256,), (256,), (out, i32(HB), i32(width)))
+            else:
+                P.add(kern, (width // HB,), (512,), tuple(args) + (i32(HB),))
 
         def mixin(P, wname):
             """RMS norm + fold of the residual stream; with a pending row-parallel partial, the exchange and the
@@ -501,10 +622,15 @@ class Shard(object):
             if st["pending"] and tp.W == 1:
                 # one card: the pending row-parallel output (gy column parts, or one vector) is the whole sum; its
                 # parts are added once (k_sumparts), then k_rmsfold adds it to the residual and folds
-                if st["pending"] > 1:
-                    P.add(K.k_sumparts, ((D + 255) // 256,), (256,), (s.part, s.y, i32(D), i32(st["pending"])))
-                P.add(K.k_rmsfold, (D // HB,), (512,), (st["h"], s.y, st["h2"],
-                                                         s.f(wname), s.sD, s.xn, s.xp, i32(D), i32(1), i32(HB)))
+                # (HIP: k_rmsfold adds the parts itself, in k_sumparts' order: one launch less per block; each launch
+                # costs ~2 us on Strix Halo)
+                if rt.is_hip:
+                    fold(P, K.k_rmsfold, D, (st["h"], s.part if st["pending"] > 1 else s.y, st["h2"], s.f(wname), s.sD,
+                                             s.xn, s.xp, i32(D), i32(st["pending"])), s.xp)
+                else:
+                    if st["pending"] > 1:
+                        P.add(K.k_sumparts, ((D + 255) // 256,), (256,), (s.part, s.y, i32(D), i32(st["pending"])))
+                    fold(P, K.k_rmsfold, D, (st["h"], s.y, st["h2"], s.f(wname), s.sD, s.xn, s.xp, i32(D), i32(1)), s.xp)
                 st["h"], st["h2"] = st["h2"], st["h"]
             elif st["pending"]:
                 P.cut()
@@ -513,8 +639,7 @@ class Shard(object):
                                                s.xctr, st["h"], st["h2"], s.f(wname), s.sD, s.xn, s.xp, i32(D)))
                 st["h"], st["h2"] = st["h2"], st["h"]
             else:
-                P.add(K.k_rmsfold, (D // HB,), (512,), (st["h"], s.y, st["h2"], s.f(wname), s.sD, s.xn, s.xp,
-                                                         i32(D), i32(0), i32(HB)))
+                fold(P, K.k_rmsfold, D, (st["h"], s.y, st["h2"], s.f(wname), s.sD, s.xn, s.xp, i32(D), i32(0)), s.xp)
             st["pending"] = 0
 
         def gemv(P, names, x, outs):
@@ -559,13 +684,19 @@ class Shard(object):
                 _, W5, R, C = s.w[n]
                 R, NG = int(R), int(C) // 128
                 nt, rpt, sp = g5_tuned(s, n, R, NG, part is not None and R == D)
-                f = {0: K.k_g5n4, 1: K.k_g5r1, 2: K.k_g5r2, 4: K.k_g5r4, 8: K.k_g5r8}[rpt]
+                var = s.__dict__.get("g5var", {}).get((R, NG, part is not None and R == D), "r")
+                f = ({0: K.k_g5n4, 1: K.k_g5r1, 2: K.k_g5r2, 4: K.k_g5r4, 8: K.k_g5r8} if var != "a" else
+                     {1: K.k_g5a1, 2: K.k_g5a2, 4: K.k_g5a4, 8: K.k_g5a8})[rpt]
                 gx = g5_gx(R, nt, rpt)
                 if part is not None and R == D:
                     P.add(f, (gx, sp), (nt,), (W5, part, i32(R), i32(NG), x))
                     ret = sp
                 elif sp == 1:
                     P.add(f, (gx, 1), (nt,), (W5, out, i32(R), i32(NG), x))
+                elif var in ("s", "as"):
+                    fs = ({1: K.k_g5r1s, 2: K.k_g5r2s, 4: K.k_g5r4s, 8: K.k_g5r8s} if var == "s" else
+                          {1: K.k_g5a1s, 2: K.k_g5a2s, 4: K.k_g5a4s, 8: K.k_g5a8s})[rpt]
+                    P.add(fs, (gx, sp), (nt,), (W5, s.gpart, i32(R), i32(NG), x, out, s.g5cnt))
                 else:
                     P.add(f, (gx, sp), (nt,), (W5, s.gpart, i32(R), i32(NG), x))
                     P.add(K.k_sumparts, ((R + 255) // 256,), (256,), (s.gpart, out, i32(R), i32(sp)))
@@ -586,7 +717,7 @@ class Shard(object):
             if state_only:                         # a prompt token's last layer: only the recurrent state is used later
                 st["pending"] = 0
                 return
-            P.add(K.k_smfold, (NV * HK // HB,), (512,), (s.zv, s.outgdn, s.sV, s.xp, i32(HK), i32(NK), i32(NV // NK), i32(HB)))
+            fold(P, K.k_smfold, NV * HK, (s.zv, s.outgdn, s.sV, s.xp, i32(HK), i32(NK), i32(NV // NK)), s.xp)
             st["pending"] = gemv(P, [p + "ssm_out.weight"], s.xp, [s.y])
 
         def attn(P, il, kvi, kv_only=False):
@@ -625,14 +756,14 @@ class Shard(object):
             P.add(K.k_attn_vq8w, (NHKV, 1, (s.ctx + 255) // 256), (128,), (s.sbuf, s.Vq[kvi], s.Vd[kvi], s.apart, n(),
                                                                          i32(NH), i32(NHKV), i32(s.G)))
             P.add(K.k_attn_combn, (NH,), (256,), (s.apart, s.qn, s.att, n(), i32(NH)))
-            P.add(K.k_fold_fwht, (NH * HD // HB,), (512,), (s.att, s.sA, s.xp, i32(HB)))
+            fold(P, K.k_fold_fwht, NH * HD, (s.att, s.sA, s.xp), s.xp)
             st["pending"] = gemv(P, [p + "attn_output.weight"], s.xp, [s.y])
 
         def ffn(P, il):
             p = "blk.%d." % il
             mixin(P, p + "post_attention_norm.weight")
             gemv(P, [p + "ffn_gate.weight", p + "ffn_up.weight"], s.xp, [s.ffg, s.ffu])
-            P.add(K.k_smfold, (NFF // HB,), (512,), (s.ffg, s.ffu, s.sF, s.fo6, i32(0), i32(0), i32(0), i32(HB)))
+            fold(P, K.k_smfold, NFF, (s.ffg, s.ffu, s.sF, s.fo6, i32(0), i32(0), i32(0)), s.fo6)
             st["pending"] = gemv(P, [p + "ffn_down.weight"], s.fo6[s.d0 - s.g0:], [s.y])
 
         def body_plan(feed):
@@ -716,6 +847,9 @@ class TPEngine(object):
             self.head_split = [0, VOCAB // 2, VOCAB]
         self.idx = json.load(open(os.path.join(pack, "index.json")))
         self.bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
+        self.tied_head = "output.weight" not in self.bi   # tied embeddings (2B, 4B): the head is token_embd
+        if self.tied_head:
+            self.bi["output.weight"] = self.bi["token_embd.weight"]
         self.bcm = np.memmap(os.path.join(pack, "bcodes.bin"), dtype=np.uint8, mode="r")
         self.dpm = np.memmap(os.path.join(pack, "dpm.bin"), dtype=np.uint16, mode="r")
         self.flm = np.memmap(os.path.join(pack, "f32.bin"), dtype=np.float32, mode="r")
@@ -990,13 +1124,19 @@ def build_batch_plan(s, NB):
                 _, W5, R, C = s.w[n]
                 R, NG = int(R), int(C) // 128
                 nt, rpt, sp = g5_tuned(s, n, R, NG, part is not None and R == D)
-                f = {0: K.k_g5n4, 1: K.k_g5r1, 2: K.k_g5r2, 4: K.k_g5r4, 8: K.k_g5r8}[rpt]
+                var = s.__dict__.get("g5var", {}).get((R, NG, part is not None and R == D), "r")
+                f = ({0: K.k_g5n4, 1: K.k_g5r1, 2: K.k_g5r2, 4: K.k_g5r4, 8: K.k_g5r8} if var != "a" else
+                     {1: K.k_g5a1, 2: K.k_g5a2, 4: K.k_g5a4, 8: K.k_g5a8})[rpt]
                 gx = g5_gx(R, nt, rpt)
                 if part is not None and R == D:
                     P.add(f, (gx, sp), (nt,), (W5, part, i32(R), i32(NG), x))
                     ret = sp
                 elif sp == 1:
                     P.add(f, (gx, 1), (nt,), (W5, out, i32(R), i32(NG), x))
+                elif var in ("s", "as"):
+                    fs = ({1: K.k_g5r1s, 2: K.k_g5r2s, 4: K.k_g5r4s, 8: K.k_g5r8s} if var == "s" else
+                          {1: K.k_g5a1s, 2: K.k_g5a2s, 4: K.k_g5a4s, 8: K.k_g5a8s})[rpt]
+                    P.add(fs, (gx, sp), (nt,), (W5, s.gpart, i32(R), i32(NG), x, out, s.g5cnt))
                 else:
                     P.add(f, (gx, sp), (nt,), (W5, s.gpart, i32(R), i32(NG), x))
                     P.add(K.k_sumparts, ((R + 255) // 256,), (256,), (s.gpart, out, i32(R), i32(sp)))

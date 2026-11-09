@@ -19,7 +19,7 @@
 # password or a key. Copyright (c) 2026 Amir Husain. SPDX-License-Identifier: AGPL-3.0-only.
 set -euo pipefail
 
-KINDI_VERSION="0.4.0"
+KINDI_VERSION="0.5.0"
 SOURCE_URL="https://github.com/ahtx/kindi/archive/refs/tags/v${KINDI_VERSION}.tar.gz"
 HF="https://huggingface.co/prism-ml"
 # model: GGUF file, sha256 (= the Hugging Face file hash), size in bytes
@@ -173,7 +173,7 @@ PREV=""
 [ -f "$STATE" ] && PREV=$(cat "$STATE") && info "found an earlier install (${STATE}): this run upgrades or repairs it"
 
 # ------------------------------------------------------------------------------------------------ 1. machine
-step "Check the machine" "Kindi runs on 64-bit Linux: on an NVIDIA GPU from the Quadro K420 (Kepler) up, on an AMD RDNA3 GPU, or on the CPU."
+step "Check the machine" "Kindi runs on 64-bit Linux: on an NVIDIA GPU from the Quadro K420 (Kepler) up, on an AMD RDNA3 or RDNA 3.5 GPU, or on the CPU."
 [ "$(uname -s)" = Linux ] || die "Kindi needs Linux (found $(uname -s))"
 [ "$(uname -m)" = x86_64 ] || die "Kindi needs an x86-64 CPU (found $(uname -m))"
 OS_ID=$(. /etc/os-release 2>/dev/null && echo "${ID:-unknown}") || OS_ID=unknown
@@ -231,11 +231,15 @@ for p in /sys/class/kfd/kfd/topology/nodes/*/properties; do
   bus=$(basename "$(readlink -f "$dv")")
   vram=$(( $(cat "$dv/mem_info_vram_total" 2>/dev/null || echo 0) / 1048576 ))
   gtt=$(( $(cat "$dv/mem_info_gtt_total" 2>/dev/null || echo 0) / 1048576 ))
-  name=$(lspci -s "$bus" 2>/dev/null | sed 's/^[^ ]* [^:]*: //; s/ (rev [0-9a-f]*)$//; s/Advanced Micro Devices, Inc. //; s/\[AMD\/ATI\] //')
+  # (no lspci in minimal systems and containers: the name then comes from the gfx id)
+  name=$( (lspci -s "$bus" 2>/dev/null || true) | sed 's/^[^ ]* [^:]*: //; s/ (rev [0-9a-f]*)$//; s/Advanced Micro Devices, Inc. //; s/\[AMD\/ATI\] //')
   [ "$gfx" = gfx1103 ] && name="Radeon 780M/760M, ${name:-Phoenix}"
+  [ "$gfx" = gfx1152 ] && name="Radeon 840M/860M, ${name:-Krackan}"
+  [ "$gfx" = gfx1151 ] && name="Radeon 8060S/8050S, ${name:-Strix Halo}"
+  [ "$gfx" = gfx1150 ] && name="Radeon 890M/880M, ${name:-Strix Point}"
   case "$gfx" in
-    gfx110[0-3]) ;;
-    *) warn "AMD GPU ${bus} (${name:-$gfx}, ${gfx}): Kindi supports AMD RDNA3 GPUs (gfx1100-gfx1103) only"; continue ;;
+    gfx110[0-3]|gfx115[0-2]) ;;
+    *) warn "AMD GPU ${bus} (${name:-$gfx}, ${gfx}): Kindi supports AMD RDNA3 (gfx1100-gfx1103) and RDNA 3.5 (gfx1150-gfx1152) GPUs only"; continue ;;
   esac
   # an APU (the 780M) has a small carve-out and uses system memory (GTT): count the larger one
   m=$vram; [ "$gtt" -gt "$m" ] && [ "$vram" -lt 8192 ] && m=$gtt
@@ -243,7 +247,8 @@ for p in /sys/class/kfd/kfd/topology/nodes/*/properties; do
 done
 NA=${#AGFX[@]}
 for k in $(seq 0 $((NA - 1))); do
-  ok "AMD GPU ${k}: ${ANAME[$k]}, ${AGFX[$k]}, ${AMEM[$k]} MiB usable$([ "${AGFX[$k]}" != gfx1103 ] && echo " (not yet measured with Kindi; the Radeon 780M is)")"
+  case "${AGFX[$k]}" in gfx1103|gfx1151|gfx1152) nm="" ;; *) nm=" (not yet measured with Kindi; the Radeon 780M, 840M and 8060S are)" ;; esac
+  ok "AMD GPU ${k}: ${ANAME[$k]}, ${AGFX[$k]}, ${AMEM[$k]} MiB usable${nm}"
 done
 if [ "$NA" = 0 ] && lspci -n 2>/dev/null | grep -E ' 03(00|80): 1002:' >/dev/null; then
   warn "an AMD GPU is in this machine, but its compute driver is not active (no /sys/class/kfd): Kindi cannot use it"
@@ -309,7 +314,7 @@ check_unlock() {
 check_unlock
 
 # ------------------------------------------------------------------------------------------------ 2. docker
-step "Check Docker and GPU access" "Kindi runs in a Docker container with CUDA 10.2 (NVIDIA) or ROCm 6.3 (AMD) inside, so the host needs only the driver."
+step "Check Docker and GPU access" "Kindi runs in a Docker container with CUDA 10.2 (NVIDIA) or ROCm 6.3 / 7 (AMD) inside, so the host needs only the driver."
 if ! command -v docker >/dev/null; then
   warn "Docker is not installed"
   case "$OS_ID" in
@@ -439,6 +444,13 @@ pair_ok() {       # two NVIDIA card positions -> 0 if they run a model split ove
 }
 amd_models() {    # AMD GPU position -> the models that run on it, the best first
   local V=${AMEM[$1]} m=""
+  if [[ "${AGFX[$1]}" == gfx115* ]]; then
+    # RDNA 3.5 (the Radeon 840M): the Ternary-Bonsai-2 models were measured; Nemotron was not
+    [ "$V" -ge 12000 ] && m="27b"
+    [ "$V" -ge 4000 ] && m="$m 9b"
+    [ "$V" -ge 2500 ] && m="$m 4b"
+    echo "$m 2b"; return 0
+  fi
   [ "$V" -ge 12000 ] && [ "$RAM_MB" -ge 24000 ] && m="27b"
   [ "$V" -ge 6000 ] && m="$m nemotron"
   echo "$m 2b"
@@ -692,15 +704,29 @@ gpu_args() {
   fi
   return 0
 }
-image_of() { if [ "$1" = rocm ]; then echo "kindi-rocm:${KINDI_VERSION}"; else echo "kindi:${KINDI_VERSION}"; fi; }
+# AMD: ROCm 6.3 for RDNA3 (gfx110x, the measured 780M setup), ROCm 7 (HIP 7.16) for RDNA 3.5 (gfx115x), which ROCm 6.3
+# does not know. image_of BACKEND [SERVER]
+rocm_image() { case "$1" in gfx115*) echo "kindi-rocm7:${KINDI_VERSION}" ;; *) echo "kindi-rocm:${KINDI_VERSION}" ;; esac; }
+image_of() {
+  if [ "$1" = rocm ]; then rocm_image "${AGFX[${SV_C[${2:-0}]}]:-gfx1100}"
+  else echo "kindi:${KINDI_VERSION}"; fi
+}
 UIDGID="$(id -u):$(id -g)"
 USERARG=(-u "$UIDGID"); [ "$ROOTLESS" = 1 ] && USERARG=()
 
 # ------------------------------------------------------------------------------------------------ 4. image
 src_id=""
-for b in $BACKENDS; do
-  IMAGE=$(image_of "$b")
-  if [ "$b" = rocm ]; then
+# one image for each backend; the AMD backend can need both ROCm images (an RDNA3 and an RDNA 3.5 GPU)
+IMAGES=""
+for i in $(seq 0 $((NS - 1))); do
+  e="${SV_B[$i]}|$(image_of "${SV_B[$i]}" "$i")"; case " $IMAGES " in *" $e "*) ;; *) IMAGES="$IMAGES $e" ;; esac
+done
+for e in $IMAGES; do
+  b=${e%%|*}; IMAGE=${e#*|}
+  if [ "$b" = rocm ] && [[ "$IMAGE" == kindi-rocm7:* ]]; then
+    DOCKERFILE=docker/Dockerfile.rocm7
+    step "Build the Kindi image (${IMAGE})" "The image holds ROCm 7 (HIP 7.16, for RDNA 3.5 GPUs: the Radeon 840M and 8060S), CuPy 14.2 and Kindi. The first build downloads about 9 GB and takes 10-20 minutes."
+  elif [ "$b" = rocm ]; then
     DOCKERFILE=docker/Dockerfile.rocm
     step "Build the Kindi image (${IMAGE})" "The image holds ROCm 6.3, CuPy 14.2 (built for ROCm) and Kindi. The first build downloads about 6 GB and takes 30-45 minutes."
   else
@@ -798,7 +824,7 @@ base_of() {
 for p in ${PACKS[@]+"${PACKS[@]}"}; do
   pk="$DIR/pack-$p"
   if [ -f "$pk/kindi_pack.json" ] && grep -q "${SHA[$p]}" "$pk/kindi_pack.json"; then ok "pack-$p is up to date"; continue; fi
-  base_of 0; ci=$(image_of "${SV_B[0]}")
+  base_of 0; ci=$(image_of "${SV_B[0]}" 0)
   run $DOCKER run --rm ${BASE[@]+"${BASE[@]}"} "$ci" convert "/data/models/${GGUF[$p]}" --out "/data/pack-$p" --force
   ok "pack-$p converted"
 done
@@ -814,7 +840,7 @@ for i in $(seq 0 $((NS - 1))); do
   key="$M/$PROFILE/$kind"
   if [ -n "${SPK[$key]:-}" ]; then SPEED+=("${SPK[$key]}"); ok "server $((i + 1)): checked above (the same model on the same kind of card)"; continue; fi
   [ "$M" = 27b ] && [ "$PROFILE" != k1200x2 ] && [ "$PROFILE" != kepler ] && info "the first 27B start writes its 5-trit weights into the pack (5.6 GB, up to 15 minutes)"
-  base_of "$i"; gpu_args "$b"; IMAGE=$(image_of "$b")
+  base_of "$i"; gpu_args "$b"; IMAGE=$(image_of "$b" "$i")
   VERIFY_OUT="$DIR/verify-$((i + 1)).log"; sp="?"
   if [ "$DRY" = 1 ]; then info "\$ $DOCKER run --rm ${BASE[*]} ${GARGS[*]:-} ${ENV[*]:-} -e KINDI_PACK=/data/pack-$M $IMAGE verify"
   else
@@ -842,7 +868,7 @@ done
 GOT_CTX=(); GOT_VER=$KINDI_VERSION; GOT_SHA=""; JSON=""
 for i in $(seq 0 $((NS - 1))); do
   profile_of "$i"; M=${SV_M[$i]}; b=${SV_B[$i]}; nm=${SV_NAME[$i]}; pt=${SV_PORT[$i]}
-  base_of "$i"; gpu_args "$b"; IMAGE=$(image_of "$b")
+  base_of "$i"; gpu_args "$b"; IMAGE=$(image_of "$b" "$i")
   $DOCKER ps -a --format '{{.Names}}' | grep -x "$nm" >/dev/null && run $DOCKER rm -f "$nm" >/dev/null
   SARGS=(-d --name "$nm" --restart unless-stopped ${BASE[@]+"${BASE[@]}"} ${GARGS[@]+"${GARGS[@]}"} ${ENV[@]+"${ENV[@]}"} -p "127.0.0.1:${pt}:8093"
          -e "KINDI_PACK=/data/pack-$M" -e "KINDI_CTX=$C" -e KINDI_HEAD=exact -e "KINDI_MODEL_NAME=$(model_name "$M")" -e KINDI_HOST=0.0.0.0)

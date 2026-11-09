@@ -165,9 +165,16 @@ __device__ __forceinline__ const typename Tab<T>::E* nbq_tab(typename Tab<T>::E*
 }
 #define NBQ_TAB(T, name) __shared__ typename Tab<T>::E name##_s[Tab<T>::N]; const typename Tab<T>::E* name = nbq_tab<T>(name##_s)
 
-template <int T>
+/* NBQ_REP (nanbeige.py, sm_80+): the decode products of IQ3_XXS read the codebook from 32 copies, entry i of copy
+   l at word 32 i + l, so the lanes of a warp never meet in a bank (the 32 KB table replaces the 1 KB one in nbq_mv
+   and nbq_mv2 only; the other kernels keep theirs). The values are the same, so the products are bit-identical. */
+#ifndef NBQ_REP
+#define NBQ_REP 0
+#endif
+template <int T, bool REP = false>
 __device__ __forceinline__ void nbq_run(const u8* b, const __half* dh, int sub, int v[8], float& s0, float& s1, float& mn,
                                         const typename Tab<T>::E* tab) {
+    if (REP && T == T_IQ3XXS) tab += threadIdx.x & 31;
     if (T == T_IQ3XXS) {
         const float d = __half2float(*dh);
         const uint2 qs = *reinterpret_cast<const uint2*>(b + 8 * sub);
@@ -177,8 +184,8 @@ __device__ __forceinline__ void nbq_run(const u8* b, const __half* dh, int sub, 
             u32 s7 = (aux >> (7 * l)) & 127u;
             u32 s8 = s7 | ((__popc(s7) & 1u) << 7);
             u32 w2 = l < 2 ? qs.x : qs.y;
-            v[2 * l] = nbq_sign4(tab[(w2 >> (16 * (l & 1))) & 255u], s8);
-            v[2 * l + 1] = nbq_sign4(tab[(w2 >> (16 * (l & 1) + 8)) & 255u], s8 >> 4);
+            v[2 * l] = nbq_sign4(tab[((w2 >> (16 * (l & 1))) & 255u) << (REP ? 5 : 0)], s8);
+            v[2 * l + 1] = nbq_sign4(tab[((w2 >> (16 * (l & 1) + 8)) & 255u) << (REP ? 5 : 0)], s8 >> 4);
         }
         s0 = s1 = d * (0.5f + (float)(aux >> 28)) * 0.5f;
         mn = 0.0f;
@@ -233,7 +240,7 @@ __device__ __forceinline__ void nbq_run(const u8* b, const __half* dh, int sub, 
 /* ---------------------------------------------------------------- decode: matrix x vector
    y[r] = sum over runs of the int32 dot of the run times the weight scale times the input scale.
    One warp per row (rows strided over the grid); lane l takes runs l, l + 32, ... */
-template <int T>
+template <int T, bool REP = false>
 __device__ __forceinline__ float nbq_row_dot(const u8* w, const __half* wd, int r, int nb,
                                              const int* xq, const float* xs, int lane, const typename Tab<T>::E* tab) {
     const u8* row = w + (size_t)r * nb * BT<T>::B;
@@ -243,7 +250,7 @@ __device__ __forceinline__ float nbq_row_dot(const u8* w, const __half* wd, int 
     for (int g = lane; g < nb * 8; g += 32) {
         int blk = g >> 3, sub = g & 7;
         int v[8]; float s0, s1, mn;
-        nbq_run<T>(row + (size_t)blk * BT<T>::B, rd + blk, sub, v, s0, s1, mn, tab);
+        nbq_run<T, REP>(row + (size_t)blk * BT<T>::B, rd + blk, sub, v, s0, s1, mn, tab);
         const int4* xp = reinterpret_cast<const int4*>(xq + 8 * g);
         int4 a = NBQ_LDG(xp), c = NBQ_LDG(xp + 1);
         NBQ_XF(a, c, xf);
@@ -270,18 +277,38 @@ __device__ __forceinline__ void nbq_mv(const u8* w, const __half* wd, const int*
     const int* xq, const float* xs, float* y, const float* add, int rows, int cols) { nbq_mv<T>(w, wd, xq, xs, y, add, rows, cols); }
 NBQ_MV(T_Q4K, nbq_mv_q4k)
 NBQ_MV(T_Q5K, nbq_mv_q5k)
+#if NBQ_REP
+extern "C" __global__ void __launch_bounds__(256) nbq_mv_iq3xxs(const u8* w, const __half* wd, const int* xq, const float* xs,
+        float* y, const float* add, int rows, int cols) {
+    __shared__ u32 tab[256 * 32];
+    for (int i = threadIdx.x; i < 256 * 32; i += blockDim.x) tab[i] = nbq_iq3xxs_grid[i >> 5];
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    for (int r = blockIdx.x * 8 + (threadIdx.x >> 5); r < rows; r += gridDim.x * 8) {
+        float s = nbq_row_dot<T_IQ3XXS, true>(w, wd, r, cols >> 8, xq, xs, lane, tab);
+        if (lane == 0) y[r] = add ? add[r] + s : s;
+    }
+}
+#else
 NBQ_MV(T_IQ3XXS, nbq_mv_iq3xxs)
+#endif
 NBQ_MV(T_IQ3S, nbq_mv_iq3s)
 NBQ_MV(T_IQ2S, nbq_mv_iq2s)
 
 /* gate and up in one launch: rows [0, rows) of y from wg, [rows, 2 rows) from wu */
 extern "C" __global__ void __launch_bounds__(256) nbq_mv2_iq3xxs(const u8* wg, const __half* dg, const u8* wu,
         const __half* du, const int* xq, const float* xs, float* y, int rows, int cols) {
+#if NBQ_REP
+    __shared__ u32 tab[256 * 32];
+    for (int i = threadIdx.x; i < 256 * 32; i += blockDim.x) tab[i] = nbq_iq3xxs_grid[i >> 5];
+    __syncthreads();
+#else
     NBQ_TAB(T_IQ3XXS, tab);
+#endif
     const int lane = threadIdx.x & 31;
     for (int r = blockIdx.x * 8 + (threadIdx.x >> 5); r < 2 * rows; r += gridDim.x * 8) {
-        float s = r < rows ? nbq_row_dot<T_IQ3XXS>(wg, dg, r, cols >> 8, xq, xs, lane, tab)
-                           : nbq_row_dot<T_IQ3XXS>(wu, du, r - rows, cols >> 8, xq, xs, lane, tab);
+        float s = r < rows ? nbq_row_dot<T_IQ3XXS, NBQ_REP>(wg, dg, r, cols >> 8, xq, xs, lane, tab)
+                           : nbq_row_dot<T_IQ3XXS, NBQ_REP>(wu, du, r - rows, cols >> 8, xq, xs, lane, tab);
         if (lane == 0) y[r] = s;
     }
 }

@@ -54,6 +54,12 @@ def _port(src):
     return src[a:b + len("/* KINDI-PORT-END */")] + chr(10) if a >= 0 and b > a else ""
 
 
+def _nug(C):
+    """spec.nug: the tc kernels' unit argument (NU | NG << 16 when the width is not a multiple of 1024)"""
+    NU, NG = (C + 1023) // 1024, C // 128
+    return NU if NG == 8 * NU else NU | NG << 16
+
+
 def _wrappers(src, names=WRAP):
     """device copies of the decode kernels in names (default WRAP), and token-batched wrappers k_*_T(..., int T_, strides...)"""
     out, nptr = [_port(src)], {}
@@ -269,19 +275,20 @@ def _build(s):
             P.call(_gemm_f16(s, Wt, R, C, X, ldx, Yb, ldy, quant))
             return
         if quant:
-            P.add(SK.k_tc_q8, (NG, T), (128,), (X, i32(ldx), c["XQ"], c["XS"], c["XA"], i32(NG), TT))
+            hpa = () if hasattr(SK, "k_tp_mm") or cp.cuda.runtime.is_hip else (i32(0),)   # tc.cu k_tc_q8 takes hp
+            P.add(SK.k_tc_q8, (NG, T), (128,), (X, i32(ldx), c["XQ"], c["XS"], c["XA"], i32(NG), TT) + hpa)
         if hasattr(SK, "k_tp_mm"):                       # Pascal (tcp.cu): dp4a, 128 rows x 128 tokens per block
             P.add(SK.k_tp_mm, (R // 128, (T + 127) // 128), (256,),
                   (Wt, i32(R), i32(C // 1024), c["XQ"], c["XS"], c["XA"], Yb, i32(ldy), TT))
             return
         if os.environ.get("KINDI_TC_MM", "2") == "2":     # activations staged in shared memory (k_tc_mm2)
             P.add(SK.k_tc_mm2, ((R // 16 + 7) // 8, (T + 63) // 64), (256,),
-                  (Wt, i32(R), i32(C // 1024), c["XQ"], c["XS"], c["XA"], Yb, i32(ldy), TT))
+                  (Wt, i32(R), i32(_nug(C)), c["XQ"], c["XS"], c["XA"], Yb, i32(ldy), TT))
             return
         nb = int(os.environ.get("KINDI_TC_MM_NB", "8"))
         f = {4: SK.k_tc_mm4, 8: SK.k_tc_mm8, 16: SK.k_tc_mm16}[nb]
         P.add(f, ((R // 16 + 3) // 4, (T + 8 * nb - 1) // (8 * nb)), (128,),
-              (Wt, i32(R), i32(C // 1024), c["XQ"], c["XS"], c["XA"], Yb, i32(ldy), TT))
+              (Wt, i32(R), i32(_nug(C)), c["XQ"], c["XS"], c["XA"], Yb, i32(ldy), TT))
 
     def gemm4(name, X, ldx, Yb, ldy):
         Wb, Sd, R, C = s.w[name]

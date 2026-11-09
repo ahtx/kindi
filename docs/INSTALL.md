@@ -20,26 +20,26 @@ Download the script, compare its sha256 with the value below, read it, and then 
 
 ```bash
 curl -fsSLO https://amirhusain.com/kindi/install.sh
-echo "592a07e0f56f164023a9e633a6e619fff5fdea1d1b3bf30345701c6658a13c7d  install.sh" | sha256sum -c -
+echo "b84df4fe0b4ae258433d043a34c67d0f9daaeecc0f9131eea8a2e3990f87d872  install.sh" | sha256sum -c -
 bash install.sh --dry-run
 bash install.sh
 ```
 
 | File | sha256 |
 |---|---|
-| `install.sh` (Kindi 0.4.0) | `592a07e0f56f164023a9e633a6e619fff5fdea1d1b3bf30345701c6658a13c7d` |
+| `install.sh` (Kindi 0.5.0) | `b84df4fe0b4ae258433d043a34c67d0f9daaeecc0f9131eea8a2e3990f87d872` |
 
 If `sha256sum -c` does not print `install.sh: OK`, do not run the script. The same script is in the repository root
-and in the 0.4.0 release.
+and in the 0.5.0 release.
 
 ## What it does
 
 | Step | What it does | sudo |
 |---|---|---|
-| 1. Check the machine | Linux x86-64, RAM, free disk, each NVIDIA GPU with its compute capability, and each AMD RDNA3 GPU. No GPU: the CPU engine. | no |
+| 1. Check the machine | Linux x86-64, RAM, free disk, each NVIDIA GPU with its compute capability, and each AMD RDNA3 or RDNA 3.5 GPU. No GPU: the CPU engine. | no |
 | 2. Docker and GPU access | Finds Docker, and the NVIDIA Container Toolkit or the AMD devices `/dev/kfd` and `/dev/dri`. If something is missing, it asks before it installs it (apt). Without the toolkit, it gives the container the NVIDIA devices and the driver libraries directly. | only to install |
 | 3. Select the setup | Shows each setup for this computer, the recommended one first, and asks which one (below). | no |
-| 4. Build the image | Builds `kindi:0.4.0` (CUDA 10.2) or `kindi-rocm:0.4.0` (ROCm 6.3) from the release source, and checks that the Kindi modules load. A re-run with the same source does not build again. | no |
+| 4. Build the image | Builds `kindi:0.5.0` (CUDA 10.2), `kindi-rocm:0.5.0` (ROCm 6.3, RDNA3) or `kindi-rocm7:0.5.0` (ROCm 7, RDNA 3.5) from the release source, and checks that the Kindi modules load. A re-run with the same source does not build again. | no |
 | 5. Download the models | Downloads each GGUF from Hugging Face. The sha256 must match the value in the script (table below). | no |
 | 6. Convert and verify | `kindi convert`, then `kindi verify` one time for each model on each kind of card. | no |
 | 7. Start the servers | One Docker container for each server, with `--restart unless-stopped`, on `127.0.0.1`. It waits until each `/health` answers. | no |
@@ -87,6 +87,7 @@ To select without questions, add `--auto`: the installer takes the recommended s
 | GeForce GTX 1080 8 GB | 27B | Nemotron, 9B, 4B, 2B, 2B on the CPU |
 | GeForce RTX 3060 / 3080 (sm_86, 9.5 GB or more) | 27B with tensor cores and the 2B draft model | Nemotron, 9B, 4B, 2B, 2B on the CPU |
 | AMD Radeon 780M (gfx1103) | 27B | Nemotron, 2B, 2B on the CPU |
+| AMD RDNA 3.5: Radeon 840M (gfx1152), Radeon 8060S (gfx1151) | 27B (12 GB of graphics memory or more) | 9B, 4B, 2B, 2B on the CPU |
 | Two or more GPUs that do not split one model | the best model on every GPU, one server each | each setup of each card |
 
 | Profile | Cards | Context asked |
@@ -98,13 +99,15 @@ To select without questions, add `--auto`: the installer takes the recommended s
 | pascal8 | sm_61 or newer, 7.5 GB or more | 65,536 |
 | tc | sm_80 or newer, 9.5 GB or more | 131,072 |
 | rocm-gfx1103 | AMD Radeon 780M | 24,576 |
+| rocm-gfx1151, rocm-gfx1152 | AMD Radeon 8060S, Radeon 840M (RDNA 3.5) | 24,576 |
 
 Nemotron always asks for 24,576. The engine fits the context to the free memory and reports what it got. For
 example, Nemotron split over two K1200 cards gets 8,448.
 
 ## AMD graphics
 
-The Kindi ROCm image holds ROCm 6.3.3, CuPy 14.2.0 and Kindi, so you do not install ROCm on the computer. The
+The Kindi ROCm images hold ROCm, CuPy 14.2.0 and Kindi, so you do not install ROCm on the computer. RDNA3 graphics
+get `kindi-rocm` (ROCm 6.3.3). RDNA 3.5 graphics (gfx1150-gfx1152) get `kindi-rocm7` (ROCm 7, HIP 7.16). The
 computer needs the `amdgpu` driver of Linux (kernel 6.2 or newer and `linux-firmware`) and Docker. The installer gives
 the container `/dev/kfd` and `/dev/dri`. On the Radeon 780M it also sets `HSA_OVERRIDE_GFX_VERSION=11.0.2` and
 checks the kernel option `amdgpu.cwsr_enable=0` (see [AMD.md](AMD.md)). It asks before it adds that option, and it
@@ -148,7 +151,7 @@ The script pins these files. It does not use a file with a different sha256.
 | `--name N` | The name of the first container (default `kindi`; later ones are `N-2`, `N-3`, ...). |
 | `--threads N` | The CPU engine: the number of threads. |
 | `--memory M` | The container memory limit, for example `8g`. |
-| `--source S` | The Kindi source: a folder, or a `.tar.gz` path or URL (default: the 0.4.0 release). |
+| `--source S` | The Kindi source: a folder, or a `.tar.gz` path or URL (default: the 0.5.0 release). |
 | `--uninstall` | Removes each server container and image that the installer made. The models stay. |
 | `--uninstall --purge` | Also removes the data folder. |
 

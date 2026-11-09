@@ -167,6 +167,27 @@ bandwidth of 732 GB/s. Photo: GP100 chip of a Tesla P100, by Fritzchens Fritz, W
 - The numbers come from two rented machines (SXM2 with NVLink, and PCIe). `docs/dev/bench-0.4.0/p100.md` has the
   conditions of each row.
 
+## NVIDIA CMP 170HX, 40 GB (GA100, sm_80)
+
+The CMP 170HX is a GA100 mining card. The boards that we measured have 40 GB of HBM2e (device id 0x2082, VBIOS
+92.00.6D.00.0A), PCIe gen4 x16 and no limit on the FP32 FMA rate. Other CMP 170HX boards have 8 GB and a slower PCIe
+link. We did not test the 8 GB board. Check `nvidia-smi` before you buy one. Measured bandwidth: 1,821 GB/s (read).
+
+| item | value |
+|---|---|
+| models | 2B, 4B, 9B, 27B (one or two cards), AH-Nanbeige4.3-33B IQ3_XXS (one or two cards) |
+| variables | `KINDI_TC=1`, `KINDI_FD=1`, `KINDI_ATT_TC=1`, `KINDI_TC_TMAX=4` (plus `KINDI_TP=1` for the 2B, 4B and 9B; `KINDI_CARDS=2` for two cards) |
+| generation, 27B, one card | 113.4 tokens/s at 512 tokens, 110.1 at 8K, 92.9 at 32K, 77.2 at 64K (llama.cpp: 106.1, 96.3, 74.1, 56.1) |
+| generation, 27B, two cards | 121.2 at 512 tokens, 118.8 at 8K, 107.8 at 32K, 93.4 at 64K (llama.cpp: 107.3, 97.8, 76.1, 58.2) |
+| generation, 33B, one card | 59.7 at 512 tokens, 55.5 at 8K, 42.0 at 32K, 32.6 at 64K (llama.cpp: 48.5, 45.9, 40.0, 34.3) |
+| generation, 33B, two cards | 64.0 at 512 tokens, 59.1 at 8K, 45.0 at 32K, 35.3 at 64K (llama.cpp: 53.1, 50.2, 43.2, 37.0) |
+| prompt reading, 27B, one card | 1,785 tokens/s at 512 tokens, 1,607 at 8K (llama.cpp: 1,398 and 1,381) |
+
+- On sm_80 cards with 20 GB or more, the decode products use the b2 weight copy. On this card the five-trit decode,
+  not the memory, limited the products.
+- `kindi verify` passes on one and two cards for the 27B and the 33B. On two cards, the 27B ends one prompt at a
+  llama.cpp tie (gap 0.0064 nats).
+
 ## GeForce RTX 20, 30, 40 and 50 series
 
 Kindi 0.4.0 supports all four series. The tensor-core path and speculative decoding use cards of compute capability
@@ -214,6 +235,37 @@ option `amdgpu.cwsr_enable=0`. [AMD.md](AMD.md) gives the settings.
 | model | Ternary-Bonsai-2-27B, Nemotron or the 2B |
 | generation | 10.6 tokens/s at 512 tokens (27B) |
 | prompt reading | 103.7 tokens/s at 512 tokens (27B) |
+
+## AMD Radeon 840M (RDNA 3.5, gfx1152)
+
+The Radeon 840M is the graphics unit of the Ryzen AI 5 340. It has 4 compute units and uses the memory of the computer.
+ROCm runs it natively (no `HSA_OVERRIDE_GFX_VERSION`). We measured it in a container with 2 GB of host memory: Kindi
+loads the 27B there, because it copies the weights to the card one tensor at a time.
+
+| item | value |
+|---|---|
+| model | Ternary-Bonsai-2 2B, 4B, 9B or 27B |
+| generation | 104.7 (2B), 49.1 (4B), 25.5 (9B), 7.90 (27B) tokens/s at 512 tokens |
+| prompt reading | 265 (2B), 105 (4B), 56 (9B), 30.2 (27B) tokens/s at 512 tokens |
+
+The installer builds the `kindi-rocm7` image (ROCm 7, HIP 7.16) for the 840M.
+
+## AMD Radeon 8060S (Strix Halo, RDNA 3.5, gfx1151)
+
+The Radeon 8060S is the graphics unit of the Ryzen AI MAX+ 395. It has 40 compute units and uses the memory of the
+computer (256-bit LPDDR5X, measured read 240 GB/s). ROCm runs it natively. The installer builds the `kindi-rocm7`
+image for it.
+
+| item | value |
+|---|---|
+| model | Ternary-Bonsai-2 2B, 4B, 9B or 27B |
+| generation | 260.0 (2B), 143.2 (4B), 88.8 (9B), 30.59 (27B) tokens/s at 512 tokens (llama.cpp: 236.1, 128.6, 86.0, 28.31) |
+| prompt reading | 3,985 (2B), 1,952 (4B), 1,174 (9B), 375 (27B) tokens/s at 512 tokens (llama.cpp: 3,153, 1,642, 746, 301) |
+
+- Kindi writes and reads faster than llama.cpp for all four models, at 512 and 8K tokens.
+- All four models use the plan engine. Kindi waits for the unit in a loop (`KINDI_BLOCKING_SYNC=1` keeps the blocking
+  wait).
+- The AH-Nanbeige4.3-33B backend of Kindi needs CUDA. It does not run on AMD graphics.
 
 ## CPU (x86-64 with AVX2)
 

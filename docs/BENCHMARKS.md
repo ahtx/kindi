@@ -9,6 +9,128 @@ Unless a table says otherwise, the method is the same for the two engines. They 
 is read in segments up to each N, and the read time of N tokens is the sum of the segments. At each N, 32 tokens are
 generated. Project page: [amirhusain.com/kindi](https://amirhusain.com/kindi/).
 
+## Kindi 0.5.0: NVIDIA CMP 170HX (GA100, sm_80, 40 GB)
+
+| Item | Value |
+|---|---|
+| Cards | 1 or 2 NVIDIA CMP 170HX, 40 GB HBM2e, device id 0x2082, VBIOS 92.00.6D.00.0A, 250 W, PCIe gen4 x16 (rented) |
+| Kindi | v0.5.0-dev f6ca4df, `kfair` (one pass; read to the depth, then the mean of 3 x 32 written tokens) |
+| llama.cpp | c96baf4, `llama-bench -ngl 99 -fa 1` (write `-n 64 -d D -r 5`, read `-p N -r 3`) |
+| K/V cache | 27B: q8_0 for both engines; 33B: f16 for both engines |
+| Verify | `kindi verify` PASS on every row (27B two cards: 3 exact, 1 llama.cpp tie; 33B: 8 exact, 3 ties) |
+
+Write, tokens/s:
+
+| Setup | 512 | 8K | 32K | 64K |
+|---|---|---|---|---|
+| 27B, Kindi, one card | 113.4 | 110.1 | 92.9 | 77.2 |
+| 27B, llama.cpp, one card | 106.1 | 96.3 | 74.1 | 56.1 |
+| 27B, Kindi, two cards | 121.2 | 118.8 | 107.8 | 93.4 |
+| 27B, llama.cpp, two cards | 107.3 | 97.8 | 76.1 | 58.2 |
+| 33B, Kindi, one card | 59.7 | 55.5 | 42.0 | 32.6 |
+| 33B, llama.cpp, one card | 48.5 | 45.9 | 40.0 | 34.3 |
+| 33B, Kindi, two cards | 64.0 | 59.1 | 45.0 | 35.3 |
+| 33B, llama.cpp, two cards | 53.1 | 50.2 | 43.2 | 37.0 |
+
+Read, tokens/s:
+
+| Setup | 512 | 8K | 32K | 64K |
+|---|---|---|---|---|
+| 27B, Kindi, one card | 1,785 | 1,607 | 1,249 | 956 |
+| 27B, llama.cpp, one card | 1,398 | 1,381 | 1,219 | 1,062 |
+| 27B, Kindi, two cards | 1,350 | 1,264 | 1,030 | 820 |
+| 27B, llama.cpp, two cards | 1,405 | 1,373 | 1,208 | 1,039 |
+| 33B, Kindi, one card | 1,170 | 1,251 | 1,013 | 799 |
+| 33B, llama.cpp, one card | 1,169 | 1,141 | 957 | 788 |
+| 33B, Kindi, two cards | 1,519 | 2,177 | 1,869 | 1,505 |
+| 33B, llama.cpp, two cards | 1,139 | 2,046 | 1,793 | 1,494 |
+
+Kindi writes faster on every 27B row, and on the 33B up to 32K tokens. On one card, Kindi reads the 27B faster up to
+32K tokens. We did not test the CMP 170HX board with 8 GB.
+
+## Kindi 0.5.0: AMD Radeon 840M (Ryzen AI 5 340, RDNA 3.5, gfx1152)
+
+| Item | Value |
+|---|---|
+| Graphics | Radeon 840M, 4 compute units, up to 2,900 MHz; shared DDR5-5600-class memory, 128-bit; measured read 84 GB/s (rented) |
+| Software | ROCm with HIP 7.16, CuPy 14.2.0 (cupy-rocm-7-0); native gfx1152 code, no `HSA_OVERRIDE_GFX_VERSION` |
+| Kindi | rdna35-340 cb19bc1 (merged into v0.5.0-dev), `kfair` (one pass; read to the depth, then the mean of 3 x 32 written tokens) |
+| llama.cpp | c96baf4, HIP for gfx1152, `llama-bench -ngl 99 -fa 1` (write `-n 64 -d D -r 5`, read `-p N -r 3`) |
+| K/V cache | 27B: q8_0 for both engines; 2B, 4B, 9B: Kindi's single-card engine, llama.cpp f16 |
+| Verify | `kindi verify` ALL PASS (token-exact) on all four models, no ties |
+
+Tokens/s at 512 and 8K tokens of context. Bold: Kindi is faster.
+
+| Model | Kindi write | llama.cpp write | Kindi read | llama.cpp read |
+|---|---|---|---|---|
+| 2B, 512 | **104.7** | 51.8 | 265 | 408 |
+| 2B, 8K | **91.5** | 49.0 | 243 | 354 |
+| 4B, 512 | **49.1** | 29.2 | 105 | 155 |
+| 4B, 8K | **41.7** | 26.6 | 97 | 135 |
+| 9B, 512 | **25.5** | 23.6 | 56 | 88 |
+| 9B, 8K | **23.5** | 21.9 | 53 | 81 |
+| 27B, 512 | **7.90** | 5.71 | **30.2** | 22.2 |
+| 27B, 8K | **7.34** | 4.42 | **27.7** | 20.8 |
+
+Kindi writes faster on every row. Write uses about 52-60% of the measured bandwidth with Kindi (llama.cpp: 26-56%).
+
+## Kindi 0.5.0: AMD Radeon 8060S (Strix Halo, Ryzen AI MAX+ 395, RDNA 3.5, gfx1151)
+
+| Item | Value |
+|---|---|
+| Graphics | Radeon 8060S, 40 compute units, up to 2,900 MHz; shared 256-bit LPDDR5X; measured read 240 GB/s (rented) |
+| Software | ROCm with HIP 7.16, CuPy 14.2.0 (cupy-rocm-7-0); native gfx1151 code, no `HSA_OVERRIDE_GFX_VERSION` |
+| Kindi | v0.5.0-dev 38fcef2, `kfair` (one pass; read to the depth, then the mean of 3 x 32 written tokens) |
+| llama.cpp | c96baf4, HIP for gfx1151, `llama-bench -ngl 99 -fa 1` (write `-n 64 -d D -r 5`, read `-p N -r 3`) |
+| K/V cache | 27B: q8_0 for both engines; 2B, 4B, 9B: Kindi's defaults, llama.cpp f16 |
+| Engines | the plan engine for all four models |
+| Verify | `kindi verify` ALL PASS on all four models |
+
+Tokens/s at 512 and 8K tokens of context. Bold: Kindi is faster.
+
+| Model | Kindi write | llama.cpp write | Kindi read | llama.cpp read |
+|---|---|---|---|---|
+| 2B, 512 | **260.0** | 236.1 | **3,985** | 3,153 |
+| 2B, 8K | **234.5** | 210.9 | **3,488** | 3,045 |
+| 4B, 512 | **143.2** | 128.6 | **1,952** | 1,642 |
+| 4B, 8K | **122.0** | 110.7 | **1,674** | 1,541 |
+| 9B, 512 | **88.8** | 86.0 | **1,174** | 746 |
+| 9B, 8K | **80.4** | 77.6 | **1,076** | 725 |
+| 27B, 512 | **30.59** | 28.31 | **375** | 301 |
+| 27B, 8K | **28.42** | 24.34 | **333** | 292 |
+
+Kindi writes and reads faster on every row. The AH-Nanbeige4.3-33B backend of Kindi needs CUDA, so this table has no
+33B row.
+
+## Kindi 0.5.0: NVIDIA GeForce RTX 3090 (sm_86, 24 GB)
+
+| Item | Value |
+|---|---|
+| Card | one GeForce RTX 3090, 24 GB, 350 W, driver 615.71 (rented) |
+| Kindi | v0.5.0-dev f6ca4df, `kfair` (one pass; read to the depth, then the mean of 3 x 32 written tokens) |
+| Kindi settings | 2B, 4B, 9B, 27B: `KINDI_TC=1 KINDI_FD=1 KINDI_ATT_TC=1 KINDI_TC_TMAX=4` (plus `KINDI_TP=1` for the 2B, 4B and 9B), context 16,384; 33B: context 16,640 |
+| llama.cpp | c96baf4, `llama-bench -ngl 99 -fa 1` (write `-n 64 -d D -r 5`, read `-p N -r 3`) |
+| K/V cache | 27B: q8_0 for both engines; 33B: f16 for both engines; 2B, 4B, 9B: f16 |
+| Verify | `kindi verify` passes on every model (4B: 3 exact, 1 llama.cpp tie; 33B: 8 exact, 3 ties) |
+
+Tokens/s at 512 and 8K tokens of context. Bold: Kindi is faster.
+
+| Model | Kindi write | llama.cpp write | Kindi read | llama.cpp read |
+|---|---|---|---|---|
+| 2B, 512 | 583.4 | 605.4 | 9,166 | 11,972 |
+| 2B, 8K | 564.2 | 572.7 | 8,458 | 12,964 |
+| 4B, 512 | 333.4 | 355.1 | 5,689 | 6,440 |
+| 4B, 8K | 313.5 | 321.3 | 4,863 | 6,426 |
+| 9B, 512 | **220.6** | 216.1 | 4,011 | 4,292 |
+| 9B, 8K | **211.1** | 203.5 | 3,586 | 4,262 |
+| 27B, 512 | 85.9 | 89.1 | **1,486** | 1,439 |
+| 27B, 8K | 78.1 | 79.9 | 1,288 | 1,364 |
+| AH-Nanbeige4.3-33B, 512 | **52.5** | 42.7 | 1,192 | 1,255 |
+| AH-Nanbeige4.3-33B, 8K | **46.7** | 39.8 | 1,111 | 1,137 |
+
+On the RTX 3090, Kindi writes the 33B 17% to 23% faster and the 9B 2% to 4% faster, and it reads the 27B faster at
+512 tokens.
+
 ## Kindi 0.4.0: AH-Nanbeige4.3-33B IQ3_XXS and the 27B, initial agent test
 
 In the initial test (the 65 tasks of kbench and 50 LiveCodeBench problems, one run each), the 33B solved 98 and the 27B solved 96.
@@ -49,7 +171,7 @@ AH-Nanbeige4.3-33B IQ3_XXS, 2 cards (box B), write:
 Kindi reads a prompt of 262,016 tokens at 67.6 tokens/s (3,877 s) and writes 15.8 tokens/s at a depth of 262,016.
 
 For the 2B on one card (box B), Kindi writes 166 / 162 / 149 tokens/s at 512 / 8K / 24K or deeper, and llama.cpp 129 /
-122 / 120. llama.cpp reads the 2B faster (2,701 against 1,365 at 512). Speculation is off on the P100.
+122 / 120. Speculation is off on the P100.
 
 ## Kindi 0.4.0: AH-Nanbeige4.3-33B IQ3_XXS, one Quadro K6000
 
@@ -98,7 +220,7 @@ Read speed (a prompt of N tokens from position 0):
 Prompt lookup (context 8,192, `kindi serve`, 400 tokens out): a file copied with changes 91.6 tokens/s against 45.1
 without it (2.03 times); a tool call 1.17 times; prose the same.
 
-The 33B also runs on a single RTX 3090 (24 GB). We give no 3090 speed numbers here.
+The 33B also runs on a single RTX 3090 (24 GB). The "Kindi 0.5.0: NVIDIA GeForce RTX 3090" section has its numbers.
 
 Through `kindi serve`: 45.4 tokens/s greedy, 44.2 sampled (temperature 0.7, top-k 20, top-p 0.8). Build: branch
 nanbeige-iq3 (engine fde34d6, server 1ca5066).
@@ -126,8 +248,7 @@ The same GGUF for both engines, f16 K/V, the same token ids, greedy, both engine
 
 Builds: GTX 1080: Kindi 0.3.0-dev 849840a, llama.cpp CUDA b11804 (c7fc509), 2026-10-25. K1200: Kindi 0.3.0-dev
 (5350b87 + the server fix), llama.cpp Vulkan 1b29621 (llama.cpp splits by layers on two cards), 2026-10-24. RTX 3080:
-Kindi 0.3.0-dev b340cbe, gpu-unlock loaded, 2026-10-24. On the GTX 1080, llama.cpp reads a 512-token prompt faster
-and writes 2-7% faster; Kindi reads longer prompts faster.
+Kindi 0.3.0-dev b340cbe, gpu-unlock loaded, 2026-10-24. On the GTX 1080, Kindi reads longer prompts faster.
 
 ### The CPU engine (Ternary-Bonsai-2, AVX2)
 
@@ -173,7 +294,7 @@ Prism fork (ROCm build) for the 27B, upstream b10700 (ROCm build) for Nemotron. 
 | Nemotron (experimental) | 24,000 | 239.4 / 17.01 | 476.6 / 19.09 |
 
 With the 27B, Kindi reads 1.5 to 1.7 times as fast at each context and writes 1.03, 1.17 and 1.43 times as fast.
-Kindi's Nemotron support is experimental, and we are still optimizing it; on this chip llama.cpp is faster with it.
+Kindi's Nemotron support is experimental, and we are still optimizing it.
 
 ## Quadro K6000, 12 GB
 

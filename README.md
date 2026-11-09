@@ -1,10 +1,10 @@
 <p align="center"><img src="assets/kindi-banner.svg" alt="Kindi 0.4.0: modern 2B to 33B language models on low-cost GPUs, from a 1 GB Quadro K420 to an RTX 3080. Ternary Bonsai 2B, 4B, 9B and 27B, and AH-Nanbeige4.3-33B." width="100%"></p>
 
-# Kindi 0.4.0
+# Kindi 0.5.0
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Commercial licenses available](https://img.shields.io/badge/commercial%20licenses-available-green.svg)](COMMERCIAL-LICENSE.md)
-[![Release v0.4.0](https://img.shields.io/badge/release-v0.4.0-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.4.0)
+[![Release v0.5.0](https://img.shields.io/badge/release-v0.5.0-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.5.0)
 
 Kindi is a custom inference engine for Prism ML's **Ternary-Bonsai-2** language models (2B, 4B, 9B and 27B
 parameters, ternary weights). It started on the **NVIDIA Quadro K420** (Kepler, 1 GB). On this card, it writes
@@ -16,7 +16,9 @@ Version 0.4.0 turns on speculative decoding on the RTX 30, 40 and 50 cards: on a
 draft model writes up to 1.82 times as fast, with the same output ([docs/MTP.md](docs/MTP.md)). It also adds
 AH-Nanbeige4.3-33B, a separate model (see below). Kindi 0.4.0 supports the GeForce RTX 20, 30, 40 and 50 series.
 It also supports the Tesla P100 (16 GB, Pascal) as a full card: Kindi writes the 27B 1.9 to 2.7 times as fast as
-llama.cpp on the same P100 ([docs/CARDS.md](docs/CARDS.md)). The
+llama.cpp on the same P100 ([docs/CARDS.md](docs/CARDS.md)). Version 0.5.0 adds the NVIDIA CMP 170HX
+(GA100, 40 GB), and AMD RDNA 3.5 graphics: the Radeon 840M (Ryzen AI 5 340) and the Radeon 8060S (Strix Halo). On the CMP 170HX, Kindi writes the 27B faster than
+llama.cpp at 512 to 64K tokens of context, on one card and on two cards ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)). The
 installer finds the GeForce RTX 30 cards that NVIDIA limits to half-rate 16-bit arithmetic. It offers to unlock them
 with the excellent [gpu-unlock](https://github.com/Zagitta/gpu-unlock) module by Zagitta. Kindi's prompt cache is
 more effective than llama.cpp's. In our test, Nemotron on a GTX 1080 answers three questions about a 9,400-token
@@ -43,7 +45,7 @@ By [Amir Husain](https://www.amirhusain.com). Watch the [launch video](https://y
 
 ## Quick start: one command
 
-On Linux x86-64 with an NVIDIA card (Kepler to Ampere, one card or more), with AMD Radeon 780M graphics, or with no GPU:
+On Linux x86-64 with an NVIDIA card (Kepler to Ampere, one card or more), with AMD Radeon 780M, 840M or 8060S graphics, or with no GPU:
 
 ```bash
 curl -fsSL https://amirhusain.com/kindi/install.sh | bash
@@ -107,8 +109,8 @@ connections only from the same computer (see [Run the server](#run-the-server)).
 
 | | |
 |---|---|
-| GPU | NVIDIA, compute capability 3.0 (Kepler) or later. Tested: Quadro K420 (1 GB and 2 GB), Quadro K1200 (one card, or two in tensor parallel), Quadro K6000, Tesla P100 16 GB, GeForce GTX 1080, GeForce RTX 3080. Supported, and `kindi verify` passes: the GeForce RTX 20, 30, 40 and 50 series (speed numbers are only for the cards in the tables below). AMD: Radeon 780M (RDNA3, gfx1103) with 32 GB of computer memory or more; see [docs/AMD.md](docs/AMD.md). With no GPU, the CPU engine runs on x86-64 with AVX2. |
-| Driver | Kepler: the NVIDIA **470** series (the last driver branch with Kepler support). Later cards: a current driver. The image has CUDA 10.2; the host needs only the driver. AMD: the `amdgpu` driver of Linux and the kernel option `amdgpu.cwsr_enable=0`; ROCm 6.3 is in the `kindi-rocm` image. |
+| GPU | NVIDIA, compute capability 3.0 (Kepler) or later. Tested: Quadro K420 (1 GB and 2 GB), Quadro K1200 (one card, or two in tensor parallel), Quadro K6000, Tesla P100 16 GB, GeForce GTX 1080, GeForce RTX 3080. Supported, and `kindi verify` passes: the GeForce RTX 20, 30, 40 and 50 series (speed numbers are only for the cards in the tables below). AMD: Radeon 780M (RDNA3, gfx1103) with 32 GB of computer memory or more; Radeon 840M and Radeon 8060S (RDNA 3.5, gfx1152 and gfx1151); see [docs/AMD.md](docs/AMD.md). With no GPU, the CPU engine runs on x86-64 with AVX2. |
+| Driver | Kepler: the NVIDIA **470** series (the last driver branch with Kepler support). Later cards: a current driver. The image has CUDA 10.2; the host needs only the driver. AMD: the `amdgpu` driver of Linux and the kernel option `amdgpu.cwsr_enable=0`; ROCm 6.3 is in the `kindi-rocm` image, and ROCm 7 (for RDNA 3.5) is in the `kindi-rocm7` image. |
 | OS | Linux x86-64 (developed on Ubuntu 24.04 with Docker; the image itself is Ubuntu 18.04) |
 | RAM / disk | 2B: 4 GB RAM, ~1.5 GB disk. 27B: ~14 GB of free RAM for its first start (two K1200 cards: ~5 GB) and ~19 GB of disk. The Docker image takes ~4 GB more. |
 | Software | Docker with the NVIDIA Container Toolkit (or the installer's device passthrough) - **or** CUDA 10.2 + Python 3.6 + CuPy 9.6 (see below) |
@@ -126,10 +128,11 @@ exactly that.
 
 ```sh
 git clone https://github.com/ahtx/kindi.git && cd kindi
-docker build -t kindi:0.4.0 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
+docker build -t kindi:0.5.0 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
 ```
 
-For AMD graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.4.0`, about 6 GB to download); see
+For AMD RDNA3 graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.5.0`, about 6 GB to download). For
+RDNA 3.5 graphics, build `docker/Dockerfile.rocm7` (`kindi-rocm7:0.5.0`, about 9 GB to download). See
 [docs/AMD.md](docs/AMD.md).
 
 You can also use the release archive. Download `kindi-0.4.0.tar.gz` from the

@@ -45,8 +45,9 @@ TMAX = max(2, min(8, int(os.environ.get("KINDI_TC_TMAX", "8"))))   # the largest
 WRAP = _chunk.WRAP + ("k_argmax", "k_softmax_rows", "k_attn_vq8w", "k_attn_combn", "k_deq_emb4")
 FUSED = ("k_rmsfold_qT", "k_smfold_qT", "k_fold_fwht_qT", "k_softmax_m", "k_attn_vq8w_m", "k_attn_combn_m", "k_attn_sq8m",
          "k_deq_emb4_p", "k_copyf", "k_fd_q8_4", "k_fd_q8_6", "k_fd_q8_8", "k_fd_comb",
-         "k_rmsfold2_1024", "k_rmsfold2_512", "k_att_tc_T")
-FD_CH = 512                              # positions per block of the split flash-decode attention (tcf.cu)
+         "k_rmsfold2_1024", "k_rmsfold2_512", "k_smfold2_1024", "k_smfold2_512", "k_att_tc_T",
+         "k_rmsfold_qa", "k_smfold_qa", "k_fold_qa", "k_mix8_q")
+FD_CH = 512                              # positions per block of the split flash-decode attention (tcf.cu; SpecKernels)
 QB = 4                                   # queries per verify attention launch (k_attn_sq8m)
 # KINDI_SPEC=auto thresholds (positions), measured on an RTX 3080 at 190 W and an RTX 3060 (docs/MTP.md,
 # docs/dev/bench-0.4.0/mtp.md): the 2B's own head k=2 up to 8K, off above; the 27B with the 2B drafter k=2 below
@@ -57,6 +58,21 @@ AUTO_B2_MAX = int(os.environ.get("KINDI_SPEC_B2_MAX", "0"))
 # the speculation guard works from this position on: below it, speculation was faster on every measured card, and
 # the guard's pauses cost 9-12% (RTX 3060, 512 and 24K)
 GUARD_FROM = int(os.environ.get("KINDI_SPEC_GUARD_FROM", "32768"))
+SMALL_SM = 48                            # cards with at most this many SMs take the small-card product configs
+# KINDI_TC_HP=1: the decode and verify products take two int8 rows per token (tc.cu tc_hp: about 14 bits of activation
+# precision instead of 8, for the same weight traffic). The verify passes then take at most 4 tokens (8 mma columns).
+HP = os.environ.get("KINDI_TC_HP", "0") == "1" and not cp.cuda.runtime.is_hip
+if HP:
+    TMAX = min(TMAX, 4)
+
+
+def small_ampere(card=None):
+    """the small cards that the write-040 product configs and fast folds were measured on (RTX 3060, 5060 Ti): CUDA,
+    sm_80 or later, at most SMALL_SM SMs. Pascal and Turing keep the v0.4.0 configs and folds."""
+    if cp.cuda.runtime.is_hip:
+        return False
+    p = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id if card is None else card)
+    return p["major"] >= 8 and p["multiProcessorCount"] <= SMALL_SM
 
 
 def wanted():
@@ -107,9 +123,33 @@ _TCF_HIP = (
 )
 
 
+def fd_ch():
+    """positions per flash-decode block (KINDI_FD_CH, a multiple of 32): 512, or 128 on cards with 80 SMs or more. The
+    blocks of one decode token are (K/V heads) x (chunks): at short contexts a 512-position chunk leaves most SMs of a
+    big card idle (CMP 170HX, 108 SMs, 27B at 512 tokens: 4 blocks, 73 us per attention layer; 64 positions were 2%
+    faster at 512 tokens and 2% slower at 8K than 128)"""
+    v = os.environ.get("KINDI_FD_CH", "")
+    if v:
+        n = int(v)
+        if n % 32 or not 32 <= n <= 512:
+            raise SystemExit("kindi: KINDI_FD_CH must be a multiple of 32 from 32 to 512")
+        return n
+    if cp.cuda.runtime.is_hip:
+        return 512
+    big = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)["multiProcessorCount"] >= 80
+    return 128 if big and _tc.tested() else 512
+
+
 class SpecKernels(object):
     def __init__(self):
         base = open(os.path.join(HERE, "kindi.cu"), encoding="utf-8").read()
+        # NVRTC's own expf on sm_80+ CUDA cards (KINDI_KEXPF=1: kindi.cu's kexpf). With kexpf the 9B tc path
+        # differed from llama.cpp at a 0.31-logit point (CMP 170HX, prompt 1 token 36) and passes without it; the
+        # write-040 branch found the same on an RTX 3060 / 5060 Ti for its kexpf
+        kx = os.environ.get("KINDI_KEXPF", "")
+        if kx == "0" or (kx != "1" and _tc.tested()):
+            base = "#define KINDI_NO_KEXPF 1" + chr(10) + base
+            os.environ.setdefault("KINDI_KEXPF", "0")          # (for the prompt cache's engine fingerprint)
         # (the device copies are made from the kernel text; _wrappers reads the parameters from the first "(", so the
         # copies are taken from a text without the launch bounds)
         wr, _ = _chunk._wrappers(re.sub(r"__launch_bounds__\(\d+\) (k_\w+)\(", r"\1(", base), WRAP)
@@ -117,8 +157,19 @@ class SpecKernels(object):
         hip = cp.cuda.runtime.is_hip
         tcs = open(os.path.join(HERE, "tc_hip.cu" if hip else "tc.cu"), encoding="utf-8").read()
         tcf = open(os.path.join(HERE, "tcf.cu"), encoding="utf-8").read()
+        global FD_CH
+        FD_CH = fd_ch()
+        os.environ.setdefault("KINDI_FD_CH", str(FD_CH))     # (for the prompt cache's engine fingerprint)
+        tcf = "#define FD_CH %d\n" % FD_CH + tcf
+        # the fast folds (tcf.cu ff_*, bit-identical) store the CUDA int8 row order only; KINDI_FF=0: the old folds
+        # (on by default where measured: tc.tested(), or the small cards the write-040 work measured, at most SMALL_SM SMs)
+        known = _tc.tested() or small_ampere()
+        ff, inc = os.environ.get("KINDI_FF", ""), os.environ.get("KINDI_TC_INC", "")
+        self.ff = not (hip or ff == "0" or (ff != "1" and not known))
+        tcf = "#define FF %d" % int(self.ff) + chr(10) + tcf
+        tcs = "#define TC_INC %d" % (inc == "1" or (inc != "0" and known)) + chr(10) + tcs   # tc.cu tc_dig (bit-identical)
         pas = not hip and _tc.pascal()
-        names = _tc.NAMES_PASCAL if pas else _tc.NAMES
+        names = _tc.NAMES_PASCAL if pas else _tc.NAMES + (() if hip else _tc.NAMES_B2)
         if pas:
             # Pascal (sm_61): tcp.cu, the same products with dp4a on the pl layout; tca.cu (k_att_tc_T) is mma.sync
             # only. Compiled for the card itself (no PTX patch).
@@ -152,6 +203,9 @@ class SpecKernels(object):
             setattr(self, k, w)
         self.mv = {2: self.k_tc_mv2, 4: self.k_tc_mv4, 8: self.k_tc_mv8}
         self.mv3 = {2: self.k_tc_mv3_2, 4: self.k_tc_mv3_4, 8: self.k_tc_mv3_8}
+        if not (hip or pas):
+            self.mvb = {2: self.k_tc_mv2b, 4: self.k_tc_mv4b, 8: self.k_tc_mv8b}
+            self.mv3b = {2: self.k_tc_mv3b_2, 4: self.k_tc_mv3b_4, 8: self.k_tc_mv3b_8}
 
 
 # ====================================================================================== CUDA graphs
@@ -270,18 +324,32 @@ def repack(s, log):
         log("card %d: lane-table products (sm_60), weights in the 5-trit lane layout" % s.card)
         return
     SK = s.sk
-    big = max(int(R) * (int(C) // 128) * 7 for _, (_, _, R, C) in s.w.items())
+    # widths that are not a multiple of 1024 (the 4B) take the padded units, measured with the fast folds only
+    pad_ok = getattr(SK, "ff", True)
+    bad = [(n, int(R), int(C)) for n, (_, _, R, C) in s.w.items()
+           if int(R) % 16 or int(C) % 128 or (int(C) % 1024 and not pad_ok)]
+    if bad:
+        log("card %d: %s (%d x %d) does not fit the tc layout; KINDI_TC is ignored for this model" % ((s.card,) + bad[0]))
+        return
+    big = max(int(R) * ((int(C) + 1023) // 1024) * 56 for _, (_, _, R, C) in s.w.items())
     tmp = cp.empty(big, dtype=cp.uint32)
     dual = cp.cuda.runtime.is_hip and os.environ.get("KINDI_TC_DUAL", "1") == "1"
     if dual:
         # a second copy for the tc layout; the lane layout stays as s.wl for the chunk path
         s.bct = cp.empty_like(s.bc)
         s.wl, wt = s.w, {}
+    # the b2 copy of every tensor for the decode products (tc.cu k_tc_pack2), made from the lane layout first
+    s.w2 = {} if (not dual and _tc.b2(s.card)) else None
     for name, (tag, W5, R, C) in s.w.items():
         R, C = int(R), int(C)
-        if R % 16 or C % 1024:
+        if R % 16 or C % 128 or (cp.cuda.runtime.is_hip and C % 1024):      # (tc_hip.cu: whole units only)
             raise SystemExit("kindi tc: %s (%d x %d) does not fit the tc layout" % (name, R, C))
-        n = R * (C // 128) * 7
+        n = R * ((C + 1023) // 1024) * 56                   # words: the last unit padded to 8 groups (tc.cu)
+        if s.w2 is not None:
+            n2 = R * ((C + 1023) // 1024) * 72
+            W2 = cp.empty(n2, dtype=cp.uint32)
+            SK.k_tc_pack2(((n2 + 255) // 256,), (256,), (W5, W2, i32(R), i32(C // 128)))
+            s.w2[name] = W2
         if dual:
             o = (W5.data.ptr - s.bc.data.ptr) // 4
             Wt = s.bct[o:]
@@ -289,15 +357,21 @@ def repack(s, log):
             wt[name] = (tag, Wt, i32(R), i32(C))
             continue
         SK.k_tc_pack(((n * 4 + 255) // 256,), (256,), (W5, tmp, i32(R), i32(C // 128)))
-        W5[:n] = tmp[:n]
+        if n == R * (C // 128) * 7:
+            W5[:n] = tmp[:n]
+        else:                                               # padded (the 4B: width 2560): an array of its own
+            Wp = cp.empty(n, dtype=cp.uint32)
+            Wp[:] = tmp[:n]
+            s.w[name] = (tag, Wp, s.w[name][2], s.w[name][3])
     if dual:
         s.w = wt
     cp.cuda.Device(s.card).synchronize()
     del tmp
     cp.get_default_memory_pool().free_all_blocks()
     s.tc_layout = True
-    log("card %d: weights repacked for the %s (%.1fs)" % (s.card, "dp4a kernels" if _tc.pascal(s.card) else "tensor cores",
-                                                         time.time() - t0))
+    log("card %d: weights repacked for the %s%s (%.1fs)" % (s.card, "dp4a kernels" if _tc.pascal(s.card) else "tensor cores",
+                                                           " (decode products on the b2 layout)" if s.w2 is not None else "",
+                                                           time.time() - t0))
 
 
 def lane_sp(s, R, C):
@@ -305,6 +379,22 @@ def lane_sp(s, R, C):
     count, so a token's result never depends on how many share the pass)"""
     bx = -(-(R // 16) // 32)                 # the decode kernel's blocks (k_g5n4: 8 warps of 4 tiles)
     return max(1, min(8, C // 128, -(-2 * s.nsm // bx)))
+
+
+def tc_nw(s):
+    """warps per block of every decode product (KINDI_TC_NW = 2 / 4 / 8), or 0 for the fixed rule of the 3080. Cards
+    with 80 SMs or more take 4: on the CMP 170HX (108 SMs) the rule's 8-warp blocks left a second, mostly empty wave
+    (the timed best was 4 warps for every shape). The warp count does not change a product's bits."""
+    v = os.environ.get("KINDI_TC_NW", "")
+    if v:
+        return int(v)
+    return 4 if cp.cuda.runtime.getDeviceProperties(s.card)["multiProcessorCount"] >= 80 and _tc.tested(s.card) else 0
+
+
+def nug(C):
+    """the tc kernels' unit argument: NU, or NU | NG << 16 when the width is not a multiple of 1024 (tc.cu tc_nu)"""
+    NU, NG = (C + 1023) // 1024, C // 128
+    return NU if NG == 8 * NU else NU | NG << 16
 
 
 def tune(s, R, C, rowpar=None):
@@ -317,15 +407,22 @@ def tune(s, R, C, rowpar=None):
     if (R, C) in cache:
         return cache[(R, C)]
     if os.environ.get("KINDI_TC_TUNE", "0") != "1":
-        # a fixed rule (the timed bests on the 3080), so a restart never changes a split and its rounding
-        NU = C // 1024
-        cfg = (2, 1) if not rowpar else (8 if NU > 8 else 4, min(NU, 6))
+        # a fixed rule, so a restart never changes a split and its rounding: the timed bests on the 3080; on cards
+        # with at most SMALL_SM multiprocessors (RTX 3060: 28, 5060 Ti: 36) the timed bests on the 3060
+        NU = (C + 1023) // 1024
+        if small_ampere(s.card):
+            cfg = (2, 1) if not rowpar else (4, 2 if R <= 2048 else 1)
+        else:
+            cfg = (2, 1) if not rowpar else (8 if NU > 8 else 4, min(NU, 6))
+            nw = tc_nw(s)
+            if nw:                               # warps per block only: the same tiles and splits, the same bits
+                cfg = (nw, cfg[1])
         cache[(R, C)] = cfg
         return cfg
     SK = s.sk
     name = next(n for n, (_, _, r, c) in s.w.items() if int(r) == R and int(c) == C)
     Wt = s.w[name][1]
-    NG, NU = C // 128, C // 1024
+    NG, NU = C // 128, (C + 1023) // 1024
     XQ = cp.zeros(TMAX * NG * 32, dtype=cp.uint32)
     XS = cp.zeros(TMAX * NG, dtype=cp.float32)
     XA = cp.zeros(TMAX * NG, dtype=cp.int32)
@@ -342,7 +439,7 @@ def tune(s, R, C, rowpar=None):
             for T in (1, TMAX):
                 P = _tp.Plan()
                 for _ in range(10):
-                    P.add(SK.mv[nw], (gx, sp), (32 * nw,), (Wt, Y, i32(R), i32(NU), XQ, XS, XA, i32(T)))
+                    P.add(SK.mv[nw], (gx, sp), (32 * nw,), (Wt, Y, i32(R), i32(nug(C)), XQ, XS, XA, i32(T)))
                     if sp > 1 and not rowpar:
                         P.add(SK.k_tc_sum, ((R * T + 255) // 256,), (256,), (Y, O, i32(R), i32(T), i32(sp)))
                 g = Graph(P)
@@ -368,11 +465,14 @@ def tune3(s, Rs, C):
     if key in cache:
         return cache[key]
     if os.environ.get("KINDI_TC_TUNE", "0") != "1":
-        cache[key] = 8 if sum(Rs) >= 8192 else 2
+        if small_ampere(s.card):         # the 3060's timed bests: 4 warps for q/k/v and the 2B / 9B FFN
+            cache[key] = 4 if len(Rs) == 3 or (Rs[0] == Rs[-1] and C <= 4096) else 2
+        else:
+            cache[key] = tc_nw(s) or (8 if sum(Rs) >= 8192 else 2)
         return cache[key]
     SK = s.sk
     ws = [s.w[next(n for n, (_, _, r, c) in s.w.items() if int(r) == R and int(c) == C)][1] for R in Rs]
-    NG, NU = C // 128, C // 1024
+    NG, NU = C // 128, (C + 1023) // 1024
     XQ = cp.zeros(TMAX * NG * 32, dtype=cp.uint32)
     XS = cp.zeros(TMAX * NG, dtype=cp.float32)
     XA = cp.zeros(TMAX * NG, dtype=cp.int32)
@@ -384,7 +484,7 @@ def tune3(s, Rs, C):
         for T in (1, TMAX):
             P = _tp.Plan()
             for _ in range(10):
-                P.add(SK.mv3[nw], (sum(R // 16 for R in Rs) // nw + 1,), (32 * nw,), mv3_args(ws, ys, Rs, NU, XQ, XS, XA, T))
+                P.add(SK.mv3[nw], (sum(R // 16 for R in Rs) // nw + 1,), (32 * nw,), mv3_args(ws, ys, Rs, nug(C), XQ, XS, XA, T))
             g = Graph(P)
             g.launch()
             ev0.record()
@@ -442,7 +542,8 @@ def _reserve_card(eng, s):
         b["FO"], b["QR"] = z(T * NH * HD), z(T * NH * HD)
         b["QQ"], b["QD"] = cp.zeros(T * NH * HD, dtype=cp.int8), z(T * NH * HD // 32)
         NGm = work // 128
-        b["XQ"], b["XS"], b["XA"] = cp.zeros(T * NGm * 32, dtype=cp.uint32), z(T * NGm), cp.zeros(T * NGm, dtype=cp.int32)
+        TQ = T * (2 if HP else 1)                    # int8 rows: two per token with KINDI_TC_HP
+        b["XQ"], b["XS"], b["XA"] = cp.zeros(TQ * NGm * 32, dtype=cp.uint32), z(TQ * NGm), cp.zeros(TQ * NGm, dtype=cp.int32)
         b["YH"], b["AOUT"] = z(T * s.R_head), cp.zeros(T, dtype=cp.int32)
         b["ctl"] = cp.zeros(16, dtype=cp.int32)
         if eng.W == 2:
@@ -492,6 +593,15 @@ def build_plan(s, T, head, wb, aout=None, tokp=None):
     P = _tp.Plan()
     st = {"h": b["HA"], "h2": b["HB"], "pending": 0}
     TT = i32(T)
+    hp = i32(1 if HP else 0)
+    TQ = i32(2 * T if HP else T)                   # the products' token count: int8 rows
+    HPB = (1 << 30) if HP else 0                   # tc.cu tc_hp
+    # the 9B's 4096-point folds in two launches (tcf.cu k_*_qa + k_mix8_q, bit-identical); KINDI_FOLD_SPLIT=0: one block
+    fsplit = (HB == 4096 and not cp.cuda.runtime.is_hip and os.environ.get("KINDI_FF", "1") != "0"
+              and os.environ.get("KINDI_FOLD_SPLIT", "1") == "1")
+
+    def mix8(C):
+        P.add(SK.k_mix8_q, (C // 4096 * 4, T), (128,), (XP, TT, i32(work), i32(C), XQ, XS, XA, hp))
 
     def tadd(kern, gx, block, args, strides):
         P.add(kern, (gx, T), block, tuple(args) + (TT,) + tuple(i32(x) for x in strides))
@@ -501,7 +611,7 @@ def build_plan(s, T, head, wb, aout=None, tokp=None):
         (returns the part count)"""
         _, Wt, R, C = s.w[name]
         R, C = int(R), int(C)
-        NG, NU = C // 128, C // 1024
+        NG, NU = C // 128, (C + 1023) // 1024
         if getattr(s, "tc_lane", False):
             # sm_60: the lane-table product of the fp32 rows X (k_g5t4 for one token: four tiles per warp)
             sp = lane_sp(s, R, C)
@@ -521,12 +631,16 @@ def build_plan(s, T, head, wb, aout=None, tokp=None):
             return 1
         nw, sp = tune(s, R, C)
         if quant:
-            P.add(SK.k_tc_q8, (NG, T), (128,), (X, i32(ldx), XQ, XS, XA, i32(NG), TT))
+            P.add(SK.k_tc_q8, (NG, T), (128,), (X, i32(ldx), XQ, XS, XA, i32(NG), TT) +
+                  (() if cp.cuda.runtime.is_hip or _tc.pascal(s.card) else (hp,)))   # (tcp.cu / tc_hip.cu: no hp)
         gx = (R // 16 + nw - 1) // nw
+        mv = SK.mv
+        if getattr(s, "w2", None):                 # the b2 layout: the same products, bit for bit
+            Wt, mv = s.w2[name], SK.mvb
         if sp == 1:
-            P.add(SK.mv[nw], (gx, 1), (32 * nw,), (Wt, Yo, i32(R), i32(NU), XQ, XS, XA, TT))
+            P.add(mv[nw], (gx, 1), (32 * nw,), (Wt, Yo, i32(R), i32(nug(C) | HPB), XQ, XS, XA, TQ))
             return 1
-        P.add(SK.mv[nw], (gx, sp), (32 * nw,), (Wt, PART, i32(R), i32(NU), XQ, XS, XA, TT))
+        P.add(mv[nw], (gx, sp), (32 * nw,), (Wt, PART, i32(R), i32(nug(C) | HPB), XQ, XS, XA, TQ))
         if resid:
             return sp
         P.add(SK.k_tc_sum, ((R * T + 255) // 256,), (256,), (PART, Yo, i32(R), TT, i32(sp)))
@@ -542,7 +656,11 @@ def build_plan(s, T, head, wb, aout=None, tokp=None):
         Rs = [int(s.w[n][2]) for n in names]
         C = int(s.w[names[0]][3])
         nw = tune3(s, Rs, C)
-        P.add(SK.mv3[nw], (sum(R // 16 for R in Rs) // nw + 1,), (32 * nw,), mv3_args(ws, outs, Rs, C // 1024, XQ, XS, XA, T))
+        mv3 = SK.mv3
+        if getattr(s, "w2", None):
+            ws, mv3 = [s.w2[n] for n in names], SK.mv3b
+        P.add(mv3[nw], (sum(R // 16 for R in Rs) // nw + 1,), (32 * nw,), mv3_args(ws, outs, Rs, nug(C) | HPB, XQ, XS, XA,
+                                                                                  2 * T if HP else T))
 
     def mixin(wname):
         """the residual add, RMS norm and Hadamard fold of every token, and their int8 rows for the next products"""
@@ -553,18 +671,37 @@ def build_plan(s, T, head, wb, aout=None, tokp=None):
             P.add(SK.k_xsum_T, (T,), (1024,), (r, i32(add), i32(D), np.uint64(tp.tcx_mem.ptr), np.uint64(tp.tcx_flags.ptr),
                                               i32(s.card), s.fail, s.tcctr, b["YX"]))
             add, r = 1, b["YX"]
-        if _tc.pascal(s.card):
-            # the one-pass fold (tcf.cu k_rmsfold2) is the default on Pascal (P40, 27B: 2.2 vs 3.7 ms per token); set in
-            # the environment so that the prompt cache's engine fingerprint sees it
+        if _tc.pascal(s.card) or (not cp.cuda.runtime.is_hip and
+                                  cp.cuda.runtime.getDeviceProperties(s.card)["multiProcessorCount"] >= 80 and
+                                  _tc.tested(s.card)):
+            # the one-pass fold (tcf.cu k_rmsfold2) is the default on Pascal (P40, 27B: 2.2 vs 3.7 ms per token) and on
+            # cards with 80 SMs or more (CMP 170HX, 27B: 1.3 vs 2.4 ms); set in the environment so that the prompt
+            # cache's engine fingerprint sees it
             os.environ.setdefault("KINDI_D1", "1")
-        rf2 = os.environ.get("KINDI_D1", "0") == "1" and HB in (512, 1024)
+        rf2 = os.environ.get("KINDI_D1", "0") == "1" and HB in (512, 1024) and not HP
+        if fsplit:
+            P.add(SK.k_rmsfold_qa, (D // 512, T), (512,), (st["h"], r, st["h2"], s.f(wname), s.sD, XN, XP, i32(add), TT,
+                                                           i32(D), i32(max(add, 1) * D), i32(D), i32(D), i32(work)))
+            mix8(D)
+            if add:
+                st["h"], st["h2"] = st["h2"], st["h"]
+            st["pending"] = 0
+            return
         P.add({512: SK.k_rmsfold2_512, 1024: SK.k_rmsfold2_1024}[HB] if rf2 else SK.k_rmsfold_qT, (D // HB, T),
               (HB if rf2 else 512,), (st["h"], r, st["h2"], s.f(wname), s.sD, XN, XP, i32(D), i32(add),
                                                        i32(HB), TT, i32(D), i32(max(add, 1) * D), i32(D), i32(D), i32(work),
-                                                       XQ, XS, XA))
+                                                       XQ, XS, XA) + (() if rf2 else (hp,)))
         if st["pending"]:
             st["h"], st["h2"] = st["h2"], st["h"]
         st["pending"] = 0
+
+    def smfold(hb):
+        """k_smfold_qT, or its thread-per-element form (bit-identical; KINDI_SM2=0 / 1, default on sm_80+ CUDA cards)"""
+        v = os.environ.get("KINDI_SM2", "")
+        on = (v == "1") if v in ("0", "1") else _tc.tested(s.card)
+        if on and hb in (512, 1024):
+            return {512: SK.k_smfold2_512, 1024: SK.k_smfold2_1024}[hb], hb
+        return SK.k_smfold_qT, 512
 
     def gdn(il):
         p = "blk.%d." % il
@@ -579,8 +716,14 @@ def build_plan(s, T, head, wb, aout=None, tokp=None):
         P.add(SK.k_sgdn_deltan_T, (NV,), (HK,), (s.M[il], L["QK"], L["QK"][NK * HK:], i32(2 * NK * HK), L["CS"][2 * NK * HK:],
                                                  i32(CC), L["GG"], L["GB"], i32(NV), s.f(p + "ssm_norm.weight"), OUT,
                                                  i32(NV * HK), f32t(1.0 / np.sqrt(HK)), i32(NK), TT, i32(wb)))
-        P.add(SK.k_smfold_qT, (NV * HK // HB, T), (512,), (b["ZV"], OUT, s.sV, XP, i32(HK), i32(NK), i32(NV // NK), i32(HB),
-                                                           TT, i32(NV * HK), i32(NV * HK), i32(work), i32(NV * HK), XQ, XS, XA))
+        if fsplit:
+            P.add(SK.k_smfold_qa, (NV * HK // 512, T), (512,), (b["ZV"], OUT, s.sV, XP, i32(HK), i32(NK), i32(NV // NK), TT,
+                                                                i32(NV * HK), i32(NV * HK), i32(work), i32(NV * HK)))
+            mix8(NV * HK)
+        else:
+            smf, smb = smfold(HB) if not HP else (SK.k_smfold_qT, 512)
+            P.add(smf, (NV * HK // HB, T), (smb,), (b["ZV"], OUT, s.sV, XP, i32(HK), i32(NK), i32(NV // NK), i32(HB),
+                                                    TT, i32(NV * HK), i32(NV * HK), i32(work), i32(NV * HK), XQ, XS, XA) + ((hp,) if smf is SK.k_smfold_qT else ()))
         st["pending"] = gemm(p + "ssm_out.weight", XP, work, Y, False, resid=True)
 
     def attn(il, kvi):
@@ -636,15 +779,25 @@ def build_plan(s, T, head, wb, aout=None, tokp=None):
                                                               i32(NH), i32(NHKV), i32(s.G)))
             P.add(SK.k_attn_combn_m, (NH, qn), (256,), (b["AP"], ps, QN[k0 * 2 * QL:], i32(2 * QL), OUT[k0 * QL:], i32(QL),
                                                         n0(), i32(qn), i32(NH)))
-        P.add(SK.k_fold_fwht_qT, (QL // HB, T), (512,), (OUT, s.sA, XP, i32(HB), TT, i32(QL), i32(work), i32(QL), XQ, XS, XA))
+        if fsplit:
+            P.add(SK.k_fold_qa, (QL // 512, T), (512,), (OUT, s.sA, XP, TT, i32(QL), i32(work), i32(QL)))
+            mix8(QL)
+        else:
+            P.add(SK.k_fold_fwht_qT, (QL // HB, T), (512,), (OUT, s.sA, XP, i32(HB), TT, i32(QL), i32(work), i32(QL), XQ, XS, XA, hp))
         st["pending"] = gemm(p + "attn_output.weight", XP, work, Y, False, resid=True)
 
     def ffn(il):
         p = "blk.%d." % il
         mixin(p + "post_attention_norm.weight")
         gemm3([p + "ffn_gate.weight", p + "ffn_up.weight"], [b["U1"], b["U2"]])
-        P.add(SK.k_smfold_qT, (NFF // HB, T), (512,), (b["U1"], b["U2"], s.sF, XP, i32(0), i32(0), i32(0), i32(HB), TT,
-                                                       i32(NFF), i32(NFF), i32(work), i32(NFF), XQ, XS, XA))
+        if fsplit:
+            P.add(SK.k_smfold_qa, (NFF // 512, T), (512,), (b["U1"], b["U2"], s.sF, XP, i32(0), i32(0), i32(0), TT, i32(NFF),
+                                                            i32(NFF), i32(work), i32(NFF)))
+            mix8(NFF)
+        else:
+            smf, smb = smfold(HB) if not HP else (SK.k_smfold_qT, 512)
+            P.add(smf, (NFF // HB, T), (smb,), (b["U1"], b["U2"], s.sF, XP, i32(0), i32(0), i32(0), i32(HB), TT,
+                                                i32(NFF), i32(NFF), i32(work), i32(NFF), XQ, XS, XA) + ((hp,) if smf is SK.k_smfold_qT else ()))
         st["pending"] = gemm(p + "ffn_down.weight", XP, work, Y, False, resid=True)
 
     emb = tp.emb
@@ -1462,9 +1615,10 @@ def install(log=print):
 
     def _slices(self):
         tern, flt = o_slices(self)
-        if "output.weight" not in self.tp.bi:          # tied embedding (the 2B): the head is token_embd
+        tied = getattr(self.tp, "tied_head", "output.weight" not in self.tp.bi)   # tp.py aliases a tied head in bi
+        if tied:                                       # tied embedding (the 2B): the head is token_embd
             tern["token_embd.weight"] = tern.pop("output.weight")
-        self.head_name = "output.weight" if "output.weight" in self.tp.bi else "token_embd.weight"
+        self.head_name = "token_embd.weight" if tied else "output.weight"
         return tern, flt
 
     def _bplans(self):

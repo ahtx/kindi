@@ -204,6 +204,11 @@ class Card(object):
         self.kslow = kepler(cp, dev) and not kfast
         self.host = set()                  # layers whose weights stay in pinned host memory (see Engine._plan)
         tc = (cfg is None or cfg.get("tc", True)) and not kepler(cp, dev)
+        # the bank-free IQ3_XXS codebook of the decode products (nbq.cu NBQ_REP): KINDI_NB_REP=0 / 1, default sm_80+
+        rv = os.environ.get("KINDI_NB_REP", "")
+        from .tc import ga100           # (GA100 only: on an RTX 3090 it cost 14%, 54.3 -> 46.6 tok/s)
+        if (rv == "1") if rv in ("0", "1") else ga100(dev):
+            opts = opts + ("-DNBQ_REP=1",)
         with cp.cuda.Device(dev):
             mod = module(cp, source(), tc, opts)
             self.k = {n: mod.get_function(n) for n in KERNELS + (K35_KERNELS if self.k35 else ())

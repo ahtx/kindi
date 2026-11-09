@@ -55,6 +55,11 @@ def run_gemma4(cfg, man, log=print):
     return 0 if ok_all else 1
 
 
+# a first difference where llama.cpp's own top-2 log-probability gap (reference "gap", tools/bonsai_gaps.py) is under
+# TIE_GAP nats, or where Kindi gives the token of another llama.cpp run ("alt"), is a tie, as in nanbeige_cli
+TIE_GAP = 0.01
+
+
 def run(cfg, log=print):
     try:
         import cupy as cp
@@ -76,7 +81,7 @@ def run(cfg, log=print):
     ref = json.load(open(rp))
     cl = os.path.join(pack, "head_clusters.npz")
     eng = make_engine(pack, ctx=1024, clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log)
-    ok_all, tok, dt = True, 0, 0.0
+    ok_all, tok, dt, ties = True, 0, 0.0, 0
     for i, r in enumerate(ref["prompts"]):
         sync = (lambda: cp.cuda.Device().synchronize()) if cp is not None and hasattr(eng, "k") else (lambda: None)
         sync()
@@ -86,13 +91,25 @@ def run(cfg, log=print):
         t = time.time() - t0
         n = sum(1 for a, b in zip(got, r["expected"]) if a == b)
         ok = got == r["expected"]
-        ok_all &= ok
-        tok += len(r["ids"]) + len(got)
-        dt += t
-        log("prompt %d %-60s %s  %d/%d tokens match  (%.1fs)" % (i + 1, repr(r["prompt"])[:60], "PASS" if ok else "FAIL",
-                                                                  n, len(r["expected"]), t))
+        state, j, gap = "PASS" if ok else "FAIL", None, None
         if not ok:
             j = next(k for k, (a, b) in enumerate(zip(got, r["expected"])) if a != b)
-            log("   first difference at token %d" % j)
-    log("%s - %.1f tokens/s over the run" % ("ALL PASS: token-exact with llama.cpp" if ok_all else "FAIL", tok / dt))
+            gap = r["gap"][j] if r.get("gap") and j < len(r["gap"]) else None
+            alt = r.get("alt") or []
+            if (gap is not None and gap < TIE_GAP) or (j < len(alt) and alt[:j + 1] == got[:j + 1]):
+                # a dead heat in llama.cpp's own top two, or the token another llama.cpp run of the same file gives
+                # there (tools/bonsai_gaps.py "alt"): the Nanbeige backend's rule
+                state = "TIE"
+                ties += 1
+        ok_all &= state != "FAIL"
+        tok += len(r["ids"]) + len(got)
+        dt += t
+        log("prompt %d %-60s %s  %d/%d tokens match  (%.1fs)" % (i + 1, repr(r["prompt"])[:60], state, n, len(r["expected"]), t))
+        if not ok:
+            log("   first difference at token %d%s" % (j, " (llama.cpp top-2 gap there %.4f)" % gap if gap is not None else ""))
+    if ok_all and ties:
+        log("PASS: %d of %d prompts token-exact, %d end at a llama.cpp tie, 0 fail - %.1f tokens/s over the run" % (
+            len(ref["prompts"]) - ties, len(ref["prompts"]), ties, tok / dt))
+    else:
+        log("%s - %.1f tokens/s over the run" % ("ALL PASS: token-exact with llama.cpp" if ok_all else "FAIL", tok / dt))
     return 0 if ok_all else 1

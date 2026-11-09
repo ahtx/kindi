@@ -118,6 +118,8 @@ def engine_fingerprint(eng, cfg):
         "tc_tmax": env.get("KINDI_TC_TMAX", ""),
         "fd": env.get("KINDI_FD", "0"),               # split flash-decode attention (tcf.cu)
         "d1": env.get("KINDI_D1", "0"),               # the one-pass RMS fold
+        "fd_ch": env.get("KINDI_FD_CH", "512"),       # positions per flash-decode block
+        "kexpf": env.get("KINDI_KEXPF", "1"),         # kindi.cu's kexpf in the tc kernels (0: NVRTC's expf)
         "att_tc": env.get("KINDI_ATT_TC", "0"),       # tensor-core prompt attention (tca.cu)
         "spec": env.get("KINDI_SPEC", "0"),
         "head": cfg.get("head", "exact"),

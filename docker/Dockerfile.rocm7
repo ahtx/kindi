@@ -1,0 +1,29 @@
+# Kindi runtime image for AMD RDNA 3.5 GPUs (ROCm 7, HIP 7.16): the Radeon 840M (gfx1152) and Radeon 8060S (Strix Halo,
+# gfx1151), both measured; Strix Point (gfx1150) not yet measured. ROCm 6.3 (docker/Dockerfile.rocm) does not know these GPUs. They
+# run natively: no HSA_OVERRIDE_GFX_VERSION. The host needs only the amdgpu kernel driver and Docker.
+#
+#   docker build -t kindi-rocm7:0.5.0 -f docker/Dockerfile.rocm7 .
+#   docker run -d --name kindi --device /dev/kfd --device /dev/dri --group-add video --group-add render \
+#       --security-opt seccomp=unconfined -p 127.0.0.1:8093:8093 -v $HOME/.kindi:/data kindi-rocm7:0.5.0
+FROM rocm/dev-ubuntu-24.04:10.1.0-full
+
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+# hipRTC compiles Kindi's GPU code at run time; its clang looks for the newest GCC's C++ headers (GCC 14 here)
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv libstdc++-14-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf && ldconfig
+
+# CuPy's ROCm 7 wheel (no source build); it loads libamdhip64.so.7 and the ROCm math libraries of the base image
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir "numpy==2.5.4" "fastrlock==0.8.4" "cupy-rocm-7-0==14.2.0" \
+    && /opt/venv/bin/pip install --no-cache-dir "fastapi==0.115.6" "uvicorn==0.32.1" "Jinja2==3.1.4" "MarkupSafe==3.0.2"
+ENV PATH=/opt/venv/bin:$PATH
+
+COPY kindi /opt/kindi/kindi
+WORKDIR /opt/kindi
+# /data holds the converted model (pack/) and the cache (state/); see docs/DOCKER.md
+ENV KINDI_PACK=/data/pack KINDI_STATE_DIR=/data/state KINDI_HOST=0.0.0.0 CUPY_CACHE_DIR=/data/state/cupy
+VOLUME ["/data"]
+EXPOSE 8093
+ENTRYPOINT ["python3", "-m", "kindi"]
+CMD ["serve"]
