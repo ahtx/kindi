@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kindi-bridge"
+version = "0.6.0"
+description = "A persistent terminal workspace for agents and their machines"
+requires-python = ">=3.10"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "COMMERCIAL-LICENSE.md"]
+authors = [{name = "Amir Husain"}]
+dependencies = ["psutil>=5.9,<8"]
+
+[project.optional-dependencies]
+knowledge = ["pypdf>=5,<7", "python-docx>=1.1,<2", "python-pptx>=1,<2", "openpyxl>=3.1,<4", "fastembed>=0.7,<1"]
+
+[project.scripts]
+kindi-bridge = "kindi_bridge.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kindi_bridge*"]
+
+[tool.setuptools.package-data]
+kindi_bridge = ["assets/*"]

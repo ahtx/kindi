@@ -1,65 +1,92 @@
-<p align="center"><img src="assets/kindi-banner.svg?v=0.5.0" alt="Kindi 0.5.0: modern 2B to 33B language models on low-cost GPUs, from a 1 GB Quadro K420 to the CMP 170HX and Radeon graphics. Ternary Bonsai 2B, 4B, 9B and 27B, and AH-Nanbeige4.3-33B." width="100%"></p>
+<p align="center"><img src="assets/kindi-banner.svg?v=0.6.0" alt="Kindi 0.6.0: language models on low-cost GPUs, from a 1 GB Quadro K420 to the RTX 50 series, the CMP 170HX and Radeon graphics. Ternary Bonsai 2B to 27B, AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B and DeepSeek-V4.1-Flash." width="100%"></p>
 
-# Kindi 0.5.0
+# Kindi 0.6.0
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Commercial licenses available](https://img.shields.io/badge/commercial%20licenses-available-green.svg)](COMMERCIAL-LICENSE.md)
-[![Release v0.5.0](https://img.shields.io/badge/release-v0.5.0-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.5.0)
+[![Release v0.6.0](https://img.shields.io/badge/release-v0.6.0-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.6.0)
 
-Kindi is a custom inference engine for Prism ML's **Ternary-Bonsai-2** language models (2B, 4B, 9B and 27B
-parameters, ternary weights). It started on the **NVIDIA Quadro K420** (Kepler, 1 GB). On this card, it writes
-**22.9 tokens per second** with the 2B (fast head). Version 0.2.0 added the Quadro K1200, two cards in tensor
-parallel, the GeForce GTX 1080 and the GeForce RTX 3080. It also added a CPU engine and a one-command installer.
-Version 0.3.0 adds AMD Radeon 780M graphics (a ROCm image) and the Quadro K6000. It also adds a prompt cache for
-agents and setups with several servers on several cards. NVIDIA Nemotron 3.5 Bolt E4B has experimental support.
-Version 0.4.0 turns on speculative decoding on the RTX 30, 40 and 50 cards: on an RTX 3080, the 27B with the 2B
-draft model writes up to 1.82 times as fast, with the same output ([docs/MTP.md](docs/MTP.md)). It also adds
-AH-Nanbeige4.3-33B, a separate model (see below). Kindi 0.4.0 supports the GeForce RTX 20, 30, 40 and 50 series.
-It also supports the Tesla P100 (16 GB, Pascal) as a full card: Kindi writes the 27B 1.9 to 2.7 times as fast as
-llama.cpp on the same P100 ([docs/CARDS.md](docs/CARDS.md)). Version 0.5.0 adds the NVIDIA CMP 170HX
-(GA100, 40 GB), and AMD RDNA 3.5 graphics: the Radeon 840M (Ryzen AI 5 340) and the Radeon 8060S (Strix Halo). On the CMP 170HX, Kindi writes the 27B faster than
-llama.cpp at 512 to 64K tokens of context, on one card and on two cards ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)). The
-installer finds the GeForce RTX 30 cards that NVIDIA limits to half-rate 16-bit arithmetic. It offers to unlock them
-with the excellent [gpu-unlock](https://github.com/Zagitta/gpu-unlock) module by Zagitta. Kindi's prompt cache is
-more effective than llama.cpp's. In our test, Nemotron on a GTX 1080 answers three questions about a 9,400-token
-document, with both caches on. Kindi answers the third question in 0.42 s, and llama.cpp in 3.10 s. The CPU
-is now a full platform: the installer offers CPU servers next to the GPU servers. On a Ryzen 9 7940HS, Kindi's CPU engine writes the 2B 2.7
-times as fast as llama.cpp (64.8 against 23.6 tokens/s). On a Core i7-8700, it writes 1.6 times as fast. Kindi has
-an **OpenAI-compatible server** for chat clients, scripts and agents that write code. Its default output is
-token-for-token identical to the output of llama.cpp for the same model file. On the K420, with the same file and
-the same context, it generates about 13x faster than llama.cpp (exact head: 20.8 against 1.65 tokens/s). The
-comparisons for each card are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The one-page summary is [WHY.md](WHY.md).
+Kindi is a custom inference engine for language models on low-cost GPUs. It runs Prism ML's ternary
+Bonsai models (2B, 4B, 9B and 27B), AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B and DeepSeek-V4.1-Flash.
+Kindi supports NVIDIA cards from the 1 GB Quadro K420 (Kepler) to the RTX 50 series and the CMP 170HX. It also
+supports AMD Radeon 780M, 840M and 8060S graphics, and x86-64 CPUs. The OpenAI-compatible server has a prompt
+cache, tool calls, a thinking mode and speculative decoding. With the exact head, the greedy output is the same as
+the output of llama.cpp for the same model file, token for token. Version 0.6.0 adds two mixture-of-experts models
+that keep experts in host memory, the DSpine drafter for the 27B, and a one-command installer for Windows.
 
-<p align="center"><img src="assets/kindi-demo.gif" alt="The pi coding agent driving Kindi on a Quadro K420: it runs nvidia-smi, writes and runs a Python script, and checks disk space" width="100%"></p>
+### Measured speed
 
-<p align="center"><sub>Recorded live: the <a href="https://pi.dev">pi</a> coding agent (with a Kindi colour theme)
-connected to <code>kindi serve</code> on one Quadro K420, default settings. Token streaming is real time. We
-shortened pauses longer than 2.5 s. The <a href="https://github.com/ahtx/kindi/releases/download/v0.1.0/kindi-demo-untrimmed.mp4">full
-video</a> (123 s, no pauses shortened) and its <a href="https://github.com/ahtx/kindi/releases/download/v0.1.0/kindi-demo.cast">asciicast</a> are in the 0.1.0 release.</sub></p>
+Kindi and llama.cpp on the same card, with the same model file and the same context. Tokens per second, one stream,
+greedy. The method and the other cards: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-<p align="center"><img src="assets/kindi-speed.svg" alt="Write speed in tokens per second, Kindi 0.2.0 and llama.cpp on the same card with the same model file and context: Quadro K420 1 GB, 2B, 20.8 and 1.65; Quadro K1200, 2B, 81.0 and 20.8; 4B, 39.2 and 8.7; 9B, 23.4 and 5.9; two Quadro K1200 cards, 27B, 12.6 and 1.69; GeForce GTX 1080, 27B, 27.9 and 19.4 at 512 tokens, and 15.4 at 64,000 tokens, where llama.cpp runs out of memory; GeForce RTX 3080 at 190 W, 27B, 63.2 and 52.2 at 1K and 44.0 and 23.5 at 90K." width="100%"></p>
+| Card | Model | Context | Kindi read / write | llama.cpp read / write |
+|---|---|---:|---:|---:|
+| Quadro K420, 1 GB | Bonsai 2B | 512 | **33.3 / 20.8** | 1.2 / 1.65 |
+| GeForce GTX 1080, 8 GB | Nemotron 3.5 Lightning 30B-A3B | 8,192 | **687 / 89.5** | 615 / 4.7 |
+| GeForce RTX 2070 SUPER, 8 GB | Nemotron 3.5 Lightning 30B-A3B | 8,192 | **2,129 / 120.3** | 1,137 / 111.8 |
+| Tesla P100, 16 GB | Nemotron 3.5 Lightning 30B-A3B | 8,192 | **702 / 144.8** | 506 / 118.4 |
+| GeForce RTX 3080, 10 GB, 190 W | Nemotron 3.5 Lightning 30B-A3B | 32,768 | **3,777 / 276.6** | 2,138 / 182.4 |
+| Two GeForce RTX 3080 | AH-Nanbeige4.3-33B IQ3_XXS | 8,192 | **1,267 / 40.9** | 1,249 / 33.3 |
+| Radeon 8060S (Strix Halo) | Bonsai 27B | 8,192 | **333 / 28.42** | 292 / 24.34 |
 
-<p align="center"><sub>The chart shows Kindi 0.2.0 measurements. We did not measure these rows again on 0.3.0, except on the K1200 cards: there, the 0.3.0 engine is within 0.5%.</sub></p>
+On the 8 GB cards, the Lightning model does not fit on the card. Both engines keep some experts in host memory
+(llama.cpp: `-ncmoe 9` on the GTX 1080 and `-ncmoe 12` on the RTX 2070 SUPER). On these two cards the write test
+uses a real text as the prompt.
 
-By [Amir Husain](https://www.amirhusain.com). Watch the [launch video](https://youtu.be/ddAnghj8HpE) on YouTube.
+Two more results:
 
-## Quick start: one command
+- **The 27B with DSpine.** On an RTX 3080 at 190 W and a context of 32,768 tokens, the 27B writes 115.5 tokens/s
+  with the DSpine drafter, with the same output as plain decoding ([docs/DSPINE.md](docs/DSPINE.md)).
+- **DeepSeek-V4.1-Flash (552B).** On one RTX 3060 12 GB, a Quadro M4000 for the most used experts and two Xeon
+  E5-2673 v4 CPUs with the model in RAM, Kindi writes 18.7 tokens/s with its built-in DSpark drafter
+  ([docs/DEEPSEEK.md](docs/DEEPSEEK.md)).
 
-On Linux x86-64 with an NVIDIA card (Kepler to Ampere, one card or more), with AMD Radeon 780M, 840M or 8060S graphics, or with no GPU:
+### Supported cards and models
+
+| Hardware | Models |
+|---|---|
+| NVIDIA Kepler: Quadro K420 (1 and 2 GB), Quadro K6000 (12 GB) | Bonsai 2B and 4B; on the K6000, the 27B and Lightning |
+| NVIDIA Maxwell: Quadro K1200, one or two cards | Bonsai 2B, 4B, 9B; 27B on two cards |
+| NVIDIA Pascal: GeForce GTX 1080, Tesla P100 | Bonsai 2B to 27B, Lightning |
+| NVIDIA GeForce RTX 20, 30, 40 and 50 series | Bonsai 2B to 27B (DSpine for the 27B on tensor-core cards), Lightning, AH-Nanbeige4.3-33B (RTX 30 and later) |
+| NVIDIA CMP 170HX, 40 GB | Bonsai 27B, AH-Nanbeige4.3-33B |
+| AMD Radeon 780M, 840M, 8060S | Bonsai 2B to 27B (the 27B needs 32 GB of system memory or more) |
+| x86-64 CPU with AVX2 | Bonsai 2B, 4B and 9B (the CPU engine) |
+| One NVIDIA card with 12 GB or more and about 560 GB of RAM | DeepSeek-V4.1-Flash |
+
+The measured cards and the per-card settings: [docs/CARDS.md](docs/CARDS.md).
+
+### Install
+
+Linux x86-64:
 
 ```bash
 curl -fsSL https://amirhusain.com/kindi/install.sh | bash
 ```
 
-The script finds your cards, shows each setup that they support with the recommended one first, and can set up
-one server for each card (`--auto` takes the recommendation). It downloads the model and checks
-its sha256, converts it, checks that the output is token-for-token identical to llama.cpp, and starts the server
-on `127.0.0.1:8093`. It explains each step, and it asks before it installs Docker or the NVIDIA Container Toolkit.
-To see each step before anything changes, add `-s -- --dry-run` after `bash`. Run it again to upgrade or repair;
-`--uninstall` removes it. To check the script's sha256 before you run it, and for the model that each card gets,
-see [docs/INSTALL.md](docs/INSTALL.md).
+Windows 10 and 11 (PowerShell; the installer sets up WSL2):
 
-- [Quick start: one command](#quick-start-one-command)
+```powershell
+irm https://amirhusain.com/kindi/install.ps1 | iex
+```
+
+The installer finds your cards and shows the setups that they support, the recommended setup first. It downloads
+the model, checks its sha256, runs `kindi verify` and starts the server on `127.0.0.1:8093`. Add `--dry-run` to see
+each step first ([docs/INSTALL.md](docs/INSTALL.md), [docs/WINDOWS.md](docs/WINDOWS.md)). DeepSeek-V4.1-Flash has
+its own installer ([docs/DEEPSEEK.md](docs/DEEPSEEK.md)).
+
+### Links
+
+- [CHANGELOG.md](CHANGELOG.md): what changed in each version
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/CARDS.md](docs/CARDS.md): the measurements and the settings
+- [WHY.md](WHY.md): the one-page summary
+- The manual: [How to get work done with Kindi](https://amirhusain.com/software/kindi/How-To-Get-Work-Done-with-Kindi-0.6.0.pdf)
+- Project page: [amirhusain.com/kindi](https://amirhusain.com/kindi/)
+
+By [Amir Husain](https://www.amirhusain.com).
+
+## Contents
+
 - [First steps after the install](#first-steps-after-the-install)
 - [Requirements](#requirements)
 - [Install](#install) - with Docker, or natively
@@ -121,18 +148,23 @@ context to the free card memory. On the K420 1 GB, Kindi uses about 870 MB of it
 
 ## Install
 
-### With Docker (recommended)
+### Containers
 
-CUDA 10.2 and CuPy 9.6 are the last releases that support Kepler, and they need an old userland; the image packages
+The installer builds the Docker image on your computer (see "Quick start" above). To build and run the image
+yourself, follow the steps below or [docs/DOCKER.md](docs/DOCKER.md).
+
+### Build the Docker image yourself
+
+CUDA 10.2 and CuPy 9.6 are the last releases that support Kepler, and they need the Ubuntu 18.04 userland; the image packages
 exactly that.
 
 ```sh
 git clone https://github.com/ahtx/kindi.git && cd kindi
-docker build -t kindi:0.5.0 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
+docker build -t kindi:0.6.0 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
 ```
 
-For AMD RDNA3 graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.5.0`, about 6 GB to download). For
-RDNA 3.5 graphics, build `docker/Dockerfile.rocm7` (`kindi-rocm7:0.5.0`, about 9 GB to download). See
+For AMD RDNA3 graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.6.0`, about 6 GB to download). For
+RDNA 3.5 graphics, build `docker/Dockerfile.rocm7` (`kindi-rocm7:0.6.0`, about 9 GB to download). See
 [docs/AMD.md](docs/AMD.md).
 
 You can also use the release archive. Download `kindi-0.4.0.tar.gz` from the
@@ -219,8 +251,9 @@ The first start compiles Kindi's CUDA kernels for your card (about 1.5 minutes o
 curl -s localhost:8093/health
 ```
 
-The server listens on `127.0.0.1:8093` (natively) or on the port you publish (Docker). To serve your network, publish
-`-p 8093:8093` (Docker) or set `host = 0.0.0.0`, and set an `api_key`.
+The server listens on `127.0.0.1:8093` (natively) or on the port you publish (Docker). To serve your network, run the
+installer with `--lan` (it sets an API key; see [docs/INSTALL.md](docs/INSTALL.md)), or publish `-p 8093:8093`
+(Docker) or set `host = 0.0.0.0`, and set an `api_key`.
 
 ## Use it
 

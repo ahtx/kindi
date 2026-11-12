@@ -33,6 +33,13 @@ MODELS = {
                          sha="9d4f18e8a22573c94b18a455147e807a8b9d2cd4b30302f2a4639c2db0a6c239", size=13108685952,
                          one=16200, two=0, split=(15500, 700), what="AH-Nanbeige4.3-33B, IQ3_XXS",
                          card="https://huggingface.co/ahtx/AH-Nanbeige4.3-33B-IQ3_XXS-GGUF"),
+    # Nota AI's ternary Nemotron 3.5 Lightning 30B-A3B, GGUF by boro64; licence: OpenMDW 1.1 (openmdw.ai/license/1-1)
+    # One card of 10 GB holds all of it; on 6 to 8 GB cards the least used experts stay in host memory.
+    "lightning-30b": dict(file="Ternary-Nemotron-3.5-Lightning-30B-A3B-GGUF.gguf",
+                          repo="boro64/Ternary-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+                          sha="38854de649212dc2761006b75afbc41412e7531f763c3ff965bd31f969bb14f3", size=9472656320,
+                          one=5800, two=0, what="Nemotron 3.5 Lightning 30B-A3B, ternary (Nota AI), Q2_0",
+                          card="https://huggingface.co/boro64/Ternary-Nemotron-3.5-Lightning-30B-A3B-GGUF"),
 }
 
 

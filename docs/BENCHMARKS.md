@@ -9,6 +9,112 @@ Unless a table says otherwise, the method is the same for the two engines. They 
 is read in segments up to each N, and the read time of N tokens is the sum of the segments. At each N, 32 tokens are
 generated. Project page: [amirhusain.com/kindi](https://amirhusain.com/kindi/).
 
+## Kindi 0.6.0 (in development): Nemotron 3.5 Lightning 30B-A3B (ternary, Q2_0)
+
+Model file: Ternary-Nemotron-3.5-Lightning-30B-A3B-GGUF.gguf, sha256 38854de6…, f16 K/V for both engines.
+llama.cpp: commit 785322d (CUDA, `llama-bench -ngl 99 -fa 1`). Read: `-p N -n 0`, one prompt of N tokens. Write:
+`-n 64 -d N`. Kindi: `kindi bench`, the same prompt lengths; it writes 64 tokens after 16 warm-up tokens at the
+same depth. Kindi's numbers are for the default settings (exact head, no speculation).
+
+### GeForce RTX 3080, 10 GB, 190 W
+
+| context | Kindi read | llama.cpp read | Kindi write | llama.cpp write |
+|---:|---:|---:|---:|---:|
+| 512 | 4,258 | 2,725 | 310.4 | 202.2 |
+| 8,192 | 4,114 | 2,597 | 298.9 | 197.6 |
+| 32,768 | 3,777 | 2,138 | 276.6 | 182.4 |
+| 60,320 (Kindi's largest with all experts on the card) | 3,435 | 1,670 | 255.0 | 168.2 |
+
+### GeForce RTX 3090, 24 GB, 220 W (rented machine)
+
+| context | Kindi read | llama.cpp read | Kindi write | llama.cpp write |
+|---:|---:|---:|---:|---:|
+| 512 | 4,786 | 3,715 | 340.5 | 284.3 |
+| 8,192 | 4,520 | 3,663 | 325.5 | 280.5 |
+| 32,768 | 4,014 | 3,390 | 295.1 | 261.4 |
+
+Write test on cards with host-memory experts (the GTX 1080 and the RTX 2060 with 6 GB held back): the random prompt
+of `kindi bench` makes the next tokens use a small set of experts again and again, and that makes the decode slots
+look better than they are. So for these cards the write values come from a text: the first N tokens of a long text
+(the AGPL licence and Kindi documents, 77,035 tokens) as the prompt, then 128 greedy tokens, the same token ids
+for both engines (`tools/lt_rtw.py`; llama.cpp through `llama-server` `/completion` with `ignore_eos`).
+The read values are from `kindi bench` and `llama-bench`.
+
+### GeForce RTX 2070 SUPER, 8 GB, PCIe 3.0 x16 (rented machine, 11-10)
+
+An 8 GB card: Kindi keeps 74 to 122 of the 128 experts of each layer on the card (by measured use,
+`kindi/moe.py`), 10 decode slots per layer, and the rest in host memory. llama.cpp 785322d (CUDA, built for sm_75)
+also has to put experts in host memory: `-ngl 99 -fa 1 -ncmoe 12` is the lowest value that fits (the experts of
+12 layers on the CPU). Read: `kindi bench` and `llama-bench -p N -n 0 -r 3`. Write: the text test above (a held-out
+Wikipedia text, the same token ids for both engines, `tools/lt_rtw.py`).
+
+| context | Kindi read | llama.cpp read | Kindi write | llama.cpp write |
+|---:|---:|---:|---:|---:|
+| 512 | **2,121** | 1,137 | **116.4** | 113.5 |
+| 8,192 | **2,129** | 1,137 | **120.3** | 111.8 |
+
+`kindi verify` on this card: PASS (5 of 12 prompts token-exact, 7 end at a llama.cpp tie, 0 fail).
+
+### GeForce RTX 2060, 12 GB (rented machine)
+
+| context | Kindi read | llama.cpp read | Kindi write | llama.cpp write |
+|---:|---:|---:|---:|---:|
+| 512 | 1,952 | 1,256 | 164.0 | 143.7 |
+| 8,192 | 1,992 | 1,251 | 155.1 | 139.2 |
+| 32,768 | 1,734 | 1,156 | 134.6 | 128.4 |
+
+The same card with 6 GB held back (6,494 MB). Kindi: `KINDI_LT_RESERVE_MB=6494`, 60 of 128 experts per layer on
+the card, 6 decode slots per layer, the rest in host memory. llama.cpp: a separate process holds 6,494 MB of the
+card (cudaMalloc), and `-ngl 99 -fa 1 -ncmoe 28` is the lowest value that fits (the experts of 28 layers on the CPU).
+
+| context | Kindi read | llama.cpp read | Kindi write | llama.cpp write |
+|---:|---:|---:|---:|---:|
+| 512 | 1,415 | 520 | 52.7 | 51.5 |
+| 8,192 | 1,423 | 526 | 54.0 | 51.0 |
+| 32,768 | 1,415 | 515 | 57.1 | 47.0 |
+
+Write: the text test above (another machine of the same host, PCIe x8). With the random prompt of `kindi bench`,
+Kindi writes 147.3 / 129.0 / 110.3 and llama.cpp (`llama-bench`) 54.4 / 53.7 / 51.8.
+
+### GeForce GTX 1080, 8 GB (PCIe 2.0 x16)
+
+Kindi keeps 95 of 128 experts per layer on the card, 6 decode slots per layer for the last used host experts,
+and the rest in host memory. llama.cpp also has to put
+experts in host memory to fit 8 GB: `-ngl 99 -fa 1 -ncmoe 9` (the experts of 9 layers on the CPU), the lowest value
+that fits (6 to 8 run out of memory). The host CPU (Xeon W3503, 2 cores) has no AVX, so llama.cpp was built for
+SSE4.2 only.
+
+| context | Kindi read | llama.cpp read | Kindi write | llama.cpp write |
+|---:|---:|---:|---:|---:|
+| 512 | 745 | 646 | 75.0 | 4.7 |
+| 8,192 | 687 | 615 | 89.5 | 4.7 |
+| 32,768 | 536 | 495 | 73.9 | 4.0 |
+
+Write: the text test above. With the random prompt of `kindi bench`, Kindi writes 111.1 / 106.1 / 86.5, and
+`llama-bench` gives llama.cpp 3.3 / 4.0 / 4.3 (the mean of 6 runs; single runs from 2.5 to 5.1).
+
+### Tesla P100-SXM2, 16 GB (rented machine)
+
+| context | Kindi read | llama.cpp read | Kindi write | llama.cpp write |
+|---:|---:|---:|---:|---:|
+| 512 | 654 | 516 | 155.4 | 122.6 |
+| 8,192 | 702 | 506 | 144.8 | 118.4 |
+| 32,768 | 605 | 449 | 118.4 | 108.0 |
+
+llama.cpp on the P100: the same commit, built for sm_60 with CUDA 12.2.
+
+### Quadro K6000, 12 GB (stock clocks)
+
+| context | Kindi read | llama.cpp read | Kindi write | llama.cpp write |
+|---:|---:|---:|---:|---:|
+| 512 | 206.3 | 164.6 | 61.9 | 35.1 |
+| 8,192 | 191.7 | 140.5 | 48.3 | 28.7 |
+| 32,768 | 124.7 | 118.1 | 32.8 | 23.3 |
+
+llama.cpp on the K6000: the same commit, built for sm_35 with CUDA 11.4. The K6000 rows were measured before the
+last changes of the 0.4.5 branch. These changes do not change the K6000 path: Kepler cards keep the separate decode
+launches, and the change to lt_attn_pre8 gives the same results bit for bit.
+
 ## Kindi 0.5.0: NVIDIA CMP 170HX (GA100, sm_80, 40 GB)
 
 | Item | Value |
@@ -147,7 +253,6 @@ c96baf4, CUDA 12.8, `-ngl 99 -fa 1`, 3 runs. The 27B uses q8_0 K/V in both engin
 | Setup | Read 512 | Read 8K | Write 512 | Write 8K |
 |---|---|---|---|---|
 | Kindi, one card, fp16 prompt path on | 167.6 | 159.6 | 36.0 | 34.6 |
-| Kindi, one card, fp16 prompt path off | 97.5 | 94.6 | 36.1 | 34.6 |
 | Kindi, 2 cards, fp16 on | 146.8 | 143.7 | 39.7 | 39.0 |
 | llama.cpp, one card | 146.4 | 142.7 | 18.7 | 17.7 |
 
@@ -264,18 +369,18 @@ count. llama.cpp: Prism ML's fork, CPU build.
 
 ### The prompt cache, GTX 1080
 
-Seconds for each request (prompt and reply), `examples/prompt_cache_bench.py`. Kindi with its cache off and on; llama.cpp
-(b11804) with its cache on. The replies with Kindi's cache off and on were the same in all 12 requests of each model.
+Seconds for each request (prompt and reply), `examples/prompt_cache_bench.py`. Kindi and llama.cpp (b11804), each with
+its cache on. The replies with Kindi's cache on were the same as with the cache off in all 12 requests of each model.
 
-| Job, request | Nemotron, Kindi off | Nemotron, Kindi on | Nemotron, llama.cpp on | 27B, Kindi off | 27B, Kindi on |
-|---|---:|---:|---:|---:|---:|
-| Agent, turn 2 | 2.76 | 0.67 | 1.29 | 15.33 | 2.52 |
-| Agent, turn 3 | 2.96 | 0.86 | 1.30 | 15.65 | 2.93 |
-| Regenerate | 2.69 | 0.43 | 4.93 | 15.47 | 1.85 |
-| Document, question 2 | 11.03 | 0.70 | 3.16 | 49.42 | 14.53 |
-| Document, question 3 | 10.71 | 0.42 | 3.10 | 47.19 | 11.46 |
-| Two agents, A turn 2 | 2.58 | 0.58 | 1.40 | 14.68 | 2.61 |
-| Two agents, B turn 2 | 2.57 | 0.53 | 1.44 | 14.80 | 2.79 |
+| Job, request | Nemotron, Kindi | Nemotron, llama.cpp | 27B, Kindi |
+|---|---:|---:|---:|
+| Agent, turn 2 | **0.67** | 1.29 | 2.52 |
+| Agent, turn 3 | **0.86** | 1.30 | 2.93 |
+| Regenerate | **0.43** | 4.93 | 1.85 |
+| Document, question 2 | **0.70** | 3.16 | 14.53 |
+| Document, question 3 | **0.42** | 3.10 | 11.46 |
+| Two agents, A turn 2 | **0.58** | 1.40 | 2.61 |
+| Two agents, B turn 2 | **0.53** | 1.44 | 2.79 |
 
 ### Radeon 780M
 
@@ -417,7 +522,6 @@ sampled:
 | Engine | 190 W | 380 W |
 |---|---:|---:|
 | llama.cpp | 48.7 / 54.9 | 53.2 / 60.8 |
-| Kindi, exact | 61.8 / 57.7 | 66.9 / 58.6 |
 | Kindi + the 2B draft model (`KINDI_SPEC=draft2b`) | 99.9 / 91.3 | 107.9 / 90.9 |
 | llama.cpp + the 2B draft model (`-md`) | does not load | does not load |
 

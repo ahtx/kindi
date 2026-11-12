@@ -1,0 +1,32 @@
+[
+ {
+  "id": "python-traceback",
+  "match": "Traceback \\(most recent call last\\)",
+  "after": 2,
+  "then": "Your recent commands keep raising Python exceptions. Before running generated code, syntax-check it (python -m py_compile <file>) or run the smallest piece first, and read the traceback's last line."
+ },
+ {
+  "id": "parse-errors",
+  "match": "SyntaxError|Unexpected token|JSONDecodeError|invalid json",
+  "after": 2,
+  "then": "Your recent outputs failed to parse. Produce the strict form: valid JSON, quoted arguments, no trailing commas, no commentary inside code blocks."
+ },
+ {
+  "id": "missing-files",
+  "match": "No such file or directory",
+  "after": 2,
+  "then": "Recent commands referenced files that do not exist. List the directory before operating on paths, and anchor paths to the job folder."
+ },
+ {
+  "id": "usage-errors",
+  "match": "Usage:|invalid option|ambiguous redirect",
+  "after": 2,
+  "then": "Recent commands were formed wrong (flags or operands). Run the tool's --help before retrying a failed command."
+ },
+ {
+  "id": "context-pressure",
+  "match": "compaction",
+  "after": 2,
+  "then": "This session has compacted repeatedly. Prefer targeted reads over whole-file dumps, and restate the plan in one line after each compaction."
+ }
+]

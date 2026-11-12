@@ -9,12 +9,16 @@ Bonsai's Gated-DeltaNet layers carry a recurrent state that cannot be rewound, s
     turn arrives (agents alternate between their main prompt and side prompts);
   * saved openings: when two requests share >= `prefix_min` tokens and then differ, the full state at that checkpoint
     is written to disk (`prefix_max` kept, least recently used dropped), so the next session that starts the same way
-    (same system prompt and tools) loads it in a fraction of a second, also after a restart.
+    (same system prompt and tools) loads it in a fraction of a second, also after a restart;
+  * saved turns (0.6.0): after each request the state at the end of the turn is written to disk in the background
+    (`turn_keep` conversations, `turn_disk_mb` of disk), so that after a restart a conversation resumes where its last
+    turn ended. K/V rows are stored in blocks shared by the turns of one conversation: a turn writes only its new rows.
 All of it is exact: resuming gives the same tokens as reading the prompt from scratch."""
 import hashlib
 import json
 import os
 import shutil
+import threading
 import time
 
 import numpy as np
@@ -29,9 +33,11 @@ def _host(a):
     return a.get() if hasattr(a, "get") else np.array(a)
 
 
-# pinned checkpoint copies: on by default under WSL2 (/dev/dxg; the WDDM driver copies pageable memory slowly: first
-# token 1.52 -> 0.98 s on a GTX 1070, issue #4); on Linux they gave no gain (RTX 3060, 19 MB: 6.2 vs 6.9 ms)
-PINNED = os.environ.get("KINDI_CKPT_PINNED", "1" if os.path.exists("/dev/dxg") else "0") == "1"
+# pinned checkpoint copies: on by default under the Windows WDDM driver, in WSL2 (/dev/dxg) and native (os.name nt)
+# - WDDM copies pageable memory slowly: first token 1.52 -> 0.98 s on a GTX 1070, issue #4; on Linux they gave no
+# gain (RTX 3060, 19 MB: 6.2 vs 6.9 ms)
+_WDDM = os.path.exists("/dev/dxg") or os.name == "nt"
+PINNED = os.environ.get("KINDI_CKPT_PINNED", "1" if _WDDM else "0") == "1"
 
 
 def _host_ckpt(a):
@@ -107,7 +113,7 @@ def engine_fingerprint(eng, cfg):
         "engine": type(eng).__module__ + "." + type(eng).__name__,
         "cards": len(cards) if cards else 1,
         "weights": "5-trit lane" if getattr(c0, "g5l", False) else ("5-trit" if getattr(c0, "g5", False) else "2-bit"),
-        "kv": "q8_0" if cards else "f16",
+        "kv": getattr(eng, "kv", None) or ("q8_0" if cards else "f16"),
         "chunk": int(getattr(eng, "chunk_ok", False)) and int(chunk.get("T", 0)),
         "chunk_q8": bool(chunk.get("q8")),
         "chunk_tc": bool(chunk.get("tc")),
@@ -235,6 +241,257 @@ class Openings(object):
             pass
         self.log("loaded a saved opening of %d tokens (%.1fs)" % (p, time.time() - t0))
         return p, Ms, Cs
+
+
+def _host_rows(a, lo, hi):
+    """host copy of rows [lo, hi) of a K/V cache array. A multi-card cache (tp.Dist) gives only [:hi]: copy that
+    and cut it on the host."""
+    if lo == 0 or isinstance(a, np.ndarray) or hasattr(a, "get"):
+        return _host(a[lo:hi]) if lo else _host(a[:hi])
+    return np.asarray(_host(a[:hi]))[lo:hi]
+
+
+def _dir_bytes(d):
+    tot = 0
+    for name in os.listdir(d):
+        try:
+            tot += os.path.getsize(os.path.join(d, name))
+        except OSError:
+            pass
+    return tot
+
+
+class Turns(object):
+    """Saved conversation turns on disk (0.6.0): the state at the end of each turn (tokens, recurrent state, K/V), so
+    that a restart resumes a conversation where its last turn ended, not at its saved opening.
+
+    The copy from the engine is made on the engine thread right after the request (the state and the new K/V rows
+    only); the disk writes run on a background thread, so the next request does not wait for the disk. K/V rows are
+    stored in blocks of B tokens, keyed by the hash of every token up to the block's end (a K/V row depends on all
+    the tokens before it): the turns of one conversation share their blocks, and a turn writes only the blocks that
+    are new plus its tail. A new turn replaces the older turns of the same conversation. At most `keep` conversations
+    and `disk_mb` of disk are kept; the least recently used goes first."""
+    B = 1024
+
+    def __init__(self, eng, root, keep, disk_mb, log, fingerprint=None):
+        self.eng, self.root, self.keep, self.log = eng, root, int(keep), log
+        self.limit = int(disk_mb) * 2 ** 20
+        self.fp = fingerprint
+        self.on = self.keep > 0 and self.limit > 0
+        self.entries = {}                  # key -> {"p", "used", "tokens", "blocks", "bytes"}
+        self.blocks = {}                   # block key -> bytes on disk
+        self.cv = threading.Condition()
+        self.job, self.busy = None, False
+        if not self.on:
+            return
+        try:
+            os.makedirs(os.path.join(root, "blocks"), exist_ok=True)
+            os.makedirs(os.path.join(root, "turns"), exist_ok=True)
+            for name in os.listdir(os.path.join(root, "blocks")):
+                if name.endswith(".npz"):
+                    self.blocks[name[:-4]] = os.path.getsize(os.path.join(root, "blocks", name))
+            for key in os.listdir(os.path.join(root, "turns")):
+                d = os.path.join(root, "turns", key)
+                try:
+                    meta = json.load(open(os.path.join(d, "meta.json")))
+                    if self.fp is not None and meta.get("engine") != self.fp[0]:
+                        continue
+                    if meta["p"] >= eng.ctx or any(b not in self.blocks for b in meta["blocks"]):
+                        continue
+                    self.entries[key] = {"p": meta["p"], "used": meta.get("used", 0), "blocks": meta["blocks"],
+                                         "tokens": np.load(os.path.join(d, "tokens.npy")), "bytes": _dir_bytes(d)}
+                except Exception:  # noqa: BLE001 - a damaged or half-written entry is skipped
+                    continue
+        except OSError as e:
+            log("saved turns disabled: %s" % e)
+            self.on = False
+            return
+        self._gc()
+        threading.Thread(target=self._writer, daemon=True, name="kindi-turn-writer").start()
+        log("saved turns: %d in %s (keep %d, %d MB of disk)" % (len(self.entries), root, self.keep,
+                                                                  self.limit // 2 ** 20))
+
+    @staticmethod
+    def key_of(tokens):
+        return hashlib.sha1(np.asarray(tokens, dtype=np.int32).tobytes()).hexdigest()[:20]
+
+    def _block_keys(self, T):
+        h, out = hashlib.sha1(), []
+        for i in range(len(T) // self.B):
+            h.update(T[i * self.B:(i + 1) * self.B].tobytes())
+            out.append(h.copy().hexdigest()[:24])
+        return out
+
+    # ---- the engine thread
+    def capture(self, tokens, state=None):
+        """copy the engine state after `tokens` to host memory and queue the disk write (returns at once).
+        state: (Ms, Cs) host copies of the recurrent state after `tokens` (a checkpoint), else the engine's current
+        state is taken (then `tokens` must be all the engine has read). The K/V rows below len(tokens) are read from
+        the engine either way: they do not change when the engine reads more."""
+        if not self.on or not tokens:
+            return
+        eng = self.eng
+        T = np.asarray(tokens, dtype=np.int32)
+        p = len(T)
+        keys = self._block_keys(T)
+        with self.cv:
+            have = set(self.blocks) | (set(self.job["new_blocks"]) if self.job else set())
+        need = [i for i, k in enumerate(keys) if k not in have]
+        new_blocks = {}
+        for i in need:
+            lo, hi = i * self.B, (i + 1) * self.B
+            new_blocks[keys[i]] = ([_host_rows(k, lo, hi) for k in eng.Kc], [_host_rows(v, lo, hi) for v in eng.Vc])
+        lo = len(keys) * self.B
+        tail = ([_host_rows(k, lo, p) for k in eng.Kc], [_host_rows(v, lo, p) for v in eng.Vc]) if p > lo else None
+        if state is None:
+            state = ([_host(m) for m in eng.M], [_host(c) for c in eng.conv])
+        else:
+            state = ([np.array(m) for m in state[0]], [np.array(c) for c in state[1]])
+        job = {"tokens": T, "blocks": keys, "new_blocks": new_blocks, "tail": tail, "state": state}
+        with self.cv:
+            if self.job is not None:            # an older turn not written yet: keep its new blocks, drop its entry
+                for k, v in self.job["new_blocks"].items():
+                    job["new_blocks"].setdefault(k, v)
+            self.job = job
+            self.cv.notify_all()
+
+    def best(self, T, lo, hi):
+        """the longest saved turn with lo < p <= hi that T starts with: (key, p) or None"""
+        if not self.on:
+            return None
+        Ta = np.asarray(T[:hi], dtype=np.int32)
+        best = None
+        with self.cv:
+            for key, e in self.entries.items():
+                p = e["p"]
+                if lo < p <= hi and (best is None or p > best[1]) and np.array_equal(e["tokens"], Ta[:p]):
+                    best = (key, p)
+        return best
+
+    def load(self, key):
+        t0 = time.time()
+        eng = self.eng
+        with self.cv:
+            e = self.entries[key]
+            e["used"] = time.time()
+        d = os.path.join(self.root, "turns", key)
+        p = e["p"]
+        parts = [np.load(os.path.join(self.root, "blocks", b + ".npz")) for b in e["blocks"]]
+        tail = np.load(os.path.join(d, "tail.npz")) if p > len(e["blocks"]) * self.B else None
+        z = np.load(os.path.join(d, "state.npz"))
+        Ms = [z["M%d" % i] for i in range(len(eng.M))]
+        Cs = [z["C%d" % i] for i in range(len(eng.conv))]
+        for name, dst in (("K", eng.Kc), ("V", eng.Vc)):
+            for i in range(len(dst)):
+                rows = [b["%s%d" % (name, i)] for b in parts] + ([tail["%s%d" % (name, i)]] if tail is not None else [])
+                _to_dev(dst[i], p, np.concatenate(rows) if len(rows) > 1 else rows[0])
+        for a, h in zip(eng.M, Ms):
+            _set_host(a, h)
+        for a, h in zip(eng.conv, Cs):
+            _set_host(a, h)
+        self.log("loaded a saved turn of %d tokens (%.1fs)" % (p, time.time() - t0))
+        return p, Ms, Cs
+
+    def drop(self, key):
+        with self.cv:
+            self.entries.pop(key, None)
+        shutil.rmtree(os.path.join(self.root, "turns", key), ignore_errors=True)
+
+    def wait(self, timeout=60.0):
+        """until the queued write is on disk (tests, shutdown)"""
+        end = time.time() + timeout
+        with self.cv:
+            while (self.job is not None or self.busy) and time.time() < end:
+                self.cv.wait(0.05)
+
+    # ---- the writer thread
+    def _writer(self):
+        while True:
+            with self.cv:
+                while self.job is None:
+                    self.cv.wait()
+                job, self.job, self.busy = self.job, None, True
+            try:
+                self._write(job)
+            except Exception as e:  # noqa: BLE001 - a full disk must not break serving
+                self.log("could not save the turn: %s" % e)
+            finally:
+                with self.cv:
+                    self.busy = False
+                    self.cv.notify_all()
+
+    def _write(self, job):
+        t0 = time.time()
+        T = job["tokens"]
+        p, key = len(T), self.key_of(T)
+        bdir = os.path.join(self.root, "blocks")
+        for k, (Ks, Vs) in job["new_blocks"].items():
+            tmp = os.path.join(bdir, k + ".tmp.npz")
+            arrs = {"K%d" % i: a for i, a in enumerate(Ks)}
+            arrs.update({"V%d" % i: a for i, a in enumerate(Vs)})
+            np.savez(tmp, **arrs)
+            os.replace(tmp, os.path.join(bdir, k + ".npz"))
+            with self.cv:
+                self.blocks[k] = os.path.getsize(os.path.join(bdir, k + ".npz"))
+        d = os.path.join(self.root, "turns", key)
+        tmpd = d + ".tmp"
+        shutil.rmtree(tmpd, ignore_errors=True)
+        os.makedirs(tmpd)
+        Ms, Cs = job["state"]
+        arrs = {"M%d" % i: m for i, m in enumerate(Ms)}
+        arrs.update({"C%d" % i: c for i, c in enumerate(Cs)})
+        np.savez(os.path.join(tmpd, "state.npz"), **arrs)
+        if job["tail"] is not None:
+            Ks, Vs = job["tail"]
+            arrs = {"K%d" % i: a for i, a in enumerate(Ks)}
+            arrs.update({"V%d" % i: a for i, a in enumerate(Vs)})
+            np.savez(os.path.join(tmpd, "tail.npz"), **arrs)
+        np.save(os.path.join(tmpd, "tokens.npy"), T)
+        now = time.time()
+        meta = {"p": p, "used": now, "created": now, "blocks": job["blocks"]}
+        if self.fp is not None:
+            meta["engine"] = self.fp[0]
+        json.dump(meta, open(os.path.join(tmpd, "meta.json"), "w"))
+        shutil.rmtree(d, ignore_errors=True)
+        os.replace(tmpd, d)
+        with self.cv:
+            # the older turns of this conversation: their tokens are a start of this turn's
+            older = [k for k, e in self.entries.items() if k != key and e["p"] <= p
+                     and np.array_equal(e["tokens"], T[:e["p"]])]
+            for k in older:
+                self.entries.pop(k, None)
+            self.entries[key] = {"p": p, "used": now, "tokens": T, "blocks": job["blocks"], "bytes": _dir_bytes(d)}
+        for k in older:
+            shutil.rmtree(os.path.join(self.root, "turns", k), ignore_errors=True)
+        dropped = self._gc()
+        self.log("saved the turn: %d tokens, %d new K/V blocks (%.1fs)%s" % (
+            p, len(job["new_blocks"]), time.time() - t0, ", %d old turns dropped" % dropped if dropped else ""))
+
+    def _held(self):
+        used = set(b for e in self.entries.values() for b in e["blocks"])
+        return sum(e["bytes"] for e in self.entries.values()) + sum(self.blocks.get(b, 0) for b in used)
+
+    def _gc(self):
+        """keep at most `keep` turns and `limit` bytes (least recently used first), then delete unused blocks"""
+        dropped = 0
+        with self.cv:
+            while self.entries and (len(self.entries) > self.keep or self._held() > self.limit):
+                old = min(self.entries, key=lambda k: self.entries[k]["used"])
+                self.entries.pop(old)
+                shutil.rmtree(os.path.join(self.root, "turns", old), ignore_errors=True)
+                dropped += 1
+            used = set(b for e in self.entries.values() for b in e["blocks"])
+            if self.job is not None:
+                used |= set(self.job["new_blocks"]) | set(self.job["blocks"])
+            gone = [b for b in self.blocks if b not in used]
+            for b in gone:
+                self.blocks.pop(b, None)
+        for b in gone:
+            try:
+                os.remove(os.path.join(self.root, "blocks", b + ".npz"))
+            except OSError:
+                pass
+        return dropped
 
 
 class _Slot(object):
@@ -377,14 +634,8 @@ class _State(object):
 
 
 def _ram_bytes():
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    return int(line.split()[1]) * 1024
-    except OSError:
-        pass
-    return 8 * 2 ** 30
+    from kindi import hostram                  # the real total on Linux, WSL2 and native Windows (issue #4)
+    return hostram.total() or 8 * 2 ** 30
 
 
 # branch parking (and resuming inside a parked conversation without taking it apart) is on by default on ROCm: the
@@ -432,6 +683,13 @@ class Runner(object):
                                                                            if k != "code"})))
         self.openings = Openings(eng, os.path.join(cfg["state_dir"], "openings", pack_id + "-e" + self.fingerprint[0]),
                                  int(cfg["prefix_max"]), log, fingerprint=self.fingerprint)
+        on = int(cfg.get("turn_save", 1)) == 1 and os.environ.get("KINDI_PROMPT_CACHE", "1") != "0"
+        self.turns = Turns(eng, os.path.join(cfg["state_dir"], "turns", pack_id + "-e" + self.fingerprint[0]),
+                           int(cfg.get("turn_keep", 4)) if on else 0, int(cfg.get("turn_disk_mb", 4096)), log,
+                           fingerprint=self.fingerprint)
+        self.turn_min = int(cfg.get("turn_min", 64))
+        self.session = None                                  # the active conversation's session (prepare)
+        self._turn_saved = None                              # the tokens of the last turn written (or queued)
         self.slot = getattr(eng, "ckpt_slot", None)          # KINDI_CKPT_VRAM (made by the engine before its fit)
 
     # ---- state copies
@@ -481,26 +739,55 @@ class Runner(object):
         return tot
 
     def _enforce(self):
-        """Drop the oldest until the cache fits the budget: the oldest parked conversation's checkpoints, then that
-        conversation, then the active conversation's oldest checkpoints (the two newest and opening_end are kept)."""
+        """Drop copies until the cache fits the budget. Only a copy that no other conversation holds frees memory
+        (a parked conversation shares checkpoint copies with the active one right after parking), so the order is:
+        1. a parked conversation's own checkpoint copies, oldest conversation and oldest checkpoint first;
+        2. the active conversation's oldest checkpoints (the two newest and opening_end are kept);
+        3. whole parked conversations, oldest first, the newest last (issue #26: the conversation parked a moment ago
+           was dropped while its copies were still the active conversation's, and returning to it read it all again)."""
         dropped = 0
         while self._held() > self.budget:
-            if self.parked:
-                P = self.parked[-1]
-                if P["ckpt"]:
-                    del P["ckpt"][next(iter(P["ckpt"]))]
-                else:
-                    self.parked.pop()
-            else:
-                cand = [q for q in self.ckpt if q not in self.keep_pos][:-2]
-                if not cand:
+            refs = {}
+            for d in [self.ckpt] + [P["ckpt"] for P in self.parked]:
+                for v in d.values():
+                    refs[id(v)] = refs.get(id(v), 0) + 1
+            victim = None
+            for P in reversed(self.parked):
+                own = [q for q, v in P["ckpt"].items() if refs[id(v)] == 1]
+                if own:
+                    victim = (P["ckpt"], min(own))
                     break
-                del self.ckpt[cand[0]]
+            if victim is None:
+                cand = [q for q in self.ckpt if q not in self.keep_pos][:-2]
+                if cand:
+                    victim = (self.ckpt, cand[0])
+            if victim is not None:
+                del victim[0][victim[1]]
+            elif self.parked:
+                self._drop_parked()
+            else:
+                break
             dropped += 1
         if dropped:
             self.log("prompt cache: %d copies dropped to stay within %d MB (%d MB held)"
                      % (dropped, self.budget // 2 ** 20, self._held() // 2 ** 20))
 
+
+    def _victim(self):
+        """the index in self.parked of the conversation to drop: first one whose session has a newer parked
+        conversation (that session keeps its newest state), else the oldest. (A FlashState-style GreedyDual-Size
+        order was tried on 11-10: on 5,030 requests of three KindiBOOST lanes merged onto one server it read 17-25 %
+        more prompt tokens again than this order at the same budget, so it was not kept. tools/replay_park.py.)"""
+        newest = {}
+        for i, P in enumerate(self.parked):          # newest first
+            s = P.get("session")
+            if s is not None and s in newest:
+                return i
+            newest.setdefault(s, i)
+        return len(self.parked) - 1
+
+    def _drop_parked(self):
+        self.parked.pop(self._victim())
 
     def _restore(self, st):
         if self.slot is not None and self.slot.restore(st):
@@ -528,13 +815,15 @@ class Runner(object):
         if self.slot is not None and self.slot.pending():      # the parked copy keeps it: its host copy first
             self.slot.complete(self.slot.owner)
         self.parked = [P for P in self.parked if _lcp(P["tokens"], toks) < 0.9 * len(P["tokens"])]
-        del self.parked[self.park_max - 1:]                 # make room first: never two parked K/V copies at once
-        self.parked.insert(0, {
-            "tokens": toks, "ckpt": dict(self.ckpt), "kv_bytes": kvb,
-            "end": ([_host(m) for m in self.eng.M], [_host(c) for c in self.eng.conv]),
-            "K": [_host(k[:n]) for k in self.eng.Kc], "V": [_host(v[:n]) for v in self.eng.Vc]})
+        while len(self.parked) > self.park_max - 1:         # make room first: never two parked K/V copies at once
+            self._drop_parked()
+        P = {"tokens": toks, "ckpt": dict(self.ckpt), "kv_bytes": kvb, "session": self.session,
+             "end": ([_host(m) for m in self.eng.M], [_host(c) for c in self.eng.conv]),
+             "K": [_host(k[:n]) for k in self.eng.Kc], "V": [_host(v[:n]) for v in self.eng.Vc]}
+        self.parked.insert(0, P)
         del self.parked[self.park_max:]
-        self._enforce()
+        # no _enforce() here: the active dict still holds the same checkpoint copies, so nothing could be freed and
+        # the conversation just parked would go (issue #26). prepare() enforces after it trims the active dict.
 
     def _resume_in(self, P, T):
         L = _lcp(P["tokens"], T)
@@ -559,7 +848,7 @@ class Runner(object):
         self.ckpt = {p: v for p, v in P["ckpt"].items() if p <= pos}
 
     # ---- the request path
-    def prepare(self, T, boundary, opening_end=None, cancel=None):
+    def prepare(self, T, boundary, opening_end=None, cancel=None, session=None):
         """Make the engine state = T processed. Returns (greedy next token, tokens reused).
         boundary: where the generation prompt starts (checkpointed too).
         opening_end: where T's first message (system prompt + tools) ends. An opening is saved only when the two
@@ -567,6 +856,7 @@ class Runner(object):
         not the next turn of the same conversation, which always parts near its own end."""
         tp0 = time.time()
         self._tsave = 0.0
+        self._boundary = boundary if 0 < boundary < len(T) else None      # the end of the messages (turn_end)
         if self.slot is not None:
             self.slot.pause()
         if opening_end is None:
@@ -609,6 +899,7 @@ class Runner(object):
                 _free_device_pool()
             nS = len(self.tokens)
             L = _lcp(self.tokens, T)
+        self.session = session                    # the active conversation's session (kept when it is parked)
         if L == len(self.tokens) and L < len(T):
             start = L
         else:
@@ -626,7 +917,23 @@ class Runner(object):
                 start = 0
         for p in [p for p in self.ckpt if p > start]:
             del self.ckpt[p]
+        self._enforce()                           # after the trim (issue #26)
         hit = None if off else self.openings.best(T, start, len(T) - 1)
+        turn = None if off else self.turns.best(T, max(start, hit[1] if hit else 0), len(T) - 1)
+        if turn is not None:                      # a saved turn (after a restart) that goes further than any opening
+            try:
+                p, Ms, Cs = self.turns.load(turn[0])
+            except Exception as e:  # noqa: BLE001 - a missing or damaged turn: try the opening, else read the prompt
+                self.log("saved turn %s is not usable (%s)" % (turn[0], e))
+                self.turns.drop(turn[0])
+                self.eng.reset()
+                self.tokens, self.ckpt, start = [], {}, 0
+                hit = None if off else self.openings.best(T, 0, len(T) - 1)
+            else:
+                self.tokens = list(T[:p])
+                self.ckpt = {p: (Ms, Cs)}
+                self._turn_saved = list(T[:p])
+                start, hit = p, None
         if hit is not None:
             try:
                 p, Ms, Cs = self.openings.load(hit[0])
@@ -653,7 +960,8 @@ class Runner(object):
         pos = start
         while pos < len(T):
             if cancel is not None and cancel.is_set():
-                raise Cancelled("the client went away after %d of %d prompt tokens" % (pos - start, len(T) - start))
+                raise Cancelled("stopped after %d of %d prompt tokens (the client went away, or a background request yields)"
+                                % (pos - start, len(T) - start))
             if ck(pos):
                 self._save_ckpt(pos)
             if pos == len(T) - 1:
@@ -682,6 +990,30 @@ class Runner(object):
         """the server finished a request (KINDI_CKPT_VRAM: the newest checkpoint goes to host RAM now)"""
         if self.slot is not None:
             self.slot.idle()
+
+    def turn_end(self):
+        """after a request has been answered: queue the state for disk (saved turns). Runs on the engine thread
+        before the next request; the disk write itself runs in the background.
+
+        The state saved is the one at the end of the messages (the `boundary` checkpoint, before the generation
+        prompt), not at the end of the reply: the next request renders the reply again, and the chat template does
+        not render it with the same tokens (the generation prompt's empty think block, for one), so the reply's
+        end is never a start of the next prompt. The end of the messages always is. After a restart the next turn
+        reads the rendered reply and its new message from there."""
+        if not self.turns.on:
+            return
+        b = getattr(self, "_boundary", None)
+        st = self.ckpt.get(b) if b else None
+        if not (isinstance(st, tuple) and len(st) == 2 and b <= len(self.tokens)):
+            b, st = len(self.tokens), None             # no host checkpoint at the boundary: the engine's own state
+        toks = self.tokens[:b]
+        if b < self.turn_min or toks == self._turn_saved:
+            return
+        try:
+            self.turns.capture(toks, st)
+            self._turn_saved = list(toks)
+        except Exception as e:  # noqa: BLE001 - saving is a convenience; serving goes on
+            self.log("could not copy the turn for saving: %s" % e)
 
     def step(self, tok):
         nxt = self.eng.step(tok, len(self.tokens))

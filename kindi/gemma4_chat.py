@@ -20,6 +20,7 @@ def _template(model_path):
         env=Environment(undefined=ChainableUndefined,   # a missing key is false and empty, as in llama.cpp
                         autoescape=False,trim_blocks=True,lstrip_blocks=True)
         env.filters["tojson"]=lambda value,**kw: json.dumps(value,ensure_ascii=False,separators=(",",":"))
+        env.filters["items"]=lambda v: list(v.items()) if hasattr(v,"items") else []   # Jinja2 3.1's |items (image: 3.0)
         env.globals["raise_exception"]=_raise
         _compiled[model_path]=(env.from_string(template),token_list[bos] if 0<=bos<len(token_list) else "",
                                token_list[eos] if 0<=eos<len(token_list) else "")

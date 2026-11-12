@@ -148,7 +148,9 @@ def cmd_info(cfg, a):
     if os.path.exists(man):
         m = json.load(open(man))
         print("pack: %s - %s, from %s" % (cfg["pack"], m.get("model"), m.get("source_file")))
-        if m.get("backend") == "kindi_gemma4":
+        if m.get("backend") == "kindi_lightning":
+            print("backend: Kindi Lightning CUDA (Nemotron-H MoE), exact head")
+        elif m.get("backend") == "kindi_gemma4":
             print("backend: Kindi Gemma 4 CUDA")
             print("fast head: %s" % ("available" if os.path.exists(os.path.join(cfg["pack"],"head_clusters.npz"))
                                      else "not built (kindi fast-head)"))

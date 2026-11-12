@@ -173,8 +173,13 @@ def reserve(eng):
             tv = os.environ.get("KINDI_CHUNK_TILE", "")
             c["small"] = tv == "64" or (tv != "128" and cp.cuda.runtime.getDeviceProperties(s.card)["major"] < 5)
             c["GB"], c["GG"] = z(T * s.NV), z(T * s.NV)
+            if getattr(eng, "_dsp_want", False) and eng.W == 1:   # the DSpine drafter's target features (dspine.py)
+                from . import dspine as _dsp
+                c["FEAT"] = z(T * _dsp.NSLOT * D)
             c["QQ"], c["QD"] = cp.zeros(T * s.NH * HD, dtype=cp.int8), z(T * s.NH * HD // 32)
             prop = cp.cuda.runtime.getDeviceProperties(s.card)
+            # int8 prompt products need dp4a (sm_61+): KINDI_CHUNK_Q8=1 cannot turn them on for sm_60, where the
+            # fp16 prompt path (KINDI_P100_FP16_PROMPT) is the fast one (issue #22; docs/CARDS.md, Tesla P100)
             c["q8"] = os.environ.get("KINDI_CHUNK_Q8", "1") == "1" and prop["major"] * 10 + prop["minor"] >= 61
             if c["q8"] and not ctc:   # int8 activations (dp4a): XQ[k4][t], XS[group][t]
                 c["XQ"], c["XS"] = cp.zeros(T * work // 4, dtype=cp.uint32), z(T * work // 128)
@@ -402,6 +407,12 @@ def _build(s):
             gdn(il, last)
         if not last:
             ffn(il)
+            if "FEAT" in c:
+                from . import dspine as _dsp
+                if il in _dsp.LAYERS:            # the layer's output (h + Y) of every token, for the DSpine drafter
+                    from .spec import _Fn
+                    tadd(_Fn(_dsp.feat_kernel()), (D + 255) // 256, (256,),
+                         (st["h"], Y, c["FEAT"], i32(D), i32(1), i32(_dsp.LAYERS.index(il)), i32(_dsp.NSLOT)), (D, D))
     return P
 
 
@@ -511,6 +522,11 @@ def feed(eng, toks, pos):
                     for s in cs:
                         with cp.cuda.Device(s.card):
                             run_core(s, s.plan_chunk.cores[j], pos + i, n)
+            dsp = getattr(eng, "dspine", None)
+            if dsp is not None:
+                ctx_set(cs[0].ctxh)
+                with cp.cuda.Device(cs[0].card):
+                    dsp.ingest(cs[0].chunk["FEAT"], pos + i, n)
             i += n
     finally:
         ctx_set(prev)

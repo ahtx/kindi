@@ -1,4 +1,4 @@
-Kindi 0.4.0 - third-party notices
+Kindi 0.6.0 - third-party notices
 
 Kindi is licensed under the GNU Affero General Public License v3.0 (see LICENSE). Commercial licenses are
 available (see COMMERCIAL-LICENSE.md).
@@ -13,6 +13,26 @@ Ternary-Bonsai-2-2B (model weights, GGUF)          Apache License 2.0
   `kindi convert` re-lays out the weights of a file you download; it does not alter them. If you redistribute a
   converted pack, the Apache License 2.0 terms of the model apply to it.
 
+Nemotron 3.5 Lightning 30B-A3B, ternary            OpenMDW License 1.1 (https://openmdw.ai/license/1-1/)
+(model weights, GGUF)
+  NVIDIA Nemotron 3.5 Lightning 30B-A3B (NVIDIA). Ternary version by Nota AI. GGUF conversion by boro64.
+  https://huggingface.co/boro64/Ternary-Nemotron-3.5-Lightning-30B-A3B-GGUF
+  Kindi reads the weights from the file as it is. It does not convert or alter them.
+
+Qwen3.8-27B-DSpine-b16 (drafter weights)            Apache License 2.0
+  Tencent. https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16
+  The installer downloads the weights for the 27B on tensor-core cards. Kindi reads them as they are.
+
+DeepSeek-V4.1-Flash (model weights, GGUF, the MTP   MIT License (deepseek-ai/DeepSeek-V4.1-Flash-1017)
+stages for DSpark and encoding/encoding.py)
+  DeepSeek. GGUF conversion (UD-Q4_K_XL) by unsloth.
+  https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+  https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF
+  tools/install_dsv41.sh downloads the files. Kindi reads the weights as they are.
+
+Kindi Bridge (bridge/ in the release archive)       GNU AGPL v3.0, the same as Kindi
+  Amir Husain. The full source is in bridge/.
+
 CuPy                                                MIT License (Preferred Networks, Inc. and Preferred Infrastructure)
 NumPy                                               BSD 3-Clause License (NumPy Developers)
 FastAPI                                             MIT License (Sebastian Ramirez)
@@ -20,6 +40,11 @@ Uvicorn                                             BSD 3-Clause License (Encode
 Pydantic                                            MIT License (Samuel Colvin and contributors)
 NVIDIA CUDA Toolkit 10.2                            NVIDIA CUDA Toolkit End User License Agreement
                                                     (downloaded from NVIDIA when the Docker image is built)
+
+Contributor credit: the Nemotron 3.5 Lightning backend was started by the work of slavalevski-tech
+(github.com/slavalevski-tech/kindi), who first ran this model on Kindi, on a Quadro K6000, and shared that backend
+under the Kindi Contributor License Agreement 1.1. That work set the scope of the backend. The code of the Kindi
+backend is a new implementation (docs/dev/LIGHTNING-CLEANROOM.md). Thank you.
 
 Interoperability: Kindi reads the GGUF file format and reproduces the numerical behaviour and the tokenizer of
 llama.cpp (MIT License, the ggml authors) for this model, so that its output can be checked against llama.cpp's. The

@@ -16,3 +16,6 @@ __pycache__/
 *.log
 .vscode/
 .idea/
+
+# receipts and logs of tools/ship_images.sh
+ship-images/

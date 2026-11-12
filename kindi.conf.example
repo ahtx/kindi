@@ -22,6 +22,12 @@ checkpoint_every = 256
 prefix_max = 8
 prefix_min = 512
 park_max = 3
+# saved turns: the state at the end of each turn is written to disk in the background, so that a restart resumes
+# a conversation where it ended (turn_save = 0: off)
+turn_save = 1
+turn_keep = 4
+turn_disk_mb = 4096
+turn_min = 64
 
 # --- generation defaults (a request's own values win)
 max_tokens = 1024

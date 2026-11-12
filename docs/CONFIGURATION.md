@@ -36,6 +36,7 @@ Kindi reads its settings in this order - later sources win:
 | `ctx` | `24576` | context length in tokens (prompt + answer). For GPU memory, see the notes below the table |
 | `head` | `exact` | `exact` = full output head (token-exact with llama.cpp); `fast` = shortlist head (needs `kindi fast-head`). `kindi head exact\|fast` overrides it at run time |
 | `fast_clusters` | `256` | clusters the fast head scores exactly (of 1,024). Fewer is faster and less exact (see the notes below the table) |
+| `kv_cache` | `auto` | AH-Nanbeige4.3-33B only: the K/V cache, `auto`, `f16` or `q8_0` (`KINDI_KV_CACHE=q8_0`). `q8_0` keeps K and V as int8 with an fp16 scale for each 32 values: half the memory (64K tokens: about 6.6 GiB instead of 13 GiB), so the 33B gets a 64K context on one 24 GB card. Needs compute capability 6.1 or later. `auto` uses `f16` when the model and its f16 cache fit on the cards at `ctx`, and `q8_0` when they do not. `kindi verify` checks `q8_0` against llama.cpp: the tokens that agree with the f16 reference must be at least as many as llama.cpp's own q8_0 cache keeps (on 2x RTX 3080: Kindi 475, llama.cpp 471, of 586) |
 
 Notes:
 
@@ -51,6 +52,33 @@ Notes:
 | `prefix_max` | `8` | saved openings kept on disk (each ~12 KiB per token + 19 MB; ~80 MB for a 5,000-token opening) |
 | `prefix_min` | `512` | the shortest opening that Kindi saves |
 | `park_max` | `3` | other conversations kept in host RAM (each: its checkpoints + its K/V cache) |
+| `checkpoint_budget_mb` | `0` | host RAM for the checkpoints and the parked conversations; `0` = 20 % of the RAM. When the cache is full, Kindi drops copies in this order: the checkpoints that only a parked conversation holds, the oldest checkpoints of the active conversation, then whole parked conversations (the oldest first) |
+| `turn_save` | `1` | save the state at the end of each turn to disk, in the background, so that after a restart a conversation resumes where its last turn ended. `0` = off |
+| `turn_keep` | `4` | saved turns: the number of conversations kept on disk (the newest turn of each) |
+| `turn_disk_mb` | `4096` | saved turns: the disk space that they can use. The K/V rows are in blocks of 1,024 tokens that the turns of one conversation share, so a new turn writes only its new rows and its recurrent state |
+| `turn_min` | `64` | saved turns: the shortest conversation that Kindi saves (tokens) |
+
+### API for agent harnesses
+
+| endpoint | |
+|---|---|
+| `GET /v1/models` | the model and its real context: `context_length`, `max_model_len`, `max_context_length` and `meta.n_ctx` |
+| `POST /v1/tokenize` (also `/tokenize`) | `{"content": text}` counts plain text. `{"messages": [...], "tools": [...]}` counts the whole chat prompt, as the chat endpoint builds it. The answer is `count`, `tokens`, `max_model_len` and `fits` |
+| `POST /v1/detokenize` (also `/detokenize`) | `{"tokens": [...]}` gives the text (`prompt` and `content`) |
+| `POST /v1/chat/completions` with `"dry_run": true` | the exact `usage.prompt_tokens` and `fits`, without generation |
+
+A prompt that does not fit gets HTTP 400 at once, also while another request uses the engine. The body is
+`{"error": {"code": "context_length_exceeded", "type": "invalid_request_error", "message": "This model's maximum
+context length is ..."}}`, OpenAI's wording, so that litellm and the OpenAI SDKs report a context-window error and
+the harness shortens the conversation. Note: harnesses that use litellm (terminus-2, hermes) do not read
+`/v1/models`. Give them the window yourself (for example harbor's `model_info` with `max_input_tokens`), or they
+assume a much larger one.
+
+While a stream waits for the engine or reads a long prompt, Kindi sends an SSE comment every 10 s
+(`KINDI_KEEPALIVE_S`): `: kindi progress {"phase": "queued"}`, then `{"phase": "reading prompt", "read": ...,
+"to_read": ..., ...}`. SSE clients ignore comments. A non-streaming request can send `"kindi_keepalive": true` (or
+the header `X-Kindi-Keepalive: 1`) to get a space every 10 s before its JSON answer. JSON allows the spaces, but
+the status is then 200 before the answer is known, so an error comes as an `{"error": ...}` body with status 200.
 
 ### Generation defaults
 
@@ -81,7 +109,7 @@ These variables have no config key. Use them to test or to compare.
 | `KINDI_DENSE_SPACING` | `256` | the spacing of the dense checkpoints in an agent opening; `0` = none |
 | `KINDI_STREAM_LOAD` | `1` | the plan engine loads the cached 5-trit weights in 256 MB parts |
 | `KINDI_MEM_RESERVE_MB` | `96` (`32` for the plan engine) | GPU memory that the context fit keeps free |
-| `KINDI_FD` | `0` | `1` = the split flash-decode attention of the 27B on one card (with `KINDI_TC=1`) |
+| `KINDI_FD` | `0` (`1` with drafting) | `1` = the split flash-decode attention of the 27B on one card (with `KINDI_TC=1`). When drafting is on (`KINDI_SPEC` set) with `KINDI_TC=1` and `KINDI_FD` is not set, Kindi uses `1`: with `0`, a drafted answer can differ from plain decoding at near-ties |
 | `KINDI_TC_DP4A` | `0` | `1` = the Pascal dp4a kernels of the `KINDI_TC=1` path (tcp.cu) on a newer card, for tests. On sm_61 they are always used |
 | `KINDI_D1` | `0` (`1` on Pascal) | `1` = the one-pass RMS fold (Hadamard block 512 or 1024, with `KINDI_TC=1`) |
 | `KINDI_ATT_TC` | `0` | `1` = the attention of the prompt chunks on the tensor cores (sm_80 and later, with `KINDI_TC=1`) |

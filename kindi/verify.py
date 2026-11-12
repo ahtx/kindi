@@ -74,6 +74,9 @@ def run(cfg, log=print):
     if man.get("backend") == "kindi_nanbeige":
         from .nanbeige_cli import verify
         return verify(cfg, man, log=log)
+    if man.get("backend") == "kindi_lightning":
+        from .lightning_cli import verify
+        return verify(cfg, man, log=log)
     rp = reference_for(pack)
     if rp is None:
         log("no llama.cpp reference for this model in this version of Kindi")

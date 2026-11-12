@@ -1,4 +1,4 @@
-"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking); a stream then carries the thinking as\ndelta.reasoning_content. thinking_budget_tokens (or thinking_budget) caps it: at the budget the server closes the\nthinking itself and the model goes on to answer. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
+"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model and its real context (context_length, max_model_len, meta.n_ctx)\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls;\n                               dry_run=true -> the exact prompt_tokens, no generation\n  POST /v1/tokenize            {"content": text} or {"messages": [...], "tools": [...]} -> count, tokens\n  POST /v1/detokenize          {"tokens": [...]} -> text\n\nA prompt that does not fit is an HTTP 400 (code context_length_exceeded, OpenAI's wording) before the request waits\nfor the engine. A stream gets an SSE comment ": kindi progress {...}" every KINDI_KEEPALIVE_S (10) seconds while\nnothing else goes out; kindi_keepalive=true gives a non-streaming request spaces before its JSON. After each answer\nthe end-of-turn state is saved to disk in the background (turn_save, see cache.Turns).\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking); a stream then carries the thinking as\ndelta.reasoning_content. thinking_budget_tokens (or thinking_budget) caps it: at the budget the server closes the\nthinking itself and the model goes on to answer. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
 import asyncio
 import codecs
 import concurrent.futures
@@ -17,6 +17,22 @@ from .sampling import Sampler
 
 
 THINK_CLOSE = "\n\nI have thought enough; time to act.\n</think>\n\n"
+
+# while a long prompt is read nothing else is sent: an SSE comment this often keeps the stream alive and tells the
+# client how far the read is (Node's fetch, which pi uses, drops a body that is silent for 300 s)
+KEEPALIVE_S = float(os.environ.get("KINDI_KEEPALIVE_S", "10"))
+
+
+class ContextOverflow(OverflowError):
+    """The prompt does not fit the context. The message is OpenAI's wording: client libraries (litellm, which the
+    terminus-2 agent harness uses, and the OpenAI SDKs) recognise it as a context-window error and shorten the
+    conversation in place of sending the same request again."""
+
+    def __init__(self, n, ctx, reserve=1):
+        self.n, self.ctx = int(n), int(ctx)
+        OverflowError.__init__(self, "This model's maximum context length is %d tokens. However, your messages "
+                               "resulted in %d tokens (%d are needed for the reply to start). Please reduce the length "
+                               "of the messages." % (self.ctx, self.n, self.n + reserve))
 
 
 def _looping(gen, min_span=240):
@@ -74,6 +90,11 @@ class Kindi(object):
             self.variant = "nanbeige"
             self.nanbeige = NanbeigeBackend(man, cfg, log=log)
             self.eng, self.tok, self.runner, self.sample = self.nanbeige.eng, self.nanbeige.tok, None, None
+        elif man.get("backend") == "kindi_lightning":     # Nemotron-H MoE GGUF (Nemotron 3.5 Lightning 30B-A3B)
+            from .lightning_gen import LightningBackend
+            self.variant = "lightning"
+            self.nanbeige = LightningBackend(man, cfg, log=log)   # (the same backend interface as Nanbeige's)
+            self.eng, self.tok, self.runner, self.sample = self.nanbeige.eng, self.nanbeige.tok, None, None
         elif self.native:
             from .gemma4 import Engine as NativeEngine
             from .gemma4_tokenizer import Tok as GemmaTok
@@ -98,7 +119,7 @@ class Kindi(object):
             self.tok = Tok(self.eng.vocab, os.path.join(pack, "merges.txt"))
             self.runner = Runner(self.eng, cfg, self.pack_id, log, progress=self.busy)
             self.sample = Sampler(self.eng)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()        # reentrant: a background request runs waiting chat requests inside its own turn
         self.stats = {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
         self.t0 = time.time()
 
@@ -161,8 +182,8 @@ class Kindi(object):
         ids=self.tok.encode(prompt)
         if not ids: raise ValueError("Gemma 4 chat template produced an empty prompt")
         if len(ids)>=self.eng.ctx:
-            raise OverflowError("the Gemma 4 prompt has %d tokens; context is %d"%(len(ids),self.eng.ctx))
-        if req.get("_kindi_check"): return                # check_prompt(): the prompt is valid, nothing to run
+            raise ContextOverflow(len(ids),self.eng.ctx)
+        if req.get("_kindi_check"): return ids            # check_prompt(): the prompt is valid, nothing to run
         self.eng.shortlist=cfg["fast_clusters"] if self.head_mode()=="fast" and self.eng.fast_centroids is not None else 0
         max_new=int(req.get("max_tokens") or req.get("max_completion_tokens") or cfg["max_tokens"])
         max_new=max(1,min(max_new,self.eng.ctx-len(ids)))
@@ -283,21 +304,77 @@ class Kindi(object):
                     "gen_s":round(elapsed,2),"gen_tok_s":round(len(generated)/elapsed,2)}}
 
     def check_prompt(self, req):
-        """Renders and counts the prompt of a request without the GPU or the lock. Raises OverflowError (the prompt does
-        not fit the context) or ValueError (the prompt is not valid), so that a streaming request gets an HTTP 400
-        before its first byte."""
-        for _ in self.generate(dict(req, _kindi_check=True)):
-            pass
+        """Renders and counts the prompt of a request without the GPU or the lock, and returns its token ids. Raises
+        ContextOverflow (the prompt does not fit the context) or ValueError (the prompt is not valid), so that a
+        request gets an HTTP 400 at once: before the first byte of a stream, and before it waits for the engine."""
+        g = self.generate(dict(req, _kindi_check=True))
+        try:
+            while True:
+                next(g)
+        except StopIteration as e:
+            return list(e.value or [])
+
+    def encode_text(self, text, special=True):
+        """the token ids of plain text (no chat template)"""
+        try:
+            return list(self.tok.encode(text, add_bos=special))     # SentencePiece tokenizers (Nanbeige)
+        except TypeError:
+            return list(self.tok.encode(text))
+
+    def decode_ids(self, ids):
+        dec = getattr(self.tok, "decode", None)
+        if dec is not None:
+            return dec([int(i) for i in ids])
+        return b"".join(self.tok.decode_bytes(int(i)) for i in ids).decode("utf-8", "replace")
+
+    def after_turn(self, locked=False):
+        """after a request has been answered, on the engine thread: queue the end-of-turn state for disk.
+        locked: the caller holds self.lock already (the stream generator)."""
+        r = getattr(self, "runner", None)
+        if r is None or not hasattr(r, "turn_end"):
+            return
+        if locked:
+            r.turn_end()
+        else:
+            with self.lock:
+                r.turn_end()
+
+    def drafting(self):
+        """speculative drafting, for /health (Kindi Bridge shows it): on or off, the method, and the last request's
+        drafts and how many were accepted"""
+        last = getattr(self, "last_spec", None)
+        out = {"enabled": False, "method": None, "drafter": None, "last": None}
+        if self.nanbeige is not None:
+            m = [n for n, on in (("lookup", int(self.cfg.get("lookup") or 0) > 0),
+                                 ("mtp", bool(self.cfg.get("mtp_head")))) if on]
+            out.update(enabled=bool(m), method="+".join(m) or None)
+        elif not self.native and hasattr(self.eng, "spec_begin"):
+            mode = os.environ.get("KINDI_SPEC", "0")
+            if mode not in ("0", "", "off"):
+                dr = getattr(self.eng, "drafter", None)
+                out.update(enabled=True, method=getattr(self.eng, "spec_mode", None) or mode,
+                           drafter=getattr(getattr(dr, "eng", None), "pack", None) or (type(dr).__name__ if dr else None))
+        if last and last.get("drafted"):
+            out["last"] = {"passes": last.get("passes", 0), "drafted": last["drafted"], "accepted": last.get("accepted", 0),
+                           "acceptance": round(last.get("accepted", 0) / float(last["drafted"]), 3)}
+        return out
+
+    def progress(self):
+        """the request being served: phase, tokens reused, read and to read, generated"""
+        b = self.busy
+        if not b["active"]:
+            return None
+        return {"phase": b["phase"], "elapsed_s": round(time.time() - b["started"]),
+                "prompt_tokens": b["prompt_tokens"], "reused": b["cached"], "read": b["read"],
+                "to_read": max(0, b["prompt_tokens"] - b["cached"]), "generated": b["generated"]}
 
     def generate(self, req, cancel=None):
         """Yields ("text", piece) while generating, then ("done", info). cancel: a threading.Event set when the
         client disconnects (prompt reading and generation stop at the next token)."""
         if self.nanbeige is not None:
-            yield from self.nanbeige.generate(self, req, cancel)
-            return
+            return (yield from self.nanbeige.generate(self, req, cancel))
         if self.native:
-            yield from self._generate_gemma(req,cancel)
-            return
+            return (yield from self._generate_gemma(req, cancel))
         cfg = self.cfg
         messages = req.get("messages") or []
         tools = req.get("tools") or None
@@ -328,9 +405,9 @@ class Kindi(object):
         T = Tb + self.tok.encode(gp)
         ctx = self.eng.ctx
         if len(T) + 1 >= ctx:
-            raise OverflowError("the prompt has %d tokens; the context is %d" % (len(T), ctx))
+            raise ContextOverflow(len(T), ctx)
         if req.get("_kindi_check"):                       # check_prompt(): the prompt is valid, nothing to run
-            return
+            return T
         fast = self.head_mode() == "fast"
         if fast and self.eng.hsl is None:
             fast = False
@@ -343,7 +420,8 @@ class Kindi(object):
         try:
             im_end = 248046                                   # <|im_end|> closes the first message
             opening_end = T.index(im_end) + 1 if im_end in T else len(T)
-            nxt, cached = self.runner.prepare(T, len(Tb), opening_end, cancel)
+            session = req.get("_kindi_session") or req.get("kindi_session") or req.get("user")
+            nxt, cached = self.runner.prepare(T, len(Tb), opening_end, cancel, session=session)
         except Cancelled as e:
             self.busy["active"] = False
             self.log("stopped: %s" % e)
@@ -356,10 +434,10 @@ class Kindi(object):
         self.busy["phase"] = "generating"
         pen = rp != 1.0 and rlast != 0
         if hasattr(self.eng, "spec_begin"):
-            if pen or (min_p > 0 and temperature > 0):        # the speculative paths do not apply these: no drafts
+            if pen:                                            # the speculative paths do not apply it: no drafts
                 self.eng.spec_begin(False)
-            else:
-                self.eng.spec_begin(temperature <= 0, temperature, top_p, top_k, rng)   # speculative decoding (KINDI_SPEC)
+            else:                                              # speculative decoding (KINDI_SPEC), min-p included
+                self.eng.spec_begin(temperature <= 0, temperature, top_p, top_k, rng, min_p)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         text, gen, finish = "", [], "length"
         # while thinking, pieces go out as ("reasoning", ...) - the last 8 characters are held back in case they are
@@ -436,6 +514,8 @@ class Kindi(object):
             self.busy["active"] = False
             if hasattr(self.runner, "idle"):
                 self.runner.idle()                            # (KINDI_CKPT_VRAM: checkpoint host copies now)
+        if sp:
+            self.last_spec = dict(sp)
         if sp and sp["passes"]:
             self.log("speculative: %d tokens in %d passes, %d of %d drafted tokens accepted" % (
                 len(gen), sp["passes"], sp["accepted"], sp["drafted"]))
@@ -467,6 +547,114 @@ class Kindi(object):
 # the parked conversations hold the memory. One thread makes one handle, at its first use, as one request did before.
 # (A handle made before the engine would load the cuBLAS code ahead of the context fit and cost small cards context.)
 GPU_THREAD = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="kindi-gpu")
+
+# priority classes (0.6.0): every request names a class with "kindi_priority" (or the header X-Kindi-Priority).
+# chat (the default) goes before background (cron jobs, batch work, agents' side work). A background request that
+# is reading its prompt stops between two chunks when a chat request arrives; the chat request runs, and the
+# background request then goes on from the prompt cache (its tokens read so far stay in the cache, or parked).
+PRIO_TURN, PRIO_CHAT, PRIO_BACKGROUND = -1, 0, 1
+_PRIO_NAMES = {"chat": PRIO_CHAT, "interactive": PRIO_CHAT, "high": PRIO_CHAT,
+               "background": PRIO_BACKGROUND, "cron": PRIO_BACKGROUND, "batch": PRIO_BACKGROUND, "low": PRIO_BACKGROUND}
+
+
+def priority_of(req, headers=None):
+    v = req.get("kindi_priority") or (headers.get("x-kindi-priority") if headers is not None else None) or "chat"
+    return _PRIO_NAMES.get(str(v).strip().lower(), PRIO_CHAT)
+
+
+class Scheduler(object):
+    """The engine jobs in priority order on the one engine thread: each task on GPU_THREAD runs the best job waiting
+    at that moment (the lowest priority number, then the oldest)."""
+
+    def __init__(self):
+        import heapq
+        self.heapq, self.heap, self.lk, self.seq = heapq, [], threading.Lock(), 0
+
+    def submit(self, fn, prio=PRIO_CHAT):
+        f = concurrent.futures.Future()
+        with self.lk:
+            self.heapq.heappush(self.heap, (prio, self.seq, fn, f))
+            self.seq += 1
+        GPU_THREAD.submit(self._run_one)
+        return f
+
+    def _pop(self, max_prio=None):
+        with self.lk:
+            if not self.heap or (max_prio is not None and self.heap[0][0] > max_prio):
+                return None
+            return self.heapq.heappop(self.heap)
+
+    def _run(self, job):
+        _, _, fn, f = job
+        if not f.set_running_or_notify_cancel():
+            return
+        try:
+            f.set_result(fn())
+        except BaseException as e:  # noqa: BLE001 - the waiting request reports it
+            f.set_exception(e)
+
+    def _run_one(self):
+        job = self._pop()
+        if job is not None:
+            self._run(job)
+
+    def waiting(self, max_prio=PRIO_CHAT):
+        """jobs waiting with this priority or a better one"""
+        with self.lk:
+            return sum(1 for j in self.heap if j[0] <= max_prio)
+
+    def counts(self):
+        with self.lk:
+            return {"chat": sum(1 for j in self.heap if j[0] == PRIO_CHAT),
+                    "background": sum(1 for j in self.heap if j[0] == PRIO_BACKGROUND)}
+
+    def run_waiting(self, max_prio=PRIO_CHAT):
+        """run the waiting jobs of this priority or better now, on this thread (a background request yields)"""
+        n = 0
+        while True:
+            job = self._pop(max_prio)
+            if job is None:
+                return n
+            self._run(job)
+            n += 1
+
+
+SCHED = Scheduler()
+
+
+class _Yield(object):
+    """the cancel event of a background request: also set while it reads its prompt and a chat request waits"""
+
+    def __init__(self, cancel, K):
+        self.cancel, self.K, self.fired = cancel, K, False
+
+    def is_set(self):
+        if self.cancel.is_set():
+            return True
+        if self.K.busy.get("phase") in ("matching cache", "reading prompt", "prompt") and SCHED.waiting(PRIO_CHAT):
+            self.fired = True
+            return True
+        return False
+
+    def set(self):
+        self.cancel.set()
+
+
+def run_generate(K, req, cancel, prio):
+    """K.generate with the priority classes: a background request that yields to chat requests runs them here, then
+    starts again (from the prompt cache). Yields what K.generate yields."""
+    while True:
+        c = _Yield(cancel, K) if prio >= PRIO_BACKGROUND else cancel
+        done = False
+        for item in K.generate(req, c):
+            if item[0] == "done":
+                done = True
+            yield item
+        if done or cancel.is_set() or not getattr(c, "fired", False):
+            return
+        K.yields = getattr(K, "yields", 0) + 1
+        K.log("a background request yields to %d chat request(s) while it reads its prompt" % SCHED.waiting(PRIO_CHAT))
+        SCHED.run_waiting(PRIO_CHAT)
 
 
 def _after_engine_error(K, e):
@@ -518,20 +706,69 @@ def create_app(cfg, log=print):
             free, total = K.cp.cuda.runtime.memGetInfo()
         b = K.busy
         busy = None
-        if b["active"] and K.lock.locked():
+        if b["active"]:
             busy = {"phase": b["phase"], "elapsed_s": round(time.time() - b["started"]),
                     "prompt_tokens": b["prompt_tokens"], "reused": b["cached"],
                     "prompt_read": "%d/%d" % (b["read"], b["prompt_tokens"] - b["cached"]), "generated": b["generated"]}
         return {"ok": True, "kindi": __version__, "commit": COMMIT, "model": model_id, "ctx": K.eng.ctx, "head": K.head_active(),
-                "uptime_s": round(time.time() - K.t0), "busy": busy, "stats": K.stats,
+                "uptime_s": round(time.time() - K.t0), "busy": busy, "stats": K.stats, "drafting": K.drafting(),
+                "queue": dict(SCHED.counts(), yields=getattr(K, "yields", 0)),
                 "gpu_free_mib": round(free / 1048576.0), "gpu_total_mib": round(total / 1048576.0)}
+
+    def _overflow(e):
+        return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error", "param": "messages",
+                                       "code": "context_length_exceeded"}}, status_code=400)
 
     @app.get("/v1/models")
     def models(request: Request):
         if not _auth(request):
             return _err(401, "invalid API key", "authentication_error")
+        ctx = K.eng.ctx
+        # the real window under every name that agent harnesses read (vLLM, llama.cpp, LM Studio, OpenRouter style)
         return {"object": "list", "data": [{"id": model_id, "object": "model", "created": int(K.t0),
-                                            "owned_by": "kindi", "context_length": K.eng.ctx}]}
+                                            "owned_by": "kindi", "context_length": ctx, "max_model_len": ctx,
+                                            "max_context_length": ctx, "meta": {"n_ctx": ctx}}]}
+
+    async def _tokenize(request: Request):
+        if not _auth(request):
+            return _err(401, "invalid API key", "authentication_error")
+        try:
+            req = await request.json()
+        except Exception:  # noqa: BLE001
+            return _err(400, "the body is not JSON")
+        ctx = K.eng.ctx
+        try:
+            if req.get("messages") is not None:   # a chat request: the whole prompt, as the chat endpoint builds it
+                ids = await asyncio.get_event_loop().run_in_executor(None, K.check_prompt, dict(req, stream=False))
+            else:
+                text = req.get("content", req.get("prompt"))
+                if not isinstance(text, str):
+                    return _err(400, "send content (text) or messages")
+                ids = K.encode_text(text, req.get("add_special_tokens", True) is not False)
+        except ContextOverflow as e:              # counting still works: report the count and that it does not fit
+            return {"count": e.n, "max_model_len": ctx, "fits": False, "tokens": []}
+        except ValueError as e:
+            return _err(400, str(e))
+        out = {"count": len(ids), "max_model_len": ctx, "fits": len(ids) + 1 < ctx}
+        if req.get("return_tokens", True) is not False:
+            out["tokens"] = ids
+        return out
+
+    async def _detokenize(request: Request):
+        if not _auth(request):
+            return _err(401, "invalid API key", "authentication_error")
+        try:
+            req = await request.json()
+            ids = [int(i) for i in req.get("tokens") or []]
+        except Exception:  # noqa: BLE001
+            return _err(400, "send tokens: a list of token ids")
+        text = K.decode_ids(ids)
+        return {"prompt": text, "content": text}
+
+    app.add_api_route("/tokenize", _tokenize, methods=["POST"])
+    app.add_api_route("/v1/tokenize", _tokenize, methods=["POST"])
+    app.add_api_route("/detokenize", _detokenize, methods=["POST"])
+    app.add_api_route("/v1/detokenize", _detokenize, methods=["POST"])
 
     @app.post("/v1/chat/completions")
     async def completions(request: Request):
@@ -542,6 +779,25 @@ def create_app(cfg, log=print):
         except Exception:  # noqa: BLE001
             return _err(400, "the body is not JSON")
         cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
+        # every request is counted before it waits for the engine: a prompt that does not fit gets its HTTP 400 at
+        # once (a queued request used to wait for the request ahead of it, then fail), and a dry run ends here
+        dry = bool(req.get("dry_run") or req.get("kindi_dry_run"))
+        try:
+            ids = await asyncio.get_event_loop().run_in_executor(None, K.check_prompt, req)
+        except ContextOverflow as e:
+            if dry:
+                return {"object": "kindi.prompt_count", "model": model_id, "fits": False, "max_model_len": K.eng.ctx,
+                        "usage": {"prompt_tokens": e.n, "completion_tokens": 0, "total_tokens": e.n}}
+            return _overflow(e)
+        except ValueError as e:
+            return _err(400, str(e))
+        except Exception:  # noqa: BLE001 - anything else: the request itself reports it
+            ids = None
+        if dry:
+            n = len(ids or [])
+            return {"object": "kindi.prompt_count", "model": model_id, "fits": n + 1 < K.eng.ctx,
+                    "max_model_len": K.eng.ctx, "usage": {"prompt_tokens": n, "completion_tokens": 0,
+                                                          "total_tokens": n}}
 
         def chunk(delta, finish=None, usage=None):
             d = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_id,
@@ -551,24 +807,24 @@ def create_app(cfg, log=print):
             return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
 
         cancel = threading.Event()
+        mine = {"started": False}             # this request holds the engine (else it waits behind another one)
+        prio = priority_of(req, request.headers)
+        if request.headers.get("x-kindi-session"):
+            req["_kindi_session"] = request.headers["x-kindi-session"]      # the conversation this request belongs to
+
+        def progress_note():
+            if not mine["started"]:
+                return {"phase": "queued"}
+            return K.progress() or {"phase": "finishing"}
 
         if req.get("stream"):
-            # an oversized or invalid prompt is an HTTP 400 now: after the first byte the status is always 200
-            try:
-                await asyncio.get_event_loop().run_in_executor(None, K.check_prompt, req)
-            except OverflowError as e:
-                return _err(400, str(e), "context_length_exceeded")
-            except ValueError as e:
-                return _err(400, str(e))
-            except Exception:  # noqa: BLE001 - anything else: the stream reports it
-                pass
-
             def sse():
                 with K.lock:
+                    mine["started"] = True
                     yield chunk({"role": "assistant", "content": ""})
                     held, in_call = "", False
                     try:
-                        for kind, val in K.generate(req, cancel):
+                        for kind, val in run_generate(K, req, cancel, prio):
                             if kind == "reasoning":
                                 yield chunk({"reasoning_content": val})
                             elif kind == "text":
@@ -599,13 +855,16 @@ def create_app(cfg, log=print):
                                 inc = (req.get("stream_options") or {}).get("include_usage")
                                 yield chunk({}, info["finish"], info["usage"] if inc else None)
                     except OverflowError as e:
-                        yield "data: " + json.dumps({"error": {"message": str(e), "type": "context_length_exceeded"}}) + "\n\n"
+                        yield "data: " + json.dumps({"error": {"message": str(e), "type": "invalid_request_error",
+                                                               "code": "context_length_exceeded"}}) + "\n\n"
                     except ValueError as e:
                         yield "data: " + json.dumps({"error": {"message": str(e), "type": "invalid_request_error"}}) + "\n\n"
                     except Exception as e:
                         yield "data: " + json.dumps({"error": {"message": "kindi: %s" % e, "type": "server_error"}}) + "\n\n"
                         _after_engine_error(K, e)
                     yield "data: [DONE]\n\n"
+                    if not cancel.is_set():
+                        K.after_turn(locked=True)     # the client has its answer; the next request waits for this
             async def relay():
                 # the generator runs in a worker thread; if the client disconnects, Starlette cancels this
                 # coroutine, the finally sets `cancel`, and the engine stops at its next token
@@ -619,15 +878,16 @@ def create_app(cfg, log=print):
                             loop.call_soon_threadsafe(q.put_nowait, item)
                     finally:
                         loop.call_soon_threadsafe(q.put_nowait, END)
-                fut = loop.run_in_executor(GPU_THREAD, pump)
+                fut = asyncio.wrap_future(SCHED.submit(pump, prio))
                 try:
                     while True:
-                        # while a long prompt is read, nothing else is sent: an SSE comment every 15 s keeps the
-                        # stream alive (Node's fetch, which pi uses, drops a body that is silent for 300 s)
+                        # an SSE comment every KEEPALIVE_S while nothing else is sent (waiting in the queue, reading
+                        # a long prompt): it keeps the stream alive and says how far the read is. SSE clients
+                        # ignore comment lines.
                         try:
-                            item = await asyncio.wait_for(q.get(), timeout=15)
+                            item = await asyncio.wait_for(q.get(), timeout=KEEPALIVE_S)
                         except asyncio.TimeoutError:
-                            yield ": keep-alive\n\n"
+                            yield ": kindi progress " + json.dumps(progress_note()) + "\n\n"
                             continue
                         if item is END:
                             break
@@ -639,13 +899,65 @@ def create_app(cfg, log=print):
 
         def run():
             with K.lock:
+                mine["started"] = True
                 info = None
-                for kind, val in K.generate(req, cancel):
+                for kind, val in run_generate(K, req, cancel, prio):
                     if kind == "done":
                         info = val
                 return info
+
+        def answer(info):
+            msg = {"role": "assistant",
+                   "content": info["content"] if (info["content"] or not info["tool_calls"]) else None}
+            if info["tool_calls"]:
+                msg["tool_calls"] = info["tool_calls"]
+            if info["reasoning"]:
+                msg["reasoning_content"] = info["reasoning"]
+            choice = {"index": 0, "message": msg, "finish_reason": info["finish"]}
+            if info.get("logprobs") is not None:
+                choice["logprobs"] = {"content": info["logprobs"]}
+            return {"id": cid, "object": "chat.completion", "created": created, "model": model_id,
+                    "choices": [choice], "usage": info["usage"], "timing": info["timing"]}
+
+        def failed(e):
+            """(status, body) of a request that raised"""
+            if isinstance(e, OverflowError):
+                return 400, {"error": {"message": str(e), "type": "invalid_request_error", "param": "messages",
+                                       "code": "context_length_exceeded"}}
+            if isinstance(e, ValueError):
+                return 400, {"error": {"message": str(e), "type": "invalid_request_error",
+                                       "code": "invalid_request_error"}}
+            _after_engine_error(K, e)
+            return 500, {"error": {"message": "kindi: %s" % e, "type": "server_error", "code": "server_error"}}
+
+        loop = asyncio.get_event_loop()
+        # kindi_keepalive (or the header X-Kindi-Keepalive: 1): a non-streaming client behind a proxy with an idle
+        # timeout gets a space every KEEPALIVE_S until the JSON answer. JSON allows whitespace before the value, but
+        # the status is then 200 before the answer is known: an error comes as an {"error": ...} body with status
+        # 200. So it is off unless the client asks for it.
+        if req.get("kindi_keepalive") or request.headers.get("x-kindi-keepalive", "") in ("1", "true"):
+            async def body():
+                fut = asyncio.wrap_future(SCHED.submit(run, prio))
+                try:
+                    while True:
+                        done, _ = await asyncio.wait([fut], timeout=KEEPALIVE_S)
+                        if done:
+                            break
+                        yield " "
+                    try:
+                        info = fut.result()
+                        out = answer(info) if info is not None else {"error": {"message": "request cancelled",
+                                                                               "type": "cancelled"}}
+                    except Exception as e:  # noqa: BLE001
+                        out = failed(e)[1]
+                    yield json.dumps(out, ensure_ascii=False)
+                    if not cancel.is_set():
+                        SCHED.submit(K.after_turn, PRIO_TURN)
+                finally:
+                    cancel.set()
+            return StreamingResponse(body(), media_type="application/json")
         try:
-            fut = asyncio.get_event_loop().run_in_executor(GPU_THREAD, run)
+            fut = asyncio.wrap_future(SCHED.submit(run, prio))
             while not fut.done():
                 done, _ = await asyncio.wait([fut], timeout=1.0)
                 if not done and await request.is_disconnected():
@@ -653,23 +965,12 @@ def create_app(cfg, log=print):
             info = fut.result()
             if info is None:
                 return _err(499, "request cancelled", "cancelled")
-        except OverflowError as e:
-            return _err(400, str(e), "context_length_exceeded")
-        except ValueError as e:
-            return _err(400, str(e))
-        except Exception as e:
-            _after_engine_error(K, e)
-            return _err(500, "kindi: %s" % e, "server_error")
-        msg = {"role": "assistant", "content": info["content"] if (info["content"] or not info["tool_calls"]) else None}
-        if info["tool_calls"]:
-            msg["tool_calls"] = info["tool_calls"]
-        if info["reasoning"]:
-            msg["reasoning_content"] = info["reasoning"]
-        choice = {"index": 0, "message": msg, "finish_reason": info["finish"]}
-        if info.get("logprobs") is not None:
-            choice["logprobs"] = {"content": info["logprobs"]}
-        return {"id": cid, "object": "chat.completion", "created": created, "model": model_id,
-                "choices": [choice], "usage": info["usage"], "timing": info["timing"]}
+        except Exception as e:  # noqa: BLE001
+            code, out = failed(e)
+            return JSONResponse(out, status_code=code)
+        # the save of the turn's end state runs on the engine thread after this answer is sent, before the next request
+        SCHED.submit(K.after_turn, PRIO_TURN)
+        return answer(info)
 
     return app
 

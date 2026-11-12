@@ -84,27 +84,34 @@ class Sampler(object):
 
     @staticmethod
     def _pick(cand, z, temperature, top_p, kk, rng, min_p=0.0):
-        """top-k, then top-p, then the temperature: the order of llama.cpp's default sampler chain, where top-p
-        sees the probabilities at temperature 1. KINDI_SAMPLER_ORDER=hf applies the temperature first (the
-        Hugging Face and vLLM order); at temperature < 1 that keeps fewer tokens and samples more greedily."""
-        k = max(1, min(kk or len(cand), len(cand)))
-        sel = np.argpartition(-z, k - 1)[:k] if k < len(cand) else np.arange(len(cand))
-        idx, zs = cand[sel], z[sel]
-        order = np.argsort(-zs)
-        idx, zs = idx[order], zs[order]
-        if top_p and top_p < 1.0:
-            q = zs / temperature if SAMPLER_ORDER == "hf" else zs
-            q = np.exp(q - q.max())
-            q /= q.sum()
-            keep = (np.cumsum(q) - q) < top_p
-            idx, zs = idx[keep], zs[keep]
-        if min_p and min_p > 0.0:
-            # min-p after top-p, on the probabilities at temperature 1 (llama.cpp's order); the best token stays
-            keep = zs >= zs.max() + np.log(min_p)
-            idx, zs = idx[keep], zs[keep]
-        p = np.exp((zs - zs.max()) / temperature)
-        p /= p.sum()
+        idx, p = distribution(cand, z, temperature, top_p, kk, min_p)
         return int(rng.choice(idx, p=p))
+
+
+def distribution(cand, z, temperature, top_p, kk, min_p=0.0):
+    """the sampler's distribution over the candidates: (token ids, best first; probabilities). The one place that
+    defines it - plain sampling and speculative sampling (spec._dist) both use it.
+    Top-k, then top-p, then min-p, then the temperature: the order of llama.cpp's default sampler chain, where top-p
+    and min-p see the probabilities at temperature 1. KINDI_SAMPLER_ORDER=hf applies the temperature first for top-p
+    (the Hugging Face and vLLM order); at temperature < 1 that keeps fewer tokens and samples more greedily."""
+    k = max(1, min(kk or len(cand), len(cand)))
+    sel = np.argpartition(-z, k - 1)[:k] if k < len(cand) else np.arange(len(cand))
+    idx, zs = cand[sel], z[sel]
+    order = np.argsort(-zs)
+    idx, zs = idx[order], zs[order]
+    if top_p and top_p < 1.0:
+        q = zs / temperature if SAMPLER_ORDER == "hf" else zs
+        q = np.exp(q - q.max())
+        q /= q.sum()
+        keep = (np.cumsum(q) - q) < top_p
+        idx, zs = idx[keep], zs[keep]
+    if min_p and min_p > 0.0:
+        # min-p after top-p, on the probabilities at temperature 1 (llama.cpp's order); the best token stays
+        keep = zs >= zs.max() + np.log(min_p)
+        idx, zs = idx[keep], zs[keep]
+    p = np.exp((zs - zs.max()) / temperature)
+    p /= p.sum()
+    return idx, p
 
 
 def penalize(cand, z, rp, recent):

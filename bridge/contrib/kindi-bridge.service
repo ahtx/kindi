@@ -1,0 +1,14 @@
+# Copyright (c) 2026 Amir Husain. SPDX-License-Identifier: AGPL-3.0-only. See LICENSE and COMMERCIAL-LICENSE.md.
+[Unit]
+Description=Kindi Bridge scheduler and knowledge indexer
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/kindi-bridge-dev
+ExecStart=%h/kindi-bridge-dev/.venv/bin/kindi-bridge serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

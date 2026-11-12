@@ -1,11 +1,15 @@
-# Kindi runtime image for AMD RDNA 3.5 GPUs (ROCm 7, HIP 7.16): the Radeon 840M (gfx1152) and Radeon 8060S (Strix Halo,
-# gfx1151), both measured; Strix Point (gfx1150) not yet measured. ROCm 6.3 (docker/Dockerfile.rocm) does not know these GPUs. They
-# run natively: no HSA_OVERRIDE_GFX_VERSION. The host needs only the amdgpu kernel driver and Docker.
+# syntax=docker/dockerfile:1
+# Kindi runtime image for AMD RDNA 3.5 GPUs (ROCm 7, HIP 7.16): the Radeon 840M (gfx1152) and Radeon 8060S (Strix Halo, gfx1151), both measured; Strix Point (gfx1150) not
+# yet measured. ROCm 6.3 (docker/Dockerfile.rocm) does not know these GPUs. They run natively: no
+# HSA_OVERRIDE_GFX_VERSION. The host needs only the amdgpu kernel driver and Docker.
 #
-#   docker build -t kindi-rocm7:0.5.0 -f docker/Dockerfile.rocm7 .
-#   docker run -d --name kindi --device /dev/kfd --device /dev/dri --group-add video --group-add render \
-#       --security-opt seccomp=unconfined -p 127.0.0.1:8093:8093 -v $HOME/.kindi:/data kindi-rocm7:0.5.0
-FROM rocm/dev-ubuntu-24.04:10.1.0-full
+#   docker build -t kindi-rocm7:0.6.0 -f docker/Dockerfile.rocm7 --build-arg KINDI_VERSION=0.6.0 .
+#   docker run -d --name kindi --device /dev/kfd --device /dev/dri \
+#       --group-add $(getent group video | cut -d: -f3) --group-add $(getent group render | cut -d: -f3) \
+#       --security-opt seccomp=unconfined -p 127.0.0.1:8093:8093 -v kindi-data:/data -e KINDI_MODEL=bonsai-4b kindi-rocm7:0.6.0
+#
+# The base image is pinned by digest (rocm/dev-ubuntu-24.04:10.1.0-full).
+FROM rocm/dev-ubuntu-24.04:10.1.0-full@sha256:5ed1362ea542a928651e4c710b44024ebe98870f74159cb70f0265aec8ef0abe
 
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 # hipRTC compiles Kindi's GPU code at run time; its clang looks for the newest GCC's C++ headers (GCC 14 here)
@@ -19,11 +23,33 @@ RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir "fastapi==0.115.6" "uvicorn==0.32.1" "Jinja2==3.1.4" "MarkupSafe==3.0.2"
 ENV PATH=/opt/venv/bin:$PATH
 
+# a fixed non-root user (1000:1000, in the video and render groups) owns /data. Ubuntu 24.04's own 'ubuntu' user has
+# uid 1000 and is removed. The GPU device nodes belong to the HOST's video and render groups: add their numbers with
+# --group-add (compose: VIDEO_GID and RENDER_GID). Rootless Docker/Podman use -u 0:0.
+RUN (userdel -r ubuntu 2>/dev/null || true) \
+    && groupadd -g 1000 kindi && useradd -u 1000 -g 1000 -m -d /home/kindi -s /usr/sbin/nologin kindi \
+    && for g in video render; do getent group $g >/dev/null && usermod -aG $g kindi; done; \
+    mkdir -p /data && chown 1000:1000 /data
+
 COPY kindi /opt/kindi/kindi
 WORKDIR /opt/kindi
-# /data holds the converted model (pack/) and the cache (state/); see docs/DOCKER.md
-ENV KINDI_PACK=/data/pack KINDI_STATE_DIR=/data/state KINDI_HOST=0.0.0.0 CUPY_CACHE_DIR=/data/state/cupy
+# /data holds the models (models/), the packs (packs/ or pack/) and the cache (state/); see docs/DOCKER.md
+ENV KINDI_PACK=/data/pack KINDI_STATE_DIR=/data/state KINDI_HOST=0.0.0.0 CUPY_CACHE_DIR=/data/state/cupy HOME=/home/kindi
 VOLUME ["/data"]
 EXPOSE 8093
-ENTRYPOINT ["python3", "-m", "kindi"]
+USER 1000:1000
+
+ARG KINDI_VERSION=dev
+ARG KINDI_REVISION=unknown
+LABEL org.opencontainers.image.title="Kindi (AMD ROCm 7)" \
+      org.opencontainers.image.description="Kindi: local LLM inference on low-cost GPUs. AMD RDNA 3.5 graphics (ROCm 7; tested: Radeon 840M, Radeon 8060S)." \
+      org.opencontainers.image.source="https://github.com/ahtx/kindi" \
+      org.opencontainers.image.url="https://amirhusain.com/kindi" \
+      org.opencontainers.image.documentation="https://github.com/ahtx/kindi/blob/main/docs/DOCKER.md" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.vendor="Amir Husain" \
+      org.opencontainers.image.version="${KINDI_VERSION}" \
+      org.opencontainers.image.revision="${KINDI_REVISION}" \
+      org.opencontainers.image.base.name="docker.io/rocm/dev-ubuntu-24.04:10.1.0-full"
+ENTRYPOINT ["python3", "-m", "kindi.container"]
 CMD ["serve"]

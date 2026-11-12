@@ -37,20 +37,46 @@ def _value(v, typ):
 
 def parse_calls(text, tools):
     """tool calls after the answer: <function=name><parameter=k>v</parameter></function>, or the JSON form"""
-    types = {}
+    types, required = {}, {}
     for t in tools or []:
         f = t.get("function", t)
-        props = (f.get("parameters") or {}).get("properties") or {}
+        params = f.get("parameters") or {}
+        props = params.get("properties") or {}
         types[f.get("name")] = {k: (p or {}).get("type") for k, p in props.items()}
+        required[f.get("name")] = list(params.get("required") or [])
     calls = []
-    for body in re.findall(r"<tool_call>(.*?)(?:</tool_call>|$)", text, re.S):
+    # A call block is <tool_call> (or the look-alike ⟨tool_call> the model sometimes writes) followed directly by
+    # <function=NAME>. After a call the model often goes on writing prose that quotes the format ("`<tool_call>`",
+    # "<function=write>path=... </function>"); such quotes are not calls (TB 11-03: 434 bash calls with no command).
+    for body in re.findall(r"(?<!`)[<⟨]tool_call>(.*?)(?:</tool_call>|(?=[<⟨]tool_call>)|$)", text, re.S):
         body = body.strip()
         m = re.match(r"<function=([^>\n]+)>(.*?)(?:</function>|$)", body, re.S)
         if m:
             name, inner = m.group(1).strip(), m.group(2)
+            if types and name not in types:
+                continue                      # not one of the request's tools: a quoted example, not a call
+            # two header slips of the model: <parameter>NAME>value, and the value inside the header
+            # (<parameter=NAME="value"> or <parameter=NAME=value>, with or without a </parameter>)
+            inner = re.sub(r"<parameter>(\w+)>", r"<parameter=\1>", inner)
+            inner = re.sub(r'<parameter=(\w+)=("?)([^\n<>]*?)\2>(?:\s*</parameter>)?',
+                           lambda h: "<parameter=%s>%s</parameter>" % (h.group(1), h.group(3)), inner)
+            pairs = re.findall(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", inner, re.S)
+            known = [k for k in types.get(name, {}) if k]
+            if known:
+                opener = r"<parameter=(?:%s)>" % "|".join(re.escape(k) for k in known)
+                if len(pairs) < len(re.findall(opener, inner)):
+                    # the model left out a </parameter>: a value then ends at the next <parameter=KNOWN_NAME> or at
+                    # the end (only the tool's own parameter names split, so a value can contain "<parameter=")
+                    pairs = re.findall(r"<parameter=(%s)>\n?(.*?)\n?(?:</parameter>|(?=%s)|$)"
+                                       % ("|".join(re.escape(k) for k in known), opener), inner, re.S)
             args = {}
-            for k, v in re.findall(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", inner, re.S):
+            for k, v in pairs:
                 args[k.strip()] = _value(v, types.get(name, {}).get(k.strip()))
+            need = required.get(name) or ([] if not types.get(name) else None)
+            if need is None and not args:
+                continue                      # a tool with parameters, but none parsed: prose, not a call
+            if need and any(k not in args for k in need):
+                continue                      # a required parameter is missing: not a complete call
         else:
             try:
                 j = json.loads(body)
@@ -112,7 +138,7 @@ class NanbeigeBackend(object):
         # every control token ends the turn (</s>, <|im_end|>, <|endoftext|>, a new <|im_start|>), as llama.cpp's
         # end-of-generation set does; the model sometimes ends an answer with </s>
         self.stop_ids = {i for i, ty in enumerate(self.tok.types) if ty == 3} | {self.tok.eos}
-        self.eng = Engine(man["model_path"], ctx=cfg["ctx"], log=log)
+        self.eng = Engine(man["model_path"], ctx=cfg["ctx"], kv=cfg.get("kv_cache"), log=log)
         self.cached = []            # the token at each position whose K/V is on the cards
         # prompt-lookup drafting (config key lookup): up to this many drafted tokens per check pass, 0: off
         self.lookup = max(0, min(7, int(cfg.get("lookup") or 0)))
@@ -182,9 +208,10 @@ class NanbeigeBackend(object):
         thinking = kw.get("enable_thinking", req.get("enable_thinking", True)) is not False
         ids = prompt_ids(self.tok, render(req.get("messages") or [], tools=tools, enable_thinking=thinking))
         if len(ids) >= self.eng.ctx:
-            raise OverflowError("the prompt has %d tokens; context is %d" % (len(ids), self.eng.ctx))
+            from .server import ContextOverflow
+            raise ContextOverflow(len(ids), self.eng.ctx)
         if req.get("_kindi_check"):                       # Kindi.check_prompt(): the prompt is valid, nothing to run
-            return
+            return ids
         g = lambda k, d: d if req.get(k) is None else req.get(k)  # noqa: E731
         temperature = float(g("temperature", cfg["temperature"]))
         top_p = float(g("top_p", cfg["top_p"]))

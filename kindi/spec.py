@@ -38,6 +38,7 @@ from . import chunk as _chunk
 from . import tc as _tc
 from . import sampling
 from . import mtp as _mtp
+from . import dspine as _dsp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 i32, f32t = np.int32, np.float32
@@ -157,6 +158,12 @@ class SpecKernels(object):
         hip = cp.cuda.runtime.is_hip
         tcs = open(os.path.join(HERE, "tc_hip.cu" if hip else "tc.cu"), encoding="utf-8").read()
         tcf = open(os.path.join(HERE, "tcf.cu"), encoding="utf-8").read()
+        # drafting on the tensor-core path (KINDI_SPEC set, KINDI_TC=1) with KINDI_FD unset: use the split flash-decode
+        # attention. With KINDI_FD=0 the one-token step and the verify pass take different attention kernels, so a draft
+        # can differ from plain decoding at near-ties (dsp06, 11-10; 0.5.0 too). The installer's profiles already set it.
+        if (os.environ.get("KINDI_SPEC", "0") not in ("", "0") and os.environ.get("KINDI_TC") == "1"
+                and "KINDI_FD" not in os.environ):
+            os.environ["KINDI_FD"] = "1"
         global FD_CH
         FD_CH = fd_ch()
         os.environ.setdefault("KINDI_FD_CH", str(FD_CH))     # (for the prompt cache's engine fingerprint)
@@ -546,6 +553,8 @@ def _reserve_card(eng, s):
         b["XQ"], b["XS"], b["XA"] = cp.zeros(TQ * NGm * 32, dtype=cp.uint32), z(TQ * NGm), cp.zeros(TQ * NGm, dtype=cp.int32)
         b["YH"], b["AOUT"] = z(T * s.R_head), cp.zeros(T, dtype=cp.int32)
         b["ctl"] = cp.zeros(16, dtype=cp.int32)
+        if getattr(eng, "_dsp_want", False) and eng.W == 1:   # the DSpine drafter's target features (dspine.py)
+            b["FEAT"] = z(T * _dsp.NSLOT * D)
         if eng.W == 2:
             b["YX"] = z(T * D)                    # the row-parallel sums after the exchange
             s.tcctr = cp.zeros(TMAX, dtype=cp.int32)
@@ -816,6 +825,12 @@ def build_plan(s, T, head, wb, aout=None, tokp=None):
         else:
             gdn(il)
         ffn(il)
+        if "FEAT" in b and il in _dsp.LAYERS:
+            # the layer's output (residual + the FFN's pending parts) of every token, for the DSpine drafter
+            add = st["pending"]
+            tadd(_Fn(_dsp.feat_kernel()), (D + 255) // 256, (256,),
+                 (st["h"], PART if add > 1 else Y, b["FEAT"], i32(D), i32(add), i32(_dsp.LAYERS.index(il)), i32(_dsp.NSLOT)),
+                 (D, max(add, 1) * D))
     if head:
         mixin("output_norm.weight")
         gemm(s.head_name, XP, work, b["YH"], False)
@@ -897,6 +912,9 @@ def run(eng, toks, pos, head):
         s.tc_plans[(T, head)].launch(tk, pos)
     if eng.W == 2:
         _gdrv().cuCtxSetCurrent(eng.cards[0].tc_plans[(T, head)].ctx)   # CuPy work after the pass stays on card 0
+    dsp = getattr(eng, "dspine", None)
+    if dsp is not None and not (head and T > 1):      # (a verify pass: tc_step adds the accepted rows only)
+        dsp.ingest(eng.cards[0].tcb["FEAT"], pos, T)
     if head and _mtp.DUMP is not None:
         _mtp.DUMP.rows(eng, toks, pos)
 
@@ -913,6 +931,9 @@ def _hist_set(self, pos, toks):
     h = _hist(self)
     if pos < len(h.h):
         h.truncate(pos)
+    dsp = getattr(self, "dspine", None)
+    if dsp is not None and pos < dsp.top:            # a rewind: the drafter's context drops the later positions
+        dsp.truncate(pos)
     while len(h.h) < pos:
         h.push(-1)
     for t in toks:
@@ -1079,8 +1100,11 @@ def tc_step(self, tok, pos):
     dr2 = getattr(self, "drafter", None) if k > 0 and self.spec_mode in ("draft2b", "both") else None
     mt = getattr(self, "mtp", None)
     d = []
+    dsp = getattr(self, "dspine", None)
     if k > 0 and self.spec_mode == "mtp":
         d = mt.draft(tok, pos, k)
+    elif k > 0 and self.spec_mode == "dspine":
+        d = dsp.draft(tok, pos, k)
     elif k > 0:
         d = _hist(self).propose(k) if self.spec_mode in ("ngram", "both") else []
         if dr2 is not None and len(d) < (2 if self.spec_mode == "both" else 1):   # "both": n-gram if it has 2+
@@ -1102,6 +1126,8 @@ def tc_step(self, tok, pos):
             j = 0
             while j < len(d) and d[j] == A[j]:
                 j += 1
+        if dsp is not None:                          # the target's features of the accepted rows (tok, d[:j])
+            dsp.ingest(self.cards[0].tcb["FEAT"], pos, j + 1)
         if dr2 is not None:
             dr2.accept(j)
         if mt is not None:
@@ -1152,6 +1178,8 @@ def tc_feed_batch(self, toks, pos):
             run(self, toks[i:i + n], pos + i, True)
             if n > 1:
                 commit(self, n)
+                if getattr(self, "dspine", None) is not None:
+                    self.dspine.ingest(self.cards[0].tcb["FEAT"], pos + i, n)
             i += n
         return
     i = _chunk.feed(self, toks, pos)             # whole chunks first (tensor-core GEMMs), the rest T <= 8 at a time
@@ -1161,20 +1189,25 @@ def tc_feed_batch(self, toks, pos):
         i += n
 
 
-def spec_begin(self, greedy, temperature=0.0, top_p=1.0, top_k=0, rng=None):
+def spec_begin(self, greedy, temperature=0.0, top_p=1.0, top_k=0, rng=None, min_p=0.0):
     """speculative decoding for the steps that follow: greedy requests, or sampled ones when the server passes its
     sampling settings and generator (speculative sampling)"""
     mode = os.environ.get("KINDI_SPEC", "0")
     self.spec_auto = mode == "auto"
     if mode == "auto":
-        # KINDI_SPEC=auto (the measured choice on a 3080): a model with its own MTP head drafts with it (greedy);
-        # a model with the 2B drafter uses it, plus the 2B's head (B2) below KINDI_SPEC_B2_MAX tokens of context
-        if getattr(self, "drafter", None) is not None:
+        # KINDI_SPEC=auto (the measured choice on a 3080): the DSpine block drafter when it is attached (27B); a model
+        # with its own MTP head drafts with it (greedy); a model with the 2B drafter uses it, plus the 2B's head (B2)
+        # below KINDI_SPEC_B2_MAX tokens of context
+        if getattr(self, "dspine", None) is not None:
+            mode = "dspine"
+        elif getattr(self, "drafter", None) is not None:
             mode = "draft2b"
         elif getattr(self, "mtp", None) is not None and greedy:
             mode = "mtp"
         else:
             mode = "0"
+    if mode == "dspine" and getattr(self, "dspine", None) is None:
+        mode = "draft2b" if getattr(self, "drafter", None) is not None else "ngram"
     if mode in ("draft2b", "both") and getattr(self, "drafter", None) is None:
         mode = "ngram"
     if mode == "mtp" and (getattr(self, "mtp", None) is None or not greedy):
@@ -1185,11 +1218,13 @@ def spec_begin(self, greedy, temperature=0.0, top_p=1.0, top_k=0, rng=None):
     self.spec_k = int(os.environ.get("KINDI_SPEC_K", "4")) if mode in ("ngram", "draft2b", "both", "mtp") else 0
     if self.spec_auto and mode == "draft2b":
         self.spec_k = 3
+    if mode == "dspine":                         # a whole block: the current token + BLOCK - 1 drafts (KINDI_SPEC_K is the 2B's)
+        self.spec_k = int(os.environ.get("KINDI_DSPINE_K", str(_dsp.BLOCK - 1)))
     self.spec_b2 = greedy                        # B2 (the 2B's head extends the draft): greedy requests only
     self.spec_k = max(0, min(self.spec_k, TMAX - 1))
     self.spec_sp = None
     if not greedy and rng is not None and os.environ.get("KINDI_SPEC_SAMPLE", "1") == "1" and self.W == 1:
-        self.spec_sp = (float(temperature), float(top_p), int(top_k), rng)
+        self.spec_sp = (float(temperature), float(top_p), int(top_k), rng, float(min_p or 0.0))
         if getattr(self, "_spsampler", None) is None:
             self._spsampler = sampling.Sampler(self)
     self.spec_presampled = None
@@ -1231,9 +1266,9 @@ def tc_ylog(self):
 
 
 def _dist(self, row, best):
-    """the server sampler's distribution (temperature, top-k, top-p; kindi.sampling.Sampler's own code) for row
-    `row` of the last pass: (token ids, probabilities)"""
-    temperature, top_p, top_k, _ = self.spec_sp
+    """the server sampler's distribution (top-k, top-p, min-p, temperature: kindi.sampling.distribution, the code
+    plain sampling uses) for row `row` of the last pass: (token ids, probabilities)"""
+    temperature, top_p, top_k, _, min_p = self.spec_sp
     self._ylog_row, self._best, self._ylog_ok = row, best, True
     smp = self._spsampler
     yl, nl, ymap = self.ylog, int(self.ylog_n), self.ylog_map
@@ -1257,20 +1292,7 @@ def _dist(self, row, best):
         z = cp.asnumpy(yl[:nl]).astype(np.float64)
         ok = cand >= 0
         cand, z = cand[ok], z[ok]
-    k = max(1, min(kk or len(cand), len(cand)))
-    sel = np.argpartition(-z, k - 1)[:k] if k < len(cand) else np.arange(len(cand))
-    idx = cand[sel]
-    zz = z[sel] / temperature
-    zz -= zz.max()
-    p = np.exp(zz)
-    p /= p.sum()
-    order = np.argsort(-p)
-    idx, p = idx[order], p[order]
-    if top_p and top_p < 1.0:
-        keep = (np.cumsum(p) - p) < top_p
-        idx, p = idx[keep], p[keep]
-        p /= p.sum()
-    return idx, p
+    return sampling.distribution(cand, z, temperature, top_p, kk, min_p)
 
 
 def spec_accept(dists, d, rng):
@@ -1394,6 +1416,8 @@ def generate_spec(eng, ids, n, k=None, drafter=None, stats=None):
             while j < len(d) and d[j] == A[j]:
                 j += 1
             a = A[:j + 1]
+            if getattr(eng, "dspine", None) is not None:
+                eng.dspine.ingest(eng.cards[0].tcb["FEAT"], pos, j + 1)
             commit(eng, j + 1)
             st["drafted"] += len(d)
             st["accepted"] += j
@@ -1661,6 +1685,11 @@ def install(log=print):
                     eng.drafter.mtp = _mtp.MTPDraft(_drafter[0], os.environ["KINDI_SPEC_DRAFT_HEAD"], log=eng.log)
             if os.environ.get("KINDI_SPEC") in ("mtp", "auto") and os.environ.get("KINDI_MTP_HEAD") and not _building_drafter[0]:
                 eng.mtp = _mtp.MTPDraft(eng, os.environ["KINDI_MTP_HEAD"], log=eng.log)
+            if getattr(eng, "_dsp_want", False) and not _building_drafter[0]:
+                if _dsp.fits(eng.cards[0]) and "FEAT" in eng.cards[0].tcb:
+                    eng.dspine = _dsp.DSpine(eng, os.environ["KINDI_DSPINE"], log=eng.log)
+                else:
+                    eng.log("dspine: not used (it drafts for the 27B on one NVIDIA card with the tensor-core plans)")
 
     _tp.Shard._load = _load
     _chunk.reserve = _reserve
@@ -1689,6 +1718,10 @@ def install(log=print):
         hps = [os.environ.get("KINDI_MTP_HEAD") if sm in ("mtp", "auto") else None,
                os.environ.get("KINDI_SPEC_DRAFT_HEAD") if sm in ("draft2b", "both", "auto") else None]
         hps = [h for h in hps if h]
+        if _dsp.wanted() and not _building_drafter[0] and not getattr(self, "_dsp_rsv", 0):
+            # the DSpine drafter: its target features in the plans, its weights kept out of the context fit
+            self._dsp_want, self._dsp_rsv = True, _dsp.reserve_mb()
+            os.environ["KINDI_MEM_RESERVE_MB"] = str(int(os.environ["KINDI_MEM_RESERVE_MB"]) + self._dsp_rsv)
         if hps and not _building_drafter[0] and not getattr(self, "_mtp_rsv", 0):
             # the MTP heads' weights and buffers: kept out of the context fit (loaded after the build)
             self._mtp_rsv = sum(os.path.getsize(h) // 2 ** 20 + 160 for h in hps)
@@ -1718,6 +1751,8 @@ def install(log=print):
         _hist(self).truncate(0)
         if getattr(self, "mtp", None) is not None:
             self.mtp.reset()
+        if getattr(self, "dspine", None) is not None:
+            self.dspine.reset()
         return o_reset(self)
 
     _tp.TPEngine.step, _tp.TPEngine.feed, _tp.TPEngine.feed_batch = step, feed, feed_batch

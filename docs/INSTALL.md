@@ -8,6 +8,13 @@ output against llama.cpp and starts the servers as services.
 curl -fsSL https://amirhusain.com/kindi/install.sh | bash
 ```
 
+On Windows 10 or 11, use the PowerShell installer instead. It sets up WSL2 and then runs this installer inside it
+(see [WINDOWS.md](WINDOWS.md)):
+
+```powershell
+irm https://amirhusain.com/kindi/install.ps1 | iex
+```
+
 To see each step and each command before anything changes, do a dry run first:
 
 ```bash
@@ -20,17 +27,17 @@ Download the script, compare its sha256 with the value below, read it, and then 
 
 ```bash
 curl -fsSLO https://amirhusain.com/kindi/install.sh
-echo "b84df4fe0b4ae258433d043a34c67d0f9daaeecc0f9131eea8a2e3990f87d872  install.sh" | sha256sum -c -
+echo "ec0f3f19cf5c5c2d6f0f660db1efb9a6e289a4cfaf0a7c8decfb996f5e4471dc  install.sh" | sha256sum -c -
 bash install.sh --dry-run
 bash install.sh
 ```
 
 | File | sha256 |
 |---|---|
-| `install.sh` (Kindi 0.5.0) | `b84df4fe0b4ae258433d043a34c67d0f9daaeecc0f9131eea8a2e3990f87d872` |
+| `install.sh` (Kindi 0.6.0) | `ec0f3f19cf5c5c2d6f0f660db1efb9a6e289a4cfaf0a7c8decfb996f5e4471dc` |
 
 If `sha256sum -c` does not print `install.sh: OK`, do not run the script. The same script is in the repository root
-and in the 0.5.0 release.
+and in the 0.6.0 release.
 
 ## What it does
 
@@ -39,7 +46,7 @@ and in the 0.5.0 release.
 | 1. Check the machine | Linux x86-64, RAM, free disk, each NVIDIA GPU with its compute capability, and each AMD RDNA3 or RDNA 3.5 GPU. No GPU: the CPU engine. | no |
 | 2. Docker and GPU access | Finds Docker, and the NVIDIA Container Toolkit or the AMD devices `/dev/kfd` and `/dev/dri`. If something is missing, it asks before it installs it (apt). Without the toolkit, it gives the container the NVIDIA devices and the driver libraries directly. | only to install |
 | 3. Select the setup | Shows each setup for this computer, the recommended one first, and asks which one (below). | no |
-| 4. Build the image | Builds `kindi:0.5.0` (CUDA 10.2), `kindi-rocm:0.5.0` (ROCm 6.3, RDNA3) or `kindi-rocm7:0.5.0` (ROCm 7, RDNA 3.5) from the release source, and checks that the Kindi modules load. A re-run with the same source does not build again. | no |
+| 4. Build the image | Builds `kindi:0.6.0` (CUDA 10.2), `kindi-rocm:0.6.0` (ROCm 6.3, RDNA3) or `kindi-rocm7:0.6.0` (ROCm 7, RDNA 3.5) from the release source, and checks that the Kindi modules load. A re-run with the same source does not build again. | no |
 | 5. Download the models | Downloads each GGUF from Hugging Face. The sha256 must match the value in the script (table below). | no |
 | 6. Convert and verify | `kindi convert`, then `kindi verify` one time for each model on each kind of card. | no |
 | 7. Start the servers | One Docker container for each server, with `--restart unless-stopped`, on `127.0.0.1`. It waits until each `/health` answers. | no |
@@ -147,13 +154,55 @@ The script pins these files. It does not use a file with a different sha256.
 | `--ctx N` | The context length in tokens. |
 | `--gpu G` | `N` (one NVIDIA card), `N,M` (two cards), `amd` or `amdN`, `all`, or `cpu`. |
 | `--port P` | The port of the first server on 127.0.0.1 (default 8093). Later servers take the next free ports. |
+| `--lan` | Also serve your local network, so that other computers can use Kindi. Off by default. The installer makes an API key, keeps it in `~/.kindi/api-key` (only you can read it), and every client must send it as `Authorization: Bearer <key>`. A later `--lan` run keeps the same key. Run the installer again without `--lan` to go back to this computer only. |
+| `--api-key K` | The API key that clients must send. With `--lan`, `--api-key none` turns the key off (not recommended). Without `--lan`, it sets a key for local clients. |
+
+### Use Kindi from other computers (`--lan`)
+
+```sh
+bash install.sh --lan
+```
+
+The installer publishes each server port on all the network addresses of this computer, not only 127.0.0.1, and
+prints the network address (`http://<this computer's address>:8093/v1`). The containers keep their normal Docker
+network, so the GPU stays visible to them (changing the Docker network mode by hand can hide the GPU from the
+container). On the other computer, use that address and the key in `~/.kindi/api-key`:
+
+```sh
+curl http://<address>:8093/v1/chat/completions -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer <key>" -d '{"messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+- Use `--lan` only on a network that you trust. Anyone with the key can use the servers. Do not forward the ports
+  from the internet.
+- If a firewall is on (for example `ufw`), allow the port for your network:
+  `sudo ufw allow from <your network>/24 to any port 8093`.
+- `/health` stays open without the key. It shows the model and the server state, not the conversations.
 | `--dir D` | The data folder (default `~/.kindi`). |
 | `--name N` | The name of the first container (default `kindi`; later ones are `N-2`, `N-3`, ...). |
 | `--threads N` | The CPU engine: the number of threads. |
 | `--memory M` | The container memory limit, for example `8g`. |
-| `--source S` | The Kindi source: a folder, or a `.tar.gz` path or URL (default: the 0.5.0 release). |
-| `--uninstall` | Removes each server container and image that the installer made. The models stay. |
-| `--uninstall --purge` | Also removes the data folder. |
+| `--source S` | The Kindi source: a folder, or a `.tar.gz` path or URL (default: the 0.6.0 release). |
+| `--with-bridge` | Also installs Kindi Bridge, the terminal workspace for agents on Kindi (see below). |
+| `--no-bridge` | Does not ask about Kindi Bridge. |
+| `--bridge-source D` | Installs Kindi Bridge from folder D (default: `bridge/` in the Kindi source). |
+| `--uninstall` | Removes each server container and image that the installer made, and Kindi Bridge. The models stay. |
+| `--uninstall --purge` | Also removes the data folder, and asks before it deletes Bridge's state. |
+
+## Kindi Bridge (optional)
+
+Kindi Bridge is a workspace in the terminal for agents on Kindi: conversations, scheduled prompts, completion
+checks, folders of your own documents, and the live state of your Kindi servers. When the installer runs in a
+terminal, it asks if you want it. `--with-bridge` installs it with no question. `--yes` and `--auto` alone do not
+install it.
+
+Bridge runs on the host, not in a container. It needs Python 3.10 or later with `venv`, tmux 3.2 or later, and the
+pi coding agent 1.3.0 (Node.js 22.19 or later). The installer offers to install the missing parts: Python and tmux with
+`apt-get`, and pi with `npm` into `~/.local`. It puts the program in `~/.kindi/bridge`, the command in
+`~/.local/bin/kindi-bridge`, and the state in `~/.local/state/kindi-bridge`. Bridge has its own pi folder there, so
+your own pi setup does not change. The installer connects Bridge's agents to the first Kindi server. It can also run
+Bridge's scheduler as a systemd user service. Run the installer again to upgrade Bridge. The manual has a chapter
+with each menu and option.
 
 ## Upgrade, repair and remove
 

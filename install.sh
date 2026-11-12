@@ -19,7 +19,7 @@
 # password or a key. Copyright (c) 2026 Amir Husain. SPDX-License-Identifier: AGPL-3.0-only.
 set -euo pipefail
 
-KINDI_VERSION="0.5.0"
+KINDI_VERSION="0.6.0"
 SOURCE_URL="https://github.com/ahtx/kindi/archive/refs/tags/v${KINDI_VERSION}.tar.gz"
 HF="https://huggingface.co/prism-ml"
 # model: GGUF file, sha256 (= the Hugging Face file hash), size in bytes
@@ -33,6 +33,10 @@ GGUF[nemotron]="NVIDIA-Nemotron-3.5-Bolt-E4B-UD-Q3_K_XL.gguf"; SHA[nemotron]="3f
 declare -A URL
 for p in 2b 4b 9b 27b; do URL[$p]="$HF/Ternary-Bonsai-2-${p^^}-gguf/resolve/main/${GGUF[$p]}"; done
 URL[nemotron]="https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF/resolve/main/${GGUF[nemotron]}"
+# Nemotron 3.5 Lightning 30B-A3B, Nota AI's ternary version (GGUF by boro64; licence OpenMDW 1.1): the Lightning
+# MoE engine. A 10 GB card holds all of it; on 6 to 8 GB cards the least used experts stay in host memory.
+GGUF[lightning]="Ternary-Nemotron-3.5-Lightning-30B-A3B-GGUF.gguf"; SHA[lightning]="38854de649212dc2761006b75afbc41412e7531f763c3ff965bd31f969bb14f3"; SIZE[lightning]=9472656320
+URL[lightning]="https://huggingface.co/boro64/Ternary-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/${GGUF[lightning]}"
 # AH-Nanbeige4.3-33B IQ3_XXS (a separate model; the Kindi Nanbeige backend, NVIDIA sm_80 and later)
 GGUF[nanbeige]="AH-Nanbeige4.3-33B-IQ3_XXS.gguf"; SHA[nanbeige]="9d4f18e8a22573c94b18a455147e807a8b9d2cd4b30302f2a4639c2db0a6c239"; SIZE[nanbeige]=13108685952
 NB_CARD_URL="https://huggingface.co/ahtx/AH-Nanbeige4.3-33B-IQ3_XXS-GGUF"
@@ -42,6 +46,14 @@ URL[nanbeige]="${NB_CARD_URL}/resolve/main/${GGUF[nanbeige]}"
 MTP_URL="${KINDI_MTP_URL:-https://huggingface.co/ahtx/kindi-mtp-heads/resolve/main}"
 MTPF="kindi-mtp-2b-v1.npz"; MTPSHA="1b5c0c790a594af368c3646370c527c319cdb3bb0592dd3e523e752f721a5520"; MTPSIZE=60960552
 mtp_ready() { [ -f "$DIR/mtp/$MTPF" ] && [ -f "$DIR/mtp/$MTPF.sha256-ok" ]; }
+# The DSpine block drafter of the 27B on tensor-core cards (Tencent, Apache-2.0: https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16),
+# pinned to a revision and sha256; KINDI_DSPINE_URL overrides the location, --no-dspine leaves it out (docs/DSPINE.md)
+DSP_URL="${KINDI_DSPINE_URL:-https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16/resolve/5f54174d301dbca65d9aa4448dc47e56732d9a12}"
+DSPF=(config.json LICENSE model.safetensors)
+DSPSHA=(c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815 bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a
+        ac90f1df842ea66b23e4224f3e86624add547526f689ffe9e9c6b7a5937116b1)
+DSPSIZE=4051845726                                   # the three files
+dspine_ready() { [ "${NO_DSPINE:-0}" = 0 ] && [ -f "$DIR/dspine/model.safetensors.sha256-ok" ] && [ -f "$DIR/dspine/config.json" ]; }
 
 DIR="${KINDI_HOME:-$HOME/.kindi}"
 PORT=8093
@@ -58,6 +70,11 @@ THREADS=""
 MEMORY=""
 AUTO=0            # --auto: take the recommended setup and answer yes (never for kernel changes)
 CHOICE=""         # --config N: setup N of the list
+LAN=0             # --lan: serve the local network (0.0.0.0), with an API key
+APIKEY=""         # --api-key K: the key clients must send; "none" = no key (not recommended with --lan)
+BRIDGE=ask        # Kindi Bridge (optional): ask | yes (--with-bridge) | no (--no-bridge); --yes/--auto alone never adds it
+BRIDGE_SOURCE=""  # --bridge-source: a Kindi Bridge folder (default: bridge/ in the Kindi source)
+PI_VERSION="1.3.0"   # the pi coding agent that Bridge is tested with
 
 usage() {
   cat <<EOF
@@ -69,27 +86,38 @@ Kindi ${KINDI_VERSION} installer
 
 Options:
   --dry-run        print every step and command, change nothing
+  --no-dspine      the 27B on tensor-core cards drafts with the 2B, not Tencent's DSpine (4 GB, Apache-2.0)
   --yes, -y        answer yes to every question (for scripts); takes the recommended setup
   --auto           choose the recommended setup and continue without questions (kernel changes are only
                    described, never made)
   --config N       take setup N of the list that the installer prints (see --dry-run); N,M runs several setups
                    side by side, one server each (for example a 27B on each of two cards); NxK runs setup N on
                    K cards of that kind. Each server gets its own container (kindi, kindi-2, ...) and port.
-  --model M        2b | 4b | 9b | 27b | nemotron | nanbeige (default: the recommended model for the card)
+  --model M        2b | 4b | 9b | 27b | lightning | nemotron | nanbeige (default: the recommended model for the
+                   card; lightning = Nemotron 3.5 Lightning 30B-A3B, a mixture of experts, on NVIDIA cards with 6 GB
+                   or more)
   --ctx N          context length in tokens (default: the profile's; the engine fits it to the free memory)
   --gpu G          N (one NVIDIA card), N,M (two cards), amd or amdN (an AMD card), all, or cpu (default: choose)
   --port P         server port on 127.0.0.1 (default ${PORT})
+  --lan            also serve the local network (other computers can use Kindi). Off by default. The installer
+                   makes an API key (kept in ${DIR}/api-key) that every client must send, unless --api-key none
+  --api-key K      the API key clients must send (Authorization: Bearer K); also without --lan
   --dir D          data folder (default ${DIR})
   --name N         container name (default ${NAME})
   --threads N      CPU engine: the number of threads (default: the cores of one socket)
   --memory M       the container memory limit, for example 8g (default: the profile's)
   --source S       Kindi source: a folder or a .tar.gz URL/path (default: the ${KINDI_VERSION} release)
+  --with-bridge    also install Kindi Bridge, the terminal workspace for agents on Kindi (optional; the installer
+                   asks when it has a terminal)
+  --no-bridge      do not ask about Kindi Bridge
+  --bridge-source D   install Kindi Bridge from folder D (default: bridge/ in the Kindi source)
 EOF
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
+    --no-dspine) NO_DSPINE=1 ;;
     --yes|-y) YES=1 ;;
     --auto) AUTO=1; YES=1 ;;
     --config) CHOICE="$2"; shift ;;
@@ -104,6 +132,11 @@ while [ $# -gt 0 ]; do
     --source) SOURCE="$2"; shift ;;
     --threads) THREADS="$2"; shift ;;
     --memory) MEMORY="$2"; shift ;;
+    --lan) LAN=1 ;;
+    --api-key) APIKEY="$2"; shift ;;
+    --with-bridge) BRIDGE=yes ;;
+    --no-bridge) BRIDGE=no ;;
+    --bridge-source) BRIDGE_SOURCE="$2"; BRIDGE=yes; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1 (see --help)"; exit 2 ;;
   esac
@@ -142,8 +175,144 @@ human() { awk -v b="$1" 'BEGIN { split("B KB MB GB TB", u); i = 1; while (b >= 1
 DOCKER="docker"
 STATE="$DIR/install.json"
 
+# ------------------------------------------------------------------------------------------------ Kindi Bridge
+# Kindi Bridge is optional. It runs on the host (not in a container): a Python venv in $DIR/bridge, a launcher in
+# ~/.local/bin, its state (agents, schedules, knowledge) in ~/.local/state/kindi-bridge, and its own pi folder there,
+# so the user's own pi setup does not change. $DIR/bridge.json records what was installed, for --uninstall.
+BRIDGE_HOME="$DIR/bridge"
+BRIDGE_BIN="$HOME/.local/bin/kindi-bridge"
+BRIDGE_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/kindi-bridge"
+BRIDGE_UNIT="$HOME/.config/systemd/user/kindi-bridge.service"
+BRIDGE_RECORD="$DIR/bridge.json"
+
+ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }   # ver_ge 3.11.2 3.10 -> true
+
+bridge_install() {   # $1 = the port of the first Kindi server
+  local src="${BRIDGE_SOURCE:-${SRC:-}/bridge}" py pyv tmv knowledge=0 unit=0
+  step "Install Kindi Bridge" "A terminal workspace for agents on Kindi: conversations, scheduled prompts, completion checks, local knowledge folders and live Kindi telemetry. It runs on this computer, not in a container."
+  [ -f "$src/pyproject.toml" ] || { warn "no Kindi Bridge source in ${src} (use --bridge-source DIR): Bridge is not installed"; return 0; }
+  py=$(command -v python3 || true)
+  pyv=$([ -n "$py" ] && "$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 0)
+  tmv=$(tmux -V 2>/dev/null | sed -n 's/^tmux \([0-9.]*\).*/\1/p'); tmv=${tmv:-0}
+  local missing=""
+  ver_ge "$pyv" 3.10 || missing="$missing python3 (3.10 or later)"
+  [ -n "$py" ] && ! "$py" -c 'import venv, ensurepip' 2>/dev/null && missing="$missing python3-venv"
+  ver_ge "$tmv" 3.2 || missing="$missing tmux (3.2 or later)"
+  if [ -n "$missing" ]; then
+    info "Bridge needs:${missing}."
+    if command -v apt-get >/dev/null && ask "Install python3, python3-venv and tmux with apt-get (needs sudo)?"; then
+      need_sudo; run $SUDO apt-get update -qq; run $SUDO apt-get install -y -qq python3 python3-venv tmux >/dev/null
+      py=$(command -v python3)
+    else warn "Bridge is not installed. Install${missing}, then run this installer again with --with-bridge."; return 0; fi
+  fi
+  ok "python $("$py" -c 'import platform; print(platform.python_version())' 2>/dev/null || echo "?"), $(tmux -V 2>/dev/null || echo tmux)"
+  local pibin; pibin=$(command -v pi || ls "$HOME"/.nvm/versions/node/*/bin/pi 2>/dev/null | tail -1 || true)
+  [ -z "$pibin" ] && [ -x "$HOME/.local/bin/pi" ] && pibin="$HOME/.local/bin/pi"
+  if [ -n "$pibin" ]; then
+    if "$pibin" --version >/dev/null 2>&1; then ok "pi coding agent found ($("$pibin" --version 2>/dev/null | head -1))"
+    else warn "${pibin} does not start: pi ${PI_VERSION} needs Node.js 22.19 or later (this Node.js: $(node -v 2>/dev/null || echo none)). Bridge installs, but its agents start only after a Node.js upgrade."; fi
+  elif command -v npm >/dev/null && ver_ge "$(node -v 2>/dev/null | tr -d v)" 22.19; then
+    info "Bridge's agents use the pi coding agent (an npm package, ${PI_VERSION}). It installs into ~/.local, without sudo."
+    if ask "Install pi ${PI_VERSION} with npm?"; then
+      run npm install -g -s --prefix "$HOME/.local" "@earendil-works/pi-coding-agent@${PI_VERSION}" >/dev/null; ok "pi installed in ~/.local/bin"
+    else warn "without pi, Bridge opens but cannot start agents. Later: npm install -g --prefix ~/.local @earendil-works/pi-coding-agent@${PI_VERSION}"; fi
+  else warn "Bridge's agents need the pi coding agent, and pi ${PI_VERSION} needs Node.js 22.19 or later (https://nodejs.org; this Node.js: $(node -v 2>/dev/null || echo none)). Install it, then run this installer again with --with-bridge."
+  fi
+  # pi searches files with ripgrep and fd (optional; without them pi prints a warning and works more slowly)
+  local tools=""
+  command -v rg >/dev/null || tools="$tools ripgrep"
+  command -v fd >/dev/null || command -v fdfind >/dev/null || tools="$tools fd-find"
+  if [ -n "$tools" ] && command -v apt-get >/dev/null; then
+    info "pi searches files with ripgrep and fd. Missing:${tools}."
+    if ask "Install${tools} with apt-get (needs sudo)?"; then
+      need_sudo; run $SUDO apt-get install -y -qq $tools >/dev/null || warn "could not install${tools}"
+    fi
+  elif [ -n "$tools" ]; then warn "pi searches files with ripgrep and fd. Install${tools} for faster file search."; fi
+  if ! command -v fd >/dev/null && command -v fdfind >/dev/null; then   # Debian and Ubuntu name the fd program fdfind
+    run mkdir -p "$HOME/.local/bin"; run ln -sf "$(command -v fdfind)" "$HOME/.local/bin/fd"; ok "fd -> fdfind in ~/.local/bin"
+  fi
+  info "Document search (PDF, Word, PowerPoint and Excel files, with local embeddings) adds about 300 MB."
+  ask "Add document search to Bridge?" && knowledge=1
+  run mkdir -p "$BRIDGE_HOME" "$(dirname "$BRIDGE_BIN")" "$BRIDGE_STATE/pi-agent"
+  [ -x "$BRIDGE_HOME/venv/bin/python" ] || run "$py" -m venv "$BRIDGE_HOME/venv"
+  # build from a copy: pip writes build files next to the source, and the source can be read-only
+  run rm -rf "$BRIDGE_HOME/src"; run mkdir -p "$BRIDGE_HOME/src"
+  run sh -c "cd '$src' && tar -c --exclude=./.git --exclude=./.venv --exclude='*.egg-info' --exclude=__pycache__ . | tar -x -C '$BRIDGE_HOME/src'"
+  run "$BRIDGE_HOME/venv/bin/pip" install -q --upgrade "$BRIDGE_HOME/src$([ "$knowledge" = 1 ] && echo '[knowledge]')" >/dev/null
+  [ "$DRY" = 1 ] || cat > "$BRIDGE_BIN" <<EOF
+#!/bin/sh
+# Kindi Bridge launcher (written by the Kindi installer). Bridge keeps its own pi folder, so ~/.pi does not change.
+export PI_CODING_AGENT_DIR="\${PI_CODING_AGENT_DIR:-${BRIDGE_STATE}/pi-agent}"
+export PATH="\$HOME/.local/bin:\$PATH"
+exec "${BRIDGE_HOME}/venv/bin/kindi-bridge" "\$@"
+EOF
+  [ "$DRY" = 1 ] || chmod 755 "$BRIDGE_BIN"
+  ok "launcher ${BRIDGE_BIN}"
+  # connect Bridge's agents to the first Kindi server (Bridge's own code writes the pi provider, the same form as below)
+  if [ "$DRY" = 0 ]; then
+    if out=$(PI_CODING_AGENT_DIR="$BRIDGE_STATE/pi-agent" BRIDGE_STATE="$BRIDGE_STATE" "$BRIDGE_HOME/venv/bin/python" -c \
+        "import sys; from kindi_bridge import kindi; from kindi_bridge.store import Store; r = kindi.use(Store(), sys.argv[1], 'kindi'); print(r['model'], r['ctx'])" \
+        "http://127.0.0.1:$1" 2>&1); then ok "agents use ${out% *} on port $1 (${out##* } tokens of context)"
+    else warn "could not connect Bridge to port $1: ${out##*$'\n'} (later: Kindi > Connect to an address in Bridge)"; fi
+  fi
+  if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
+    info "Bridge's scheduler sends scheduled prompts. It starts with Bridge; as a user service it also runs when Bridge is closed."
+    if ask "Run the Bridge scheduler as a user service (starts at login)?"; then
+      unit=1
+      [ "$DRY" = 1 ] || { mkdir -p "$(dirname "$BRIDGE_UNIT")"; cat > "$BRIDGE_UNIT" <<EOF
+[Unit]
+Description=Kindi Bridge scheduler and knowledge indexer
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=${BRIDGE_BIN} serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+      }
+      run systemctl --user daemon-reload; run systemctl --user enable --now kindi-bridge.service >/dev/null 2>&1 || warn "could not start the user service"
+    fi
+  fi
+  [ "$DRY" = 1 ] || printf '{"home": "%s", "bin": "%s", "state": "%s", "unit": %s, "knowledge": %s}\n' \
+      "$BRIDGE_HOME" "$BRIDGE_BIN" "$BRIDGE_STATE" "$([ "$unit" = 1 ] && echo "\"$BRIDGE_UNIT\"" || echo null)" "$knowledge" > "$BRIDGE_RECORD"
+  BRIDGE_DONE=1
+}
+
+bridge_uninstall() {
+  [ -f "$BRIDGE_RECORD" ] || [ -x "$BRIDGE_BIN" ] || return 0
+  step "Remove Kindi Bridge" "Removes its venv, launcher and user service. Its state (agents, schedules, knowledge) in ${BRIDGE_STATE} stays unless --purge."
+  # close Bridge first: its own tmux server (the workbench, its agents and their panes), then its scheduler, found by
+  # the PID that Bridge records (never by name). The conversations are saved in the state folder.
+  if command -v tmux >/dev/null && tmux -L kindi-bridge has-session 2>/dev/null; then
+    info "Bridge is open: its window and its agents close now (the conversations are saved)."
+    run tmux -L kindi-bridge kill-server >/dev/null 2>&1 || true; ok "Bridge's tmux server stopped"
+  fi
+  local spid=""
+  [ -f "$BRIDGE_STATE/bridge.sqlite3" ] && command -v python3 >/dev/null && spid=$(python3 -c \
+      "import sqlite3,sys; r=sqlite3.connect(sys.argv[1]).execute(\"SELECT value FROM settings WHERE key='service_pid'\").fetchone(); print(r[0] if r else '')" \
+      "$BRIDGE_STATE/bridge.sqlite3" 2>/dev/null || true)
+  if [ -n "$spid" ] && tr '\0' ' ' < "/proc/$spid/cmdline" 2>/dev/null | grep -q 'kindi_bridge serve\|kindi-bridge serve'; then
+    run kill "$spid" 2>/dev/null || true; ok "Bridge scheduler (PID ${spid}) stopped"
+  fi
+  if [ -f "$BRIDGE_UNIT" ]; then
+    run systemctl --user disable --now kindi-bridge.service >/dev/null 2>&1 || true
+    run rm -f "$BRIDGE_UNIT"; run systemctl --user daemon-reload >/dev/null 2>&1 || true; ok "user service removed"
+  fi
+  if [ -f "$BRIDGE_BIN" ] && grep -q 'written by the Kindi installer' "$BRIDGE_BIN" 2>/dev/null; then run rm -f "$BRIDGE_BIN"; ok "launcher removed"; fi
+  [ -d "$BRIDGE_HOME" ] && { run rm -rf "$BRIDGE_HOME"; ok "Bridge venv removed"; }
+  run rm -f "$BRIDGE_RECORD"
+  if [ "$PURGE" = 1 ] && [ -d "$BRIDGE_STATE" ] && ask "Delete Bridge's state (${BRIDGE_STATE}: agents, conversations, schedules, knowledge indexes)?"; then
+    run rm -rf "$BRIDGE_STATE"; ok "deleted"
+  fi
+}
+
 # ------------------------------------------------------------------------------------------------ uninstall
 if [ "$MODE" = uninstall ]; then
+  bridge_uninstall
   step "Remove the Kindi servers" "Stops and removes this installer's containers. The models in ${DIR} stay unless --purge."
   command -v docker >/dev/null || die "Docker is not installed: nothing to remove"
   docker info >/dev/null 2>&1 || DOCKER="sudo docker"
@@ -177,6 +346,9 @@ step "Check the machine" "Kindi runs on 64-bit Linux: on an NVIDIA GPU from the 
 [ "$(uname -s)" = Linux ] || die "Kindi needs Linux (found $(uname -s))"
 [ "$(uname -m)" = x86_64 ] || die "Kindi needs an x86-64 CPU (found $(uname -m))"
 OS_ID=$(. /etc/os-release 2>/dev/null && echo "${ID:-unknown}") || OS_ID=unknown
+# WSL2 (Kindi for Windows, install.ps1): the Windows driver serves the GPU; its tools are in /usr/lib/wsl/lib
+IS_WSL=0; grep -qsi microsoft /proc/sys/kernel/osrelease && IS_WSL=1
+if [ "$IS_WSL" = 1 ] && [ -d /usr/lib/wsl/lib ]; then case ":$PATH:" in *:/usr/lib/wsl/lib:*) ;; *) PATH="$PATH:/usr/lib/wsl/lib" ;; esac; fi
 RAM_MB=$(awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo)
 AVAIL_MB=$(awk '/MemAvailable/ {print int($2 / 1024)}' /proc/meminfo)
 CORES=$(nproc)
@@ -184,6 +356,10 @@ CORES=$(nproc)
 d="$DIR"; while [ ! -d "$d" ]; do d=$(dirname "$d"); done      # the nearest folder that exists (a dry run makes none)
 FREE_DISK=$(df -Pk "$d" | awk 'NR == 2 {print $4 * 1024}')
 ok "Linux ($OS_ID), ${CORES} CPU threads, $((RAM_MB / 1024)) GB RAM, $(human "$FREE_DISK") free for ${DIR}"
+if [ "$IS_WSL" = 1 ]; then
+  info "WSL2: this RAM is the WSL virtual machine's. Windows gives it about half of the PC's RAM by default;"
+  info "memory= in %UserProfile%\\.wslconfig changes it (install.ps1 -WslMemoryGB N does this)."
+fi
 
 # GPUs: index, name, memory (MiB), compute capability
 GIDX=(); GNAME=(); GMEM=(); GCC=()
@@ -197,10 +373,17 @@ if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
     if [ "$c" = "?" ] || [ -z "$c" ]; then   # older drivers (Kepler's 470) do not report it: from the name
       case "$n" in
         *"GTX TITAN X"*) c=5.2 ;;                                                      # GM200 (Maxwell): before "GTX TITAN"
+        # data-centre parts first: "SXM4" in a name would match the Maxwell M[0-9] pattern below
+        *"Tesla P100"*|*"Quadro GP100"*) c=6.0 ;;                                       # GP100: no dp4a
+        *V100*|*"TITAN V"*|*"Quadro GV100"*) c=7.0 ;;                                   # GV100
+        *A100*|*A30*|*"CMP 170HX"*) c=8.0 ;;                                            # GA100: before A[0-9]
+        *H100*|*H200*|*GH200*) c=9.0 ;;
         # the K20 and K40 patterns must not match the K2000 and the K4000: a digit after "K20" or "K40" is another card
         *K6000*|*K5200*|*K40[!0-9]*|*K40|*K20[!0-9]*|*K20|*"GTX TITAN"*|*"GTX 780"*) c=3.5 ;;   # GK110
         *K80*) c=3.7 ;;                                                                # GK210
         *K420*|*K600*|*K2000*|*K4000*|*K4200*|*K5000*|*K520*|*K10[!0-9]*|*K10|*"GTX 6"*|*"GTX 7"[0-4]*|*"GT 7"*) c=3.0 ;;   # GK104, GK106, GK107
+        # Maxwell 2 (GM200, GM204, GM206) is sm_52: before the M[0-9] line below (issue #30: the M5000 showed sm_50)
+        *"Quadro M2000"|*"Quadro M4000"|*"Quadro M5000"|*"Quadro M6000"*|*"Quadro M3000M"*|*"Quadro M4000M"*|*"Quadro M5000M"*|*"Tesla M4"|*"Tesla M40"*|*"Tesla M6"|*"Tesla M60"*|*"GTX 950"|*"GTX 960"|*"GTX 970"*|*"GTX 980"*|*"GTX 965M"*) c=5.2 ;;
         *K620*|*K1200*|*K2200*|*"GTX 75"*|*"GTX 9"*|*M[0-9]*) c=5.0 ;;
         *"GTX 10"*|*"Quadro P"*|*"TITAN X"*|*Tesla\ P*) c=6.1 ;;
         *"RTX 20"*|*"GTX 16"*|*"Quadro RTX"*|*T4*) c=7.5 ;;
@@ -250,7 +433,9 @@ for k in $(seq 0 $((NA - 1))); do
   case "${AGFX[$k]}" in gfx1103|gfx1151|gfx1152) nm="" ;; *) nm=" (not yet measured with Kindi; the Radeon 780M, 840M and 8060S are)" ;; esac
   ok "AMD GPU ${k}: ${ANAME[$k]}, ${AGFX[$k]}, ${AMEM[$k]} MiB usable${nm}"
 done
-if [ "$NA" = 0 ] && lspci -n 2>/dev/null | grep -E ' 03(00|80): 1002:' >/dev/null; then
+if [ "$IS_WSL" = 1 ] && [ "$NA" = 0 ] && [ "$NG" = 0 ]; then
+  info "WSL2: no GPU that Kindi can use is visible here, so Kindi uses the CPU engine (an AMD GPU cannot be used in WSL2: its engine needs /dev/kfd)"
+elif [ "$NA" = 0 ] && lspci -n 2>/dev/null | grep -E ' 03(00|80): 1002:' >/dev/null; then
   warn "an AMD GPU is in this machine, but its compute driver is not active (no /sys/class/kfd): Kindi cannot use it"
   info "the amdgpu kernel driver ships with Linux; a kernel 6.2 or newer and the package linux-firmware are needed"
 fi
@@ -265,6 +450,7 @@ UNLOCK_IDS=" 2200 2203 2204 2205 2206 2207 2208 220a 220d 2216 222b 222f 2414 24
 unlock_targets() { cat /sys/module/gpu_unlock/parameters/targets 2>/dev/null || true; }
 check_unlock() {
   [ "$NG" -gt 0 ] || return 0
+  [ "$IS_WSL" = 1 ] && return 0      # WSL2: no Linux kernel modules for the GPU; the Windows driver controls it
   local locked=() name bus dev t
   t=$(unlock_targets)
   while IFS=',' read -r i bus dev name; do
@@ -321,7 +507,7 @@ if ! command -v docker >/dev/null; then
     ubuntu|debian|linuxmint|pop)
       if ask "Install Docker (apt package docker.io) and add ${USER} to the docker group?"; then
         need_sudo; run $SUDO apt-get update -qq; run $SUDO apt-get install -y -qq docker.io
-        run $SUDO usermod -aG docker "$USER"; DOCKER="$SUDO docker"
+        run $SUDO usermod -aG docker "$USER"; [ "$DRY" = 1 ] || DOCKER="$SUDO docker"   # a dry run must not wait for a sudo password
       else die "Kindi needs Docker: https://docs.docker.com/engine/install/"; fi ;;
     *) die "install Docker for ${OS_ID} (https://docs.docker.com/engine/install/), then run this again" ;;
   esac
@@ -329,6 +515,8 @@ fi
 if [ "$DRY" = 0 ] && ! docker info >/dev/null 2>&1; then
   if sudo -n docker info >/dev/null 2>&1 || { need_sudo; $SUDO docker info >/dev/null 2>&1; }; then
     DOCKER="sudo docker"; warn "your user cannot use Docker yet (log out and in after 'usermod -aG docker'); using sudo docker"
+  elif [ "$IS_WSL" = 1 ]; then
+    die "Docker does not answer. Under WSL2, Docker needs systemd ([boot] systemd=true in /etc/wsl.conf, then 'wsl --terminate <distribution>' in Windows) or Docker Desktop's WSL integration. install.ps1 sets this up."
   else die "Docker does not answer (is the daemon running? 'sudo systemctl start docker')"; fi
 fi
 ok "Docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,)"
@@ -343,7 +531,9 @@ restart_docker() {
 
 GPU_MODE=none
 if [ "$NG" -gt 0 ] && [ "$GPU" != cpu ]; then
-  if $DOCKER info 2>/dev/null | grep -i 'runtimes.*nvidia' >/dev/null || command -v nvidia-ctk >/dev/null || command -v nvidia-container-toolkit >/dev/null; then
+  if [ "$IS_WSL" = 1 ] && [ "$DRY" = 0 ] && $DOCKER info -f '{{.OperatingSystem}}' 2>/dev/null | grep -q 'Docker Desktop'; then
+    GPU_MODE=toolkit; ok "Docker Desktop (WSL2): the container gets the GPUs with --gpus"
+  elif $DOCKER info 2>/dev/null | grep -i 'runtimes.*nvidia' >/dev/null || command -v nvidia-ctk >/dev/null || command -v nvidia-container-toolkit >/dev/null; then
     GPU_MODE=toolkit; ok "NVIDIA container toolkit found: the container gets the GPUs with --gpus"
   else
     warn "the NVIDIA container toolkit is not installed"
@@ -358,6 +548,9 @@ if [ "$NG" -gt 0 ] && [ "$GPU" != cpu ]; then
         restart_docker
         GPU_MODE=toolkit
       fi
+    fi
+    if [ "$GPU_MODE" = none ] && [ "$IS_WSL" = 1 ]; then
+      die "under WSL2 a container reaches the GPU only through the NVIDIA container toolkit or Docker Desktop. Install one of them (install.ps1 does), or use --gpu cpu."
     fi
     if [ "$GPU_MODE" = none ]; then
       GPU_MODE=passthrough; info "Kindi passes the GPU devices and the driver libraries to the container itself instead"
@@ -377,6 +570,7 @@ fi
 # The Radeon 780M (gfx1103) resets under long GPU work when the driver preempts a running kernel (CWSR). The kernel
 # option amdgpu.cwsr_enable=0 turns that preemption off; with it, the long-prompt tests that reset the GPU passed.
 check_cwsr() {
+  [ "$IS_WSL" = 1 ] && return 0
   local v; v=$(cat /sys/module/amdgpu/parameters/cwsr_enable 2>/dev/null || echo "?")
   [ "$v" = 0 ] && { ok "amdgpu.cwsr_enable=0 is set (the 780M needs it for long prompts)"; return 0; }
   warn "the kernel option amdgpu.cwsr_enable=0 is not set (cwsr_enable=${v})."
@@ -429,9 +623,10 @@ nb_cards() {      # NVIDIA card positions (candidates) -> the fewest of them, la
 card_models() {   # NVIDIA card position -> the models that run on it, the best first
   local V=${GMEM[$1]}
   case "$(card_class "$1")" in
-    tc|pascal8) echo "27b nemotron 9b 4b 2b" ;;
-    p100) echo "27b 9b 4b 2b" ;;
-    kepler) if [ "$V" -ge 11000 ]; then echo "27b 9b 4b 2b"; elif [ "$V" -ge 3800 ]; then echo "9b 4b 2b"   # no Nemotron on Kepler
+    tc|pascal8) if [ "$V" -ge 5800 ]; then echo "27b lightning nemotron 9b 4b 2b"; else echo "27b nemotron 9b 4b 2b"; fi ;;
+    p100) echo "27b lightning 9b 4b 2b" ;;
+    # Kepler: Lightning on the 12 GB cards (Quadro K6000); no Nemotron Bolt
+    kepler) if [ "$V" -ge 11000 ]; then echo "27b lightning 9b 4b 2b"; elif [ "$V" -ge 3800 ]; then echo "9b 4b 2b"
             elif [ "$V" -ge 1900 ]; then echo "4b 2b"; else echo "2b"; fi ;;
     *) if [ "$V" -ge 3800 ]; then echo "9b nemotron 4b 2b"; elif [ "$V" -ge 3300 ]; then echo "4b nemotron 2b"
        elif [ "$V" -ge 1900 ]; then echo "4b 2b"; else echo "2b"; fi ;;
@@ -459,13 +654,14 @@ model_label() {
   case "$1" in
     27b) echo "Ternary-Bonsai-2 27B" ;;
     nemotron) echo "NVIDIA Nemotron 3.5 Bolt E4B" ;;
+    lightning) echo "Nemotron 3.5 Lightning 30B-A3B (ternary)" ;;
     nanbeige) echo "AH-Nanbeige4.3-33B IQ3_XXS" ;;
     *) echo "Ternary-Bonsai-2 ${1^^}" ;;
   esac
 }
 # A setup is one or more servers. Each server is "backend|model|cards", where cards is a card list ("0,1": one model
 # split over both), "kind:0 3 5" (any free card of this kind: each pick takes the next one) or "" (the CPU).
-short() { case "$1" in nemotron) echo Nemotron ;; nanbeige) echo Nanbeige ;; *) echo "${1^^}" ;; esac; }
+short() { case "$1" in nemotron) echo Nemotron ;; lightning) echo Lightning ;; nanbeige) echo Nanbeige ;; *) echo "${1^^}" ;; esac; }
 CFG=()            # the servers of each setup, separated by ";"
 CFG_N=()          # the label of each setup
 add_cfg() { CFG+=("$1"); CFG_N+=("$2"); }
@@ -623,12 +819,16 @@ profile_of() {
             ENV+=(-e KINDI_CARDS=1 -e KINDI_REPEAT_STOP=1 -e KINDI_CHECKPOINT_BUDGET_MB=1280 -e KINDI_PARK_MAX=1
                   -e KINDI_DENSE_SPACING=2048 -e KINDI_PREFIX_MAX=2 -e KINDI_MAX_TOKENS=65536)
             if [ "$M" = 27b ]; then   # the profile of the RTX 3080 cluster servers (docs/CARDS.md)
-              ENV+=(-e KINDI_TC=1 -e KINDI_FD=1 -e KINDI_ATT_TC=1 -e KINDI_CKPT_VRAM=1
-                    -e KINDI_SPEC_K=3 -e KINDI_SPEC_PACK=/data/pack-2b -e KINDI_SPEC_WINDOW=8192
-                    -e KINDI_TC_TMAX=4 -e KINDI_MEM_RESERVE_MB=160)
-              # auto (docs/MTP.md): the 2B drafter, k=2 below 1K tokens of context and k=3 from 1K
-              ENV+=(-e KINDI_SPEC=auto)
-              XPACKS+=(2b)
+              [ "${NO_DSPINE:-0}" = 0 ] && NEED_DSPINE=1
+              ENV+=(-e KINDI_TC=1 -e KINDI_FD=1 -e KINDI_ATT_TC=1 -e KINDI_CKPT_VRAM=1 -e KINDI_MEM_RESERVE_MB=160 -e KINDI_SPEC=auto)
+              if dspine_ready; then
+                # auto (docs/DSPINE.md): the DSpine block drafter, the current token + 7 drafts per verify pass
+                ENV+=(-e KINDI_DSPINE=/data/dspine -e KINDI_TC_TMAX=8)
+              else
+                # auto (docs/MTP.md): the 2B drafter, k=2 below 1K tokens of context and k=3 from 1K
+                ENV+=(-e KINDI_SPEC_K=3 -e KINDI_SPEC_PACK=/data/pack-2b -e KINDI_SPEC_WINDOW=8192 -e KINDI_TC_TMAX=4)
+                XPACKS+=(2b)
+              fi
             elif [ "$M" = 2b ] && mtp_ready; then   # the 2B with its own MTP head: the plan engine on the tensor cores
               ENV+=(-e KINDI_TC=1 -e KINDI_TP=1 -e KINDI_FD=1 -e KINDI_ATT_TC=1 -e KINDI_TC_TMAX=4
                     -e KINDI_SPEC=auto -e "KINDI_MTP_HEAD=/data/mtp/$MTPF")
@@ -651,15 +851,18 @@ profile_of() {
     [ "$PROFILE" = tc ] || ENV+=(-e KINDI_BLOCKING_SYNC=0)
   fi
   [ "$M" = nemotron ] && C=${CTX/auto/24576}
+  # Lightning: 32K by default (more context takes card memory from the experts on 6 to 8 GB cards); the host
+  # experts are pinned host memory, so the container needs room for them
+  if [ "$M" = lightning ]; then C=${CTX/auto/32768}; [ -z "$MEM" ] || [ "${MEM%g}" -lt 14 ] && MEM=14g; fi
   [ -n "$MEMORY" ] && MEM="$MEMORY"
   return 0
 }
-model_name() { case "$1" in nemotron) echo "nemotron-bolt-e4b" ;; nanbeige) echo "nanbeige-33b-iq3" ;; *) echo "bonsai2-$1" ;; esac; }
+model_name() { case "$1" in nemotron) echo "nemotron-bolt-e4b" ;; lightning) echo "nemotron-lightning-30b" ;; nanbeige) echo "nanbeige-33b-iq3" ;; *) echo "bonsai2-$1" ;; esac; }
 
 PACKS=(); BACKENDS=" "; ram_need=0; cwsr=0
 for i in $(seq 0 $((NS - 1))); do
   profile_of "$i"; M=${SV_M[$i]}
-  [ -n "${GGUF[$M]:-}" ] || die "unknown model '${M}' (2b, 4b, 9b, 27b, nemotron or nanbeige)"
+  [ -n "${GGUF[$M]:-}" ] || die "unknown model '${M}' (2b, 4b, 9b, 27b, lightning, nemotron or nanbeige)"
   for p in "$M" ${XPACKS[@]+"${XPACKS[@]}"}; do case " ${PACKS[*]+${PACKS[*]}} " in *" $p "*) ;; *) PACKS+=("$p") ;; esac; done
   case "$BACKENDS" in *" ${SV_B[$i]} "*) ;; *) BACKENDS="$BACKENDS${SV_B[$i]} " ;; esac
   [[ "$MEM" =~ ^[0-9]+g$ ]] && ram_need=$((ram_need + ${MEM%g} * 1024))
@@ -712,7 +915,9 @@ image_of() {
   else echo "kindi:${KINDI_VERSION}"; fi
 }
 UIDGID="$(id -u):$(id -g)"
-USERARG=(-u "$UIDGID"); [ "$ROOTLESS" = 1 ] && USERARG=()
+# the images run as a fixed user (1000:1000); rootful Docker runs them as this user, rootless Docker as the
+# container's root, which is this user on the host (the image's own user would be a subuid that cannot write $DIR)
+USERARG=(-u "$UIDGID"); [ "$ROOTLESS" = 1 ] && USERARG=(-u 0:0)
 
 # ------------------------------------------------------------------------------------------------ 4. image
 src_id=""
@@ -737,7 +942,10 @@ for e in $IMAGES; do
   else
     SRC="$DIR/src-${KINDI_VERSION}"
     tarball="${SOURCE:-$SOURCE_URL}"
-    if [ ! -f "$SRC/$DOCKERFILE" ]; then
+    # an explicit --source tarball or URL is unpacked again on every run: a rerun with newer source must not keep
+    # the tree of the first run (the default release tarball of this version does not change, so it is kept)
+    if [ ! -f "$SRC/$DOCKERFILE" ] || [ -n "$SOURCE" ]; then
+      [ -n "$SOURCE" ] && run rm -rf "$SRC"
       run mkdir -p "$SRC"
       if [ -f "$tarball" ]; then run tar -xzf "$tarball" -C "$SRC" --strip-components=1
       else run sh -c "curl -fsSL '$tarball' | tar -xz -C '$SRC' --strip-components=1"; fi
@@ -773,7 +981,7 @@ if [ "$GPU_MODE" = toolkit ] && [ "$nv" = 1 ] && [ "$DRY" = 0 ]; then
 fi
 
 # ------------------------------------------------------------------------------------------------ 5. download
-step "Download the model$([ "${#PACKS[@]}" -gt 1 ] && echo s)" "From Hugging Face (Prism ML; unsloth for Nemotron; ahtx for Nanbeige). The sha256 of each file must match the value in this script."
+step "Download the model$([ "${#PACKS[@]}" -gt 1 ] && echo s)" "From Hugging Face (Prism ML; unsloth for Nemotron Bolt; boro64 for Nemotron Lightning; ahtx for Nanbeige). The sha256 of each file must match the value in this script."
 [ "$DRY" = 1 ] || mkdir -p "$DIR/models"
 for p in ${PACKS[@]+"${PACKS[@]}"}; do
   f="$DIR/models/${GGUF[$p]}"
@@ -809,6 +1017,39 @@ if [ "${NEED_MTP:-0}" = 1 ] && ! mtp_ready; then
 fi
 mtp_ready && ok "MTP is on: KINDI_SPEC=auto with ${MTPF} (sha256 ${MTPSHA:0:16}...; docs/MTP.md)"
 
+# the DSpine drafter for the 27B on tensor-core cards (sha256 pinned above); without it the 27B drafts with the 2B
+if [ "${NEED_DSPINE:-0}" = 1 ] && ! dspine_ready; then
+  info "DSpine drafter: Tencent's Qwen3.8-27B-DSpine-b16, Apache-2.0 ($(human "$DSPSIZE")); --no-dspine leaves it out"
+  [ "$DRY" = 1 ] || mkdir -p "$DIR/dspine"
+  okd=1
+  for j in 0 1 2; do
+    f="$DIR/dspine/${DSPF[$j]}"
+    [ -f "$f.sha256-ok" ] && continue
+    if [ -t 2 ]; then prog=--progress-bar; else prog=-sS; fi
+    if run curl -fL --retry 5 --retry-delay 5 -C - "$prog" -o "$f.part" "$DSP_URL/${DSPF[$j]}"; then
+      if [ "$DRY" = 0 ]; then
+        got=$(sha256sum "$f.part" | cut -d' ' -f1)
+        if [ "$got" = "${DSPSHA[$j]}" ]; then mv "$f.part" "$f"; touch "$f.sha256-ok"
+        else rm -f "$f.part"; okd=0; info "DSpine ${DSPF[$j]}: sha256 ${got} is not the expected ${DSPSHA[$j]} (deleted)"; fi
+      fi
+    else
+      okd=0; info "DSpine ${DSPF[$j]}: the download failed"
+    fi
+  done
+  [ "$okd" = 1 ] || info "DSpine stays off: the 27B drafts with the 2B (run the installer again to retry)"
+fi
+if dspine_ready; then
+  ok "DSpine is on: KINDI_SPEC=auto drafts the 27B with Tencent's DSpine (sha256 ${DSPSHA[2]:0:16}...; docs/DSPINE.md)"
+  info "NOTICE: the DSpine weights are (c) Tencent, under the Apache License 2.0 ($DIR/dspine/LICENSE); Kindi's drafter"
+  info "        code is Kindi's own. The weights are downloaded from Hugging Face, not redistributed by Kindi."
+  [ "$DRY" = 1 ] || cat > "$DIR/dspine/NOTICE" <<NOTICE_EOF
+DSpine draft model weights: tencent/Qwen3.8-27B-DSpine-b16 (Hugging Face), Copyright Tencent, licensed under the
+Apache License, Version 2.0 (LICENSE in this folder). Downloaded at revision 5f54174d301dbca65d9aa4448dc47e56732d9a12.
+Kindi uses them unmodified (quantized to int4 in memory at load); Kindi's drafter code (kindi/dspine.py, kindi/dspine.cu)
+is its own implementation.
+NOTICE_EOF
+fi
+
 # ------------------------------------------------------------------------------------------------ 6. convert + verify
 step "Convert and verify" "kindi convert builds Kindi's weight pack; kindi verify checks the output against llama.cpp, token for token, once for each model on each kind of card."
 state_of() {      # the cache folder of server i: one per model, and one per card when a model runs more than once
@@ -830,7 +1071,7 @@ for p in ${PACKS[@]+"${PACKS[@]}"}; do
 done
 # this installer's servers hold the GPUs: stop them for the checks (the chosen ones start again below)
 for c in $OURS $(printf '%s ' "${SV_NAME[@]}"); do
-  if $DOCKER ps --format '{{.Names}}' | grep -x "$c" >/dev/null; then info "stopping '${c}' for the check"; run $DOCKER stop "$c" >/dev/null; fi
+  if $DOCKER ps --format '{{.Names}}' 2>/dev/null | grep -x "$c" >/dev/null; then info "stopping '${c}' for the check"; run $DOCKER stop "$c" >/dev/null; fi
 done
 SPEED=(); declare -A SPK
 for i in $(seq 0 $((NS - 1))); do
@@ -848,7 +1089,7 @@ for i in $(seq 0 $((NS - 1))); do
     if $DOCKER run --rm ${VX[@]+"${VX[@]}"} ${BASE[@]+"${BASE[@]}"} ${GARGS[@]+"${GARGS[@]}"} ${ENV[@]+"${ENV[@]}"} -e "KINDI_PACK=/data/pack-$M" -e KINDI_HEAD=exact "$IMAGE" verify > "$VERIFY_OUT" 2>&1; then
       grep -E "PASS|FAIL" "$VERIFY_OUT" | sed 's/^\[[^]]*\] /    /' | sed -n 1,6p
       sp=$(grep -o '[0-9.]* tokens/s over the run' "$VERIFY_OUT" | awk '{print $1}')
-      if [ "$M" = nanbeige ]; then ok "server $((i + 1)): agrees with llama.cpp on each prompt, up to a llama.cpp tie (${sp} tokens/s over the check)"
+      if [ "$M" = nanbeige ] || [ "$M" = lightning ]; then ok "server $((i + 1)): agrees with llama.cpp on each prompt, up to a llama.cpp tie (${sp} tokens/s over the check)"
       elif [ "$M" = nemotron ]; then ok "server $((i + 1)): agrees with llama.cpp on the first 12 tokens or more of each prompt (${sp} tokens/s over the check)"
       else ok "server $((i + 1)): token-exact with llama.cpp (${sp} tokens/s over the check, prompt tokens included)"; fi
     else
@@ -860,7 +1101,29 @@ for i in $(seq 0 $((NS - 1))); do
 done
 
 # ------------------------------------------------------------------------------------------------ 7. service
-step "Start the server$([ "$NS" -gt 1 ] && echo s)" "Docker containers with restart=unless-stopped: they start again after a reboot. Only this machine can reach them (127.0.0.1)."
+# network access: 127.0.0.1 only (the default), or the local network with --lan. The API key goes to the
+# containers through an env file (mode 600), so it is not on a command line or in the dry-run output.
+BIND=127.0.0.1; KEYFILE="$DIR/api-key"; KEYENV="$DIR/api-key.env"; KEY=""
+if [ "$APIKEY" = none ]; then KEY=""
+elif [ -n "$APIKEY" ]; then KEY=$APIKEY
+elif [ "$LAN" = 1 ]; then
+  if [ -s "$KEYFILE" ]; then KEY=$(cat "$KEYFILE")      # the key of an earlier --lan install: clients keep working
+  else KEY="kindi-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"; fi
+fi
+[ "$LAN" = 1 ] && BIND=0.0.0.0
+if [ "$DRY" = 0 ]; then
+  if [ -n "$KEY" ]; then
+    (umask 077; printf '%s\n' "$KEY" > "$KEYFILE"; printf 'KINDI_API_KEY=%s\n' "$KEY" > "$KEYENV")
+  else rm -f "$KEYENV"; fi
+fi
+if [ "$LAN" = 1 ]; then
+  step "Start the server$([ "$NS" -gt 1 ] && echo s)" "Docker containers with restart=unless-stopped: they start again after a reboot. --lan: other computers on this network can reach them."
+  warn "--lan: anyone who can reach this computer on the network can use these servers$([ -n "$KEY" ] && echo " if they have the API key" || echo ", with no key (--api-key none)")."
+  warn "Use --lan only on a network that you trust. Do not forward these ports from the internet."
+  [ -z "$KEY" ] && warn "No API key: any program on the network can send requests and read the answers."
+else
+  step "Start the server$([ "$NS" -gt 1 ] && echo s)" "Docker containers with restart=unless-stopped: they start again after a reboot. Only this machine can reach them (127.0.0.1)."
+fi
 for c in $OURS; do      # an earlier install's servers that this setup does not keep
   case " ${SV_NAME[*]} " in *" $c "*) ;; *)
     if $DOCKER ps -a --format '{{.Names}}' | grep -x "$c" >/dev/null; then info "removing the earlier server '${c}'"; run $DOCKER rm -f "$c" >/dev/null; fi ;; esac
@@ -869,9 +1132,10 @@ GOT_CTX=(); GOT_VER=$KINDI_VERSION; GOT_SHA=""; JSON=""
 for i in $(seq 0 $((NS - 1))); do
   profile_of "$i"; M=${SV_M[$i]}; b=${SV_B[$i]}; nm=${SV_NAME[$i]}; pt=${SV_PORT[$i]}
   base_of "$i"; gpu_args "$b"; IMAGE=$(image_of "$b" "$i")
-  $DOCKER ps -a --format '{{.Names}}' | grep -x "$nm" >/dev/null && run $DOCKER rm -f "$nm" >/dev/null
-  SARGS=(-d --name "$nm" --restart unless-stopped ${BASE[@]+"${BASE[@]}"} ${GARGS[@]+"${GARGS[@]}"} ${ENV[@]+"${ENV[@]}"} -p "127.0.0.1:${pt}:8093"
+  $DOCKER ps -a --format '{{.Names}}' 2>/dev/null | grep -x "$nm" >/dev/null && run $DOCKER rm -f "$nm" >/dev/null
+  SARGS=(-d --name "$nm" --restart unless-stopped ${BASE[@]+"${BASE[@]}"} ${GARGS[@]+"${GARGS[@]}"} ${ENV[@]+"${ENV[@]}"} -p "${BIND}:${pt}:8093"
          -e "KINDI_PACK=/data/pack-$M" -e "KINDI_CTX=$C" -e KINDI_HEAD=exact -e "KINDI_MODEL_NAME=$(model_name "$M")" -e KINDI_HOST=0.0.0.0)
+  [ -n "$KEY" ] && SARGS+=(--env-file "$KEYENV")
   [ -n "$MEM" ] && SARGS+=(--memory "$MEM")
   [ -n "$CPUS" ] && SARGS+=(--cpus "$CPUS")
   run $DOCKER run ${SARGS[@]+"${SARGS[@]}"} "$IMAGE" serve >/dev/null
@@ -907,6 +1171,17 @@ ${JSON}
  ]}
 EOF
 
+# ------------------------------------------------------------------------------------------------ Kindi Bridge (optional)
+BRIDGE_DONE=0
+[ "$BRIDGE" = ask ] && [ -f "$BRIDGE_RECORD" ] && BRIDGE=yes      # installed before: upgrade it too
+if [ "$BRIDGE" = ask ] && [ "$YES" = 0 ] && [ "$DRY" = 0 ] && [ -r /dev/tty ]; then
+  echo
+  info "Optional: Kindi Bridge, a terminal workspace for agents on Kindi (conversations, scheduled prompts,"
+  info "completion checks, local knowledge folders and live Kindi telemetry). You can add it later with --with-bridge."
+  ask "Install Kindi Bridge too?" && BRIDGE=yes
+fi
+[ "$BRIDGE" = yes ] && bridge_install "${SV_PORT[0]}"
+
 # ------------------------------------------------------------------------------------------------ done
 echo
 echo "${G}${B}Kindi is running$([ "$NS" -gt 1 ] && echo ": ${NS} servers").${N}"
@@ -916,22 +1191,32 @@ for i in $(seq 0 $((NS - 1))); do
   echo "  ${SV_NAME[$i]}  http://127.0.0.1:${SV_PORT[$i]}/v1  $(model_name "${SV_M[$i]}") on $([ "${SV_B[$i]}" = cpu ] && echo "the CPU" || echo "$([ "${SV_B[$i]}" = rocm ] && echo "AMD ")GPU ${SV_C[$i]}"), ${GOT_CTX[$i]:-?} tokens, ${SPEED[$i]:-?} tokens/s in the check"
 done
 URL="http://127.0.0.1:${SV_PORT[0]}/v1"; MODEL_NAME=$(model_name "${SV_M[0]}")
+AUTH_H=""; [ -n "$KEY" ] && AUTH_H=" -H \"Authorization: Bearer \$(cat ${KEYFILE})\""
+if [ "$LAN" = 1 ]; then
+  LANIP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  echo
+  echo "  Local network: $(for i in $(seq 0 $((NS - 1))); do printf 'http://%s:%s/v1  ' "${LANIP:-<this computer>}" "${SV_PORT[$i]}"; done)"
+  if [ -n "$KEY" ]; then echo "  API key: in ${KEYFILE} (clients send it as: Authorization: Bearer <key>)"
+  else echo "  API key: none (--api-key none)"; fi
+  command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active" && \
+    echo "  The ufw firewall is on: allow the port(s) for your network: sudo ufw allow from <your network>/24 to any port ${SV_PORT[0]}"
+fi
 cat <<EOF
 
   Each server is an OpenAI-compatible endpoint; status: /health on its port. Logs: ${DOCKER} logs -f ${SV_NAME[0]}
   The containers restart unless stopped.
 
 Try it:
-  curl ${URL}/chat/completions -H 'Content-Type: application/json' \\
+  curl ${URL}/chat/completions -H 'Content-Type: application/json'${AUTH_H} \\
     -d '{"messages": [{"role": "user", "content": "Hello!"}]}'
 
 OpenAI clients:
-  export OPENAI_BASE_URL=${URL}  OPENAI_API_KEY=none
+  export OPENAI_BASE_URL=${URL}  OPENAI_API_KEY=$([ -n "$KEY" ] && echo "\$(cat ${KEYFILE})" || echo none)
 
 pi (~/.pi/agent/models.json; one provider for each server):
   {"providers": {
 $(for i in $(seq 0 $((NS - 1))); do mn=$(model_name "${SV_M[$i]}"); pv=${SV_NAME[$i]}
-  printf '    "%s": {"baseUrl": "http://127.0.0.1:%s/v1", "api": "openai-completions", "apiKey": "none",\n' "$pv" "${SV_PORT[$i]}"
+  printf '    "%s": {"baseUrl": "http://127.0.0.1:%s/v1", "api": "openai-completions", "apiKey": "%s",\n' "$pv" "${SV_PORT[$i]}" "$([ -n "$KEY" ] && echo "<the key in ${KEYFILE}>" || echo none)"
   printf '      "compat": {"supportsDeveloperRole": false, "supportsReasoningEffort": false,\n'
   printf '                 "thinkingFormat": "qwen-chat-template", "thinkingTokenBudgetField": "thinking_budget_tokens"},\n'
   printf '      "models": [{"id": "%s", "name": "%s", "reasoning": true, "input": ["text"],\n' "$mn" "$mn"
@@ -942,3 +1227,10 @@ done)
 
 Run this installer again to upgrade, repair or change the setup. Remove Kindi: bash install.sh --uninstall [--purge]
 EOF
+if [ "$BRIDGE_DONE" = 1 ]; then cat <<EOF
+
+Kindi Bridge:
+  kindi-bridge        opens the workspace (Agents > New agent starts an agent on Kindi; Help > Getting started)
+  Over SSH: ssh -t HOST kindi-bridge. Detach with View > Detach: the agents keep running.
+EOF
+fi

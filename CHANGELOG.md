@@ -1,5 +1,142 @@
 # Changelog
 
+## 0.6.0 (2026-11-12)
+
+### New
+
+- **DeepSeek V4.1 Flash is a supported model** ([docs/DEEPSEEK.md](docs/DEEPSEEK.md)). It uses one CUDA card with
+  12 GB or more and host RAM for the experts. A second card can hold hot experts. It drafts with DSpark and saves its
+  prompt cache.
+  - On one RTX 3060 12 GB, a Quadro M4000 as the expert card and two Xeon E5-2673 v4 CPUs, Kindi writes 18.7
+    tokens/s with DSpark (the default). It reads a real-text prompt at about 95 to 100 tokens/s.
+  - `tools/install_dsv41.sh` checks the host and picks a profile. The big-RAM profile is measured. The NVMe profile is
+    experimental, and we did not measure it yet.
+  - The script downloads the files and checks their sha256. It writes a systemd service. It does not replace an
+    existing service without `--force`.
+  - `python -m kindi.dsv41 verify` checks 20 prompts of 64 tokens against the reference. The gate is 98.5% top-1
+    agreement. Each miss must be a near-tie, with a top-2 gap of 0.75 or less.
+  - The default numerics are DeepSeek's own FP8/FP4 rounding. `--flags 160` uses the rounding of the reference.
+- **Nemotron 3.5 Lightning 30B-A3B (ternary).** Kindi has a backend for Nota AI's ternary version of NVIDIA
+  Nemotron 3.5 Lightning 30B-A3B (GGUF by boro64, Q2_0). Use `kindi use lightning-30b`. The model has Mamba-2,
+  mixture-of-experts and attention layers. On an RTX 3080 at 190 W, Kindi writes 310 tokens/s at 512 tokens and
+  277 at 32K (llama.cpp 202 and 182). It reads a 32K prompt at 3,777 tokens/s (llama.cpp 2,138). On an RTX 3090
+  at 220 W, it writes 341 tokens/s at 512 tokens (llama.cpp 284). On a GTX 1080 with 8 GB, 95 of the 128 experts
+  of each layer are on the card, and Kindi writes 75 tokens/s after a text prompt of 512 tokens (llama.cpp, with the experts of 9 layers on
+  the CPU: 4.7). On a Quadro K6000, it writes 61.9
+  tokens/s and reads 206 tokens/s at 512 tokens (llama.cpp 35.1 and 165). The server supports chat, streaming, the thinking block and tool calls.
+  [docs/CARDS.md](docs/CARDS.md) and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) give the numbers. The weights are
+  not part of Kindi; their licence is OpenMDW 1.1.
+- **Host-memory experts.** On cards with less than 10 GB, the least used experts of the Lightning model stay in
+  host memory. The card reads them over PCIe. During generation, each layer keeps its last used host experts in 10
+  slots on the card (`KINDI_LT_DCACHE`), so an expert that the next token uses again is
+  not read again. On an RTX 2070 SUPER (8 GB, PCIe 3.0 x16), Kindi writes 116.4 tokens/s after a 512-token text
+  prompt and 120.3 after 8K (llama.cpp on the same card, with the experts of 12 layers on the CPU: 113.5 and
+  111.8), and reads 2,121 tokens/s (llama.cpp 1,137).
+- **Nemotron 3.5 Lightning is a supported model.** The installer offers it (`--model lightning`) on NVIDIA cards
+  with 6 GB or more from the GTX 10 series on, on the Tesla P100 and on the 12 GB Kepler cards, after the 27B. The
+  default context is 32K.
+- **One mixture-of-experts placement for every MoE engine** (`kindi/moe.py`). It decides which experts of which
+  layer go to the card, to host memory and (for the DeepSeek engine on hosts with little RAM) to the disk, from
+  measured pick counts (`kindi/lightning-experts.json` now has them). With host experts, the card slots go to the
+  most used experts over all layers. `KINDI_MOE_WEIGHTED=0` keeps the same count in each layer.
+- **The DSpine drafter for the 27B** ([docs/DSPINE.md](docs/DSPINE.md)). It is a block drafter that reads five
+  layers of the 27B. Its weights are Apache-2.0. The output is the same as plain decoding.
+  - RTX 3080 at 190 W, context 32768: DSpine writes 115.5 tokens/s and accepts 3.10 tokens per pass.
+  - The installer downloads DSpine for the 27B on tensor-core cards. `KINDI_SPEC=auto` uses it. `--no-dspine` keeps
+    the 2B drafter.
+- **Exact token counts and the real context.** New endpoints: `/v1/tokenize` and `/v1/detokenize`. With
+  `"dry_run": true`, a request gives the exact `prompt_tokens` and does not generate. `/v1/models` gives the context
+  limit (`max_model_len`, `meta.n_ctx`). A prompt that does not fit gets an HTTP 400 at once, with the code
+  `context_length_exceeded`.
+- **Progress during long reads.** A stream gets a `: kindi progress {...}` comment every 10 s. A client that does not
+  stream can ask for keep-alive spaces with `kindi_keepalive`.
+- **A save after each turn.** The server writes the state to the disk in the background after each answer. A restart
+  does not lose the turn. DeepSeek in thinking mode saves the state before `<think>`.
+- **Conversations by session.** Send the `X-Kindi-Session` header, or `kindi_session` or `user`. When the cache is
+  full, older states of a session go before the newest states of other sessions. The DeepSeek server keeps 2 to 4
+  conversations in RAM with `--slots N`.
+- **Priority.** A request is chat (the default) or background (`kindi_priority`, `X-Kindi-Priority`). Chat goes
+  first. A background read stops between chunks for a chat request. Then it continues from the cache, and the answer
+  does not change.
+- **DeepSeek sampling.** The server uses temperature, top_p, top_k and min_p. DSpark drafts for sampled requests too,
+  and the output has the distribution of plain sampling. A repeat guard is on by default.
+- **`/health` reports drafting:** the method, the drafter, and the drafted and accepted tokens of the last request.
+- **`install.sh --lan`** serves the local network. It makes an API key in `~/.kindi/api-key` and gives the key to the
+  container in an env file. `--api-key K` sets the key. `--lan` is off by default.
+- **Kindi Bridge in the installer.** It is optional: `--with-bridge`, `--no-bridge` and `--bridge-source D`, and
+  `-WithBridge` on Windows. Bridge 0.6.0 shows the Kindi servers and their features. Its menus are Agents, Schedule,
+  Kindi, Files, System, View and Help. The manual has a Kindi Bridge chapter. Bridge is AGPL-3.0, as Kindi is.
+- **AH-Nanbeige4.3-33B with an 8-bit K/V cache.** The new default is `kv_cache auto`. It uses f16 when the model and
+  the f16 cache fit at the chosen context. Otherwise it uses q8_0. Both caches pass `kindi verify`. The q8_0 check
+  counts the tokens up to the first difference from the f16 reference. Kindi keeps 475 of 586 tokens.
+- **Kindi on Windows 10 and 11 with one PowerShell command** (`install.ps1`, [docs/WINDOWS.md](docs/WINDOWS.md)).
+  - The installer checks the PC: x86-64, the Windows build, virtualization, RAM, the GPU driver and the proxy.
+  - It turns on WSL2 if it is off. After the restart, it continues by itself.
+  - It makes a WSL2 distribution only for Kindi (Ubuntu 24.04 from Canonical, sha256-checked). It does not change your
+    other distributions.
+  - It uses Docker Desktop if you have it. If not, it installs Docker Engine and the NVIDIA container toolkit in the
+    Kindi distribution.
+  - It checks that the GPU reaches WSL2, and it runs `install.sh` inside. Then it checks the server on
+    `http://localhost:8093` from Windows.
+  - It adds the Kindi Console (status, chat, logs, API settings), a shell item, an uninstall item and a Settings > Apps
+    entry.
+  - AMD GPUs use the CPU engine on Windows, because WSL2 has no `/dev/kfd`. A native Windows build is not in 0.6.0.
+- **`install.sh` under WSL2.** It finds `nvidia-smi` in `/usr/lib/wsl/lib`. It says that the RAM is the RAM of the
+  WSL virtual machine. It does not make kernel changes (gpu-unlock, the 780M option). It uses the GPU support of
+  Docker Desktop.
+- **The model on the first start of a Kindi container.** Set `KINDI_MODEL` to a model id or to a GGUF file in the volume. The container
+  downloads the model and checks its sha256. It builds the pack once into `/data/packs/<name>` and uses it again at
+  the next starts. Two containers on the same volume build it once. `KINDI_VERIFY_ON_START=1` runs `kindi verify`
+  once for each pack and kind of card.
+### Changed
+
+- DeepSeek: the card does its part of each layer in fewer steps, and some kernels run at the same time. The card
+  time for each token goes from 34.6 to 24.1 ms. The output does not change, bit for bit.
+- DeepSeek: DSpark calculates the cost of a draft from the experts that all the drafted tokens use together. This
+  is on by default. The output does not change.
+- The images run as the user 1000:1000, not as root. With rootless Docker, the installer now uses `-u 0:0`.
+- The CUDA image does not have the CUDA static libraries, NPP and nvJPEG. Kindi does not use them.
+- Drafting on the tensor-core path uses `KINDI_FD=1` when `KINDI_FD` is not set. With `0`, a drafted answer could be
+  different from plain decoding at near-ties. 0.5.0 had this too. The profiles of the installer already set `1`.
+- The installer names more cards correctly with the 470 driver. The Maxwell Quadro M cards are compute 5.2 (it
+  printed sm_50). The Tesla P100 is sm_60 (it guessed 6.1). The A100 is sm_80 (it matched a Maxwell pattern).
+
+### Fixed
+
+- DeepSeek: when `max_tokens` or the context stopped a reply in its tool calls, the server sent the raw tool-call
+  markup as text. Now the reply has `finish_reason` "length", the complete calls, and the cut call with the start
+  of its arguments, as in the OpenAI API. A request without `max_tokens` can use the remaining context (the limit
+  was 4096 tokens).
+- Lightning on 8 GB cards with host experts stopped with "out of memory" at the decode slots (an RTX 2070 SUPER):
+  the plan's reserve of 350 MB did not cover what the plan does not count. The engine now frees everything, keeps
+  free what the failed allocation was short of (plus 96 MB), and plans again (up to 3 times). `kindi verify` passes
+  on the RTX 2070 SUPER.
+- Tool calls of the Lightning server: one call per reply unless the request asks for `parallel_tool_calls` (the
+  model could write the same call 20 times, 3,000+ tokens), a repeated call ends a parallel reply, a call cut by a
+  stop token is closed and parsed (a call without a required parameter is still dropped), the slips
+  `<parameter=name=value>` and `</function_call>` are read, a `<tool_call>` quoted in backticks is text, and a call
+  of a tool that the request did not offer (the chat template's example call) is not returned. 57 of 60 test
+  requests come back as correct calls (`tools/lt_tooltest.py`, 5 rounds), without the long repeated-call replies.
+- Sampled speculation used the temperature before top-p, and it did not use min_p. So the server turned drafting
+  off for min_p requests. Now plain and speculative sampling use one distribution (#32).
+- On native Windows, the host RAM read 8 GiB, so the checkpoint budget was too small (#4).
+- A parked conversation was removed at once when the cache was full (#26).
+- `install.sh --dry-run --yes` waited for a sudo password on a computer without Docker.
+- The sampled DeepSeek path gave HTTP 500.
+
+### Thanks
+
+- The Nemotron 3.5 Lightning backend was started by the work of slavalevski-tech
+  ([github.com/slavalevski-tech/kindi](https://github.com/slavalevski-tech/kindi)). slavalevski-tech first ran this model on Kindi
+  and shared that backend under the Kindi CLA 1.1. That work set the scope of the backend. The Kindi code is a new
+  implementation ([docs/dev/LIGHTNING-CLEANROOM.md](docs/dev/LIGHTNING-CLEANROOM.md)). Thank you.
+
+### Not in 0.6.0
+
+- Gemma 4 31B Dense: Kindi was not faster on the same cards (two RTX 3080s).
+- Qwen3.8-Flash-Next on many cards: moved to 0.7.0.
+- The RTX 20 speed work: moved to 0.8.0.
+
 ## 0.5.0 (2026-11-09)
 
 ### New
