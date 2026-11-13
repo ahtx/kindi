@@ -14,6 +14,8 @@ On Windows 10 or 11, use the PowerShell installer instead. It sets up WSL2 and t
 ```powershell
 irm https://amirhusain.com/kindi/install.ps1 | iex
 ```
+For Docker Compose, Podman, servers and automated installs, there are also ready-made images (no build):
+[CONTAINERS.md](CONTAINERS.md). The installer builds the same images on your computer.
 
 To see each step and each command before anything changes, do a dry run first:
 

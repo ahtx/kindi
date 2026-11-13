@@ -1,6 +1,7 @@
 # Running Kindi with Docker
 
-To install Kindi with one command (the image, the models and the servers), see [INSTALL.md](INSTALL.md). This
+To install Kindi with one command (the image, the models and the servers), see [INSTALL.md](INSTALL.md). To use the
+ready-made images from GitHub's container registry (no clone and no build), see [CONTAINERS.md](CONTAINERS.md). This
 page tells how to build the images and do the steps by hand.
 
 Kindi has three images:
@@ -36,8 +37,8 @@ the host: it is not the owner of `/data`, and `kindi convert` stops with
 `-u 0:0`.
 
 The images run as the user 1000:1000 when no `-u` is given. Their entry point (`python3 -m kindi.container`) takes
-the same commands as `python3 -m kindi`. With `KINDI_MODEL` set (a model id or a GGUF file in the volume), it also
-downloads the model, checks its sha256 and builds its pack on the first start.
+the same commands as `python3 -m kindi`, and with `KINDI_MODEL` set it also gets the model and builds its pack on the
+first start ([CONTAINERS.md](CONTAINERS.md)).
 
 AMD:
 

@@ -1,0 +1,46 @@
+# Kindi with Docker Compose v2 (`docker compose`) or podman-compose, AMD Radeon graphics (ROCm). It pulls the published
+# image: no clone and no build. The project name is the folder name (or -p kindi). See docs/CONTAINERS.md and
+# docs/AMD.md.
+#
+#   curl -fsSLO https://raw.githubusercontent.com/ahtx/kindi/main/compose.amd.yaml
+#   VIDEO_GID=$(getent group video | cut -d: -f3) RENDER_GID=$(getent group render | cut -d: -f3) \
+#     KINDI_MODEL=bonsai-4b docker compose -f compose.amd.yaml up -d
+#
+# KINDI_TAG picks the ROCm image: rocm6 (RDNA3, for example the Radeon 780M: also set HSA_OVERRIDE_GFX_VERSION=11.0.2)
+# or rocm7 (RDNA 3.5: the Radeon 840M and 8060S). VIDEO_GID and RENDER_GID are the numbers of the HOST's video and
+# render groups (the GPU device nodes belong to them). The other settings are the same as in compose.yaml.
+#
+# Rootless Podman: set KINDI_UID=0:0, and replace group_add with   group_add: [keep-groups]   so that the container
+# keeps your groups. Full Podman support is planned for a later release; this is best effort.
+services:
+  kindi:
+    image: ghcr.io/ahtx/kindi:${KINDI_TAG:-rocm6}
+    restart: unless-stopped
+    user: "${KINDI_UID:-1000:1000}"
+    ports:
+      - "${KINDI_BIND:-127.0.0.1}:${KINDI_PORT:-8093}:8093"
+    volumes:
+      - ${KINDI_DATA:-kindi-data}:/data
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-992}"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      KINDI_MODEL: ${KINDI_MODEL:-bonsai-4b}
+      KINDI_CTX: ${KINDI_CTX:-24576}
+      KINDI_API_KEY: ${KINDI_API_KEY:-}
+      KINDI_VERIFY_ON_START: ${KINDI_VERIFY_ON_START:-0}
+      HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if b'\"ok\":true' in urllib.request.urlopen('http://127.0.0.1:8093/health', timeout=5).read() else 1)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30m
+      retries: 3
+volumes:
+  kindi-data:
+    name: ${KINDI_VOLUME:-kindi-data}

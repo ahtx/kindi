@@ -148,10 +148,17 @@ context to the free card memory. On the K420 1 GB, Kindi uses about 870 MB of it
 
 ## Install
 
-### Containers
+### Containers: ready-made images
 
-The installer builds the Docker image on your computer (see "Quick start" above). To build and run the image
-yourself, follow the steps below or [docs/DOCKER.md](docs/DOCKER.md).
+The images are on GitHub's container registry: `ghcr.io/ahtx/kindi:cuda` (NVIDIA and the CPU engine; also `latest`), `:rocm6` (AMD RDNA3), `:rocm7` (AMD RDNA 3.5). With Docker Compose or podman-compose, no clone and no build:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/ahtx/kindi/main/compose.yaml
+KINDI_MODEL=bonsai-4b docker compose up -d
+```
+
+The first start downloads the model (or uses a GGUF file in the volume), builds its pack once and starts the server
+on `127.0.0.1:8093`. AMD, Podman, users and all the settings: [docs/CONTAINERS.md](docs/CONTAINERS.md).
 
 ### Build the Docker image yourself
 

@@ -137,6 +137,12 @@
 - Qwen3.8-Flash-Next on many cards: moved to 0.7.0.
 - The RTX 20 speed work: moved to 0.8.0.
 
+### Container images (added on 2026-11-12)
+
+- Ready-made images are on GitHub's container registry ([docs/CONTAINERS.md](docs/CONTAINERS.md)): `ghcr.io/ahtx/kindi:0.6.0-cuda`, `ghcr.io/ahtx/kindi:0.6.0-rocm6`, `ghcr.io/ahtx/kindi:0.6.0-rocm7`, and the
+  moving tags `cuda`, `latest`, `rocm6`, `rocm7`. Each image passed `kindi verify` on a real card before it was published: `0.6.0-cuda` on NVIDIA GeForce RTX 3080; `0.6.0-rocm6` on AMD Radeon Graphics (with HSA_OVERRIDE_GFX_VERSION=11.0.2); `0.6.0-rocm7` on AMD Radeon 780M Graphics (RDNA3, run with HSA_OVERRIDE_GFX_VERSION=11.0.2).
+- `compose.yaml` and `compose.amd.yaml` start a server with Docker Compose or podman-compose, without a clone or a build.
+
 ## 0.5.0 (2026-11-09)
 
 ### New
