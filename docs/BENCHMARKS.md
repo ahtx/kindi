@@ -456,6 +456,42 @@ The largest context on the card:
 | 4B | 86,272 | loads at 65,536 (larger was not tried) |
 | 9B | 47,360 | loads at 65,536 (Kindi does not fit there) |
 
+## GeForce GTX 1650 SUPER, 4 GB · Ternary-Bonsai-2
+
+2026-11-03. Kindi 0.3.0, local Docker image built from repository commit `3762126`, CUDA 10.2 / CuPy 9.6, NVIDIA
+driver 565.57.01. The card is Turing (sm_75); CUDA reported 3,716 MiB total memory. The PTQ1_0 GGUFs were used
+(2B sha256 `36061ad4…`, 4B `56711263…`, 9B `3561df7a…`). Each model passed `kindi verify` (four prompts,
+token-exact). The exact head was used; no fast-head clusters were built. The host desktop remained active, so the
+context that fits depends on memory available to Kindi.
+
+`kindi bench` warms each operation once. Its prompt-read figure is based on 20 one-token feeds near the start of the
+context; each write figure is the average of 10 decode steps at the indicated position. These are built-in benchmark
+measurements, not the multi-token prompt-read method or cross-engine comparison used in the tables above. Read and
+write figures are tokens per second:
+
+| Model | Requested / fitted context | Read | Write @100 | @2,000 | @8,000 | @16,000 | @24,000 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 2B | 24,576 / 24,576 | 143.1 | 119.7 | 117.9 | 115.1 | 115.0 | 105.9 |
+| 4B | 24,576 / 24,576 | 76.5 | 67.6 | 65.4 | 59.7 | 53.4 | 47.3 |
+| 9B | 24,576 / 19,200 | 61.6 | 54.2 | 52.6 | 49.7 | 45.7 | — |
+
+The 9B run did not reach position 24,000 because the engine fitted its requested context to 19,200. A separate
+context-fit run with the default `KINDI_MEM_RESERVE_MB=96` requested 131,072 tokens; the engine used 131,072 for the
+2B (all that was requested), 58,112 for the 4B and 19,200 for the 9B. Contexts above 131,072 were not tested for the
+2B. The fitted values depend on free GPU memory and are not guarantees for other systems. At the time of this test,
+`kindi models` reported the 9B as too large on the card's 3,716 MiB, although it loaded and passed verification with
+the reduced context.
+
+To reproduce a context-fit run, convert each PTQ1_0 GGUF into its own pack, then run `bench` with the requested
+context. For example, with the 4B pack at `/data/pack4b` in the mounted data directory:
+
+```sh
+docker run --rm --gpus all -u "$(id -u):$(id -g)" \
+  -v /path/to/kindi-data:/data -e KINDI_PACK=/data/pack4b \
+  -e KINDI_STATE_DIR=/data/state -e KINDI_CTX=131072 \
+  kindi:0.3.0 bench
+```
+
 ## Two Quadro K1200 cards · Ternary-Bonsai-2-27B
 
 2026-10-23 (Kindi) and 2026-10-21/22 (llama.cpp). Kindi 0.2.0, the tensor-parallel engine, q8_0 K/V. llama.cpp: Prism ML's fork, Vulkan

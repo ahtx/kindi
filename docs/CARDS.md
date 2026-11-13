@@ -102,6 +102,19 @@ Replace `...` with the variables in the section for your card. To use one card o
   (a driver change that Kindi does not need or support), the 27B got 66,560 tokens. `kindi verify` passed in both
   modes, and the write speed was the same (22.0 to 22.9 tokens/s). Report: epscheel (GitHub), issue #33.
 
+## GeForce GTX 1650 SUPER, 4 GB (Turing, sm_75)
+
+| item | value |
+|---|---|
+| models | Ternary-Bonsai-2 2B, 4B and 9B |
+| variables | `KINDI_CTX=24576` (default; the engine fits the context to free GPU memory) |
+| context fit (`KINDI_CTX=131072`, default 96 MiB reserve) | 2B: 131,072 (all that was asked); 4B: 58,112; 9B: 19,200 |
+| generation (exact head at position 100) | 2B: 119.7 tokens/s; 4B: 67.6; 9B: 54.2 |
+| prompt reading (one-token `kindi bench`) | 2B: 143.1 tokens/s; 4B: 76.5; 9B: 61.6 |
+
+These are `kindi bench` results from Kindi 0.3.0. The 9B fits at a reduced context on this card; see
+[BENCHMARKS.md](BENCHMARKS.md) for the test conditions and details.
+
 ## GeForce RTX 3080, 10 GB (Ampere, sm_86)
 
 | item | value |
