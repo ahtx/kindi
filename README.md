@@ -454,11 +454,23 @@ notices are in [NOTICE](NOTICE).
 
 ## Acknowledgements
 
-Kindi exists because of the model it runs. Thank you to [Prism ML](https://huggingface.co/prism-ml) for
-[Ternary-Bonsai-2-2B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf) and for its release under
-Apache 2.0. Thank you to the Qwen team at Alibaba Cloud for Qwen3.5-2B, the base model of Ternary-Bonsai-2-2B. Thank
-you also to the [llama.cpp](https://github.com/ggml-org/llama.cpp) authors. Their implementation is the reference
-that we check Kindi's output against.
+Kindi exists because of the models it runs. Thank you to the teams that release their models openly:
+
+- [DeepSeek](https://huggingface.co/deepseek-ai) for
+  [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) under the MIT License.
+  Kindi's DSpark drafter uses the model's own MTP stages. Thank you also to
+  [unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) for the GGUF conversion.
+- [Prism ML](https://huggingface.co/prism-ml) for the Ternary Bonsai models, 2B to 27B, and the
+  Qwen team at Alibaba Cloud for the Qwen base models of Ternary Bonsai.
+- NVIDIA for Nemotron 3.5 Lightning 30B-A3B, Nota AI for its ternary version, and
+  [boro64](https://huggingface.co/boro64/Ternary-Nemotron-3.5-Lightning-30B-A3B-GGUF) for the GGUF conversion.
+- [Tencent](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) for the DSpine drafter of the 27B, under
+  Apache 2.0.
+- The Nanbeige team for Nanbeige4.3-33B, the base model of AH-Nanbeige4.3-33B.
+
+Thank you to slavalevski-tech, who first ran Nemotron 3.5 Lightning on Kindi, on a Quadro K6000. Thank you also to
+the [llama.cpp](https://github.com/ggml-org/llama.cpp) authors. Their implementation is the reference that we check
+Kindi's output against.
 
 ## Contributions
 
