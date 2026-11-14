@@ -89,7 +89,7 @@ def _lcp(a, b):
 
 
 # the files whose code decides the arithmetic of the state (a change of any of them changes the saved states)
-_ARITH = ("kindi.cu", "chunk.cu", "chunk1.cu", "tc.cu", "tcp.cu", "tcf.cu", "tca.cu", "spec.cu", "kcpu.c", "engine.py", "tp.py",
+_ARITH = ("kindi.cu", "chunk.cu", "chunk1.cu", "tc.cu", "tc_hip.cu", "tcp.cu", "tcf.cu", "tca.cu", "spec.cu", "kcpu.c", "engine.py", "tp.py",
           "chunk.py", "chunk1.py", "tc.py", "spec.py", "cpu.py", "layout.py")
 
 

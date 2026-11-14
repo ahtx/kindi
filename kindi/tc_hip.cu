@@ -1,4 +1,4 @@
-/* tc_hip.cu - the tc.cu kernels (names, arguments, launch shapes) for HIP / RDNA3, on a dp4a-friendly layout.
+/* tc_hip.cu - the tc.cu kernels (names, arguments, launch shapes) for HIP / RDNA2 and RDNA3, on a dp4a-friendly layout.
 
    Weights: on HIP, k_tc_pack turns the 5-trit lane layout into the 5-trit ROW layout (g5_core's: per 128-column
    group and row, 28 bytes: 24 five-trit bytes c = sum_i trit_i 3^i of columns 5p .. 5p+4, two four-trit bytes of
@@ -24,7 +24,12 @@
 
 __device__ __forceinline__ float tc_h2f(unsigned short h){ return __half2float(*(const __half*)&h); }
 __device__ __forceinline__ int td_dot4(unsigned int a, unsigned int b, int c){
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+  /* Each digit byte is 0, 1 or 2, so signed and unsigned interpretations are identical. No clamp. */
+  return __builtin_amdgcn_sdot4((int)a, (int)b, c, false);
+#else
   return __builtin_amdgcn_sudot4(false, (int)a, true, (int)b, c, false);   /* digits unsigned, activations signed */
+#endif
 }
 
 /* ------------------------------------------------------------------ repack: 5-trit lane layout -> row layout */

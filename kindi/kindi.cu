@@ -2054,7 +2054,11 @@ G5RAS(8)
 __device__ __forceinline__ int kdp4a(int a, int b, int c){
   /* dp4a.s32.s32: four SIGNED int8 x int8 products added to c */
 #if KHIP
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+  return __builtin_amdgcn_sdot4(a, b, c, false);               /* RDNA2 v_dot4_i32_i8, no clamp */
+#else
   return __builtin_amdgcn_sudot4(true, a, true, b, c, false);    /* v_dot4_i32_iu8, both operands signed, no clamp */
+#endif
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
   int d; asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c)); return d;
 #else

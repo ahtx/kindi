@@ -78,6 +78,12 @@ These variables have no config key. Use them to test or to compare.
 | `KINDI_CHUNK_TILE` | (auto) | `128` = the 128 x 128 tile for the 2-bit chunk products |
 | `KINDI_CHUNK_ATT` | `flash` | `exact` = chunk attention with the same arithmetic as one token at a time (slower) |
 | `KINDI_G5L` | `1` | sm_61 and later: the 5-trit lane-per-byte GEMV; `0` = one row per thread |
+| `KINDI_G5_DUAL` | architecture-dependent; `0` on gfx1032 | `1` keeps row and lane weight copies; two 27B copies do not fit an 8 GB RX6600 |
+| `KINDI_G5_PINS` | empty | explicit `R,NG,rowpar,threads,rpt,splits;...` choices; lane requires threads 256 and rpt 0; invalid sizes/splits fail before loading |
+| `KINDI_HOST_OUTPUT` | `0` | map the output head in pinned host memory; GPU reads over PCIe, not CPU matrix computation |
+| `KINDI_HOST_FFN_LAYERS` | empty | FFN indices/ranges, e.g. `0,3-7`, mapped in pinned host memory; requires one HIP card, G5 lane, no dual copy and `KINDI_TC=0` |
+| `KINDI_WDDM_BUDGET` | `0` | opt-in single-card native Windows HIP fit using this process's DXGI local budget minus usage; actual context can be much smaller than requested; query failures are explicit |
+| `KINDI_TC_DUAL` | `0` on gfx103x | optional TC path's second weight copy; single-copy HIP uses dp4a kernels, not NVIDIA tensor cores |
 | `KINDI_DENSE_SPACING` | `256` | the spacing of the dense checkpoints in an agent opening; `0` = none |
 | `KINDI_STREAM_LOAD` | `1` | the plan engine loads the cached 5-trit weights in 256 MB parts |
 | `KINDI_MEM_RESERVE_MB` | `96` (`32` for the plan engine) | GPU memory that the context fit keeps free |
@@ -86,6 +92,13 @@ These variables have no config key. Use them to test or to compare.
 | `KINDI_D1` | `0` (`1` on Pascal) | `1` = the one-pass RMS fold (Hadamard block 512 or 1024, with `KINDI_TC=1`) |
 | `KINDI_ATT_TC` | `0` | `1` = the attention of the prompt chunks on the tensor cores (sm_80 and later, with `KINDI_TC=1`) |
 | `KINDI_CKPT_VRAM` | `0` | `1` = checkpoints in card memory; the copy to the host waits until the server is idle (one card) |
-| `KINDI_CKPT_PINNED` | `1` under WSL2, else `0` | `1` = the host copies of the checkpoints are in pinned memory. Under Windows (WDDM), this makes the first token faster |
+| `KINDI_CKPT_PINNED` | `1` under WSL2, else `0` | pinned host checkpoint copies; profile on the target GPU. Native RX6600 tests found no benefit over ordinary host checkpoints |
 | `KINDI_HOST_RAM_CHECK` | `1` | before the weights of a card load, the plan engine stops when the free host RAM is too small. `0` = no check |
 | `KINDI_BLOCKING_SYNC` | `1` | the host thread sleeps while it waits for the card, and does not use a CPU core. `0` = it waits in a loop (the driver default) |
+
+Host placement buys capacity at a PCIe bandwidth cost. Default weights remain
+GPU-resident. Incompatible explicit host-placement, TC-layout or HIP B2 requests
+fail rather than silently selecting another path. The WDDM snapshot is a startup
+fit, not a guarantee against later desktop-app budget changes. The configured
+reserve is still deducted after the budget fit.
+

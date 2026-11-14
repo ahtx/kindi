@@ -30,6 +30,14 @@ token-for-token identical to the output of llama.cpp for the same model file. On
 the same context, it generates about 13x faster than llama.cpp (exact head: 20.8 against 1.65 tokens/s). The
 comparisons for each card are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The one-page summary is [WHY.md](WHY.md).
 
+**Experimental native Windows RX6600 branch:** this source includes RDNA2
+kernel support and opt-in host-weight/budget fitting. It requires the separately
+source-built [Windows HIP CuPy fork](https://github.com/JohnUzoka/cupy/tree/windows-hip-rdna2),
+not the Linux Docker installer. Bonsai27B reaches about24tok/s after8K in a
+budget-fitted18K-class window; the frozen three-task Pi test passed1/3, so this
+is not a demonstrated coding-quality upgrade. See [build and tuning details](docs/AMD.md).
+
+
 <p align="center"><img src="assets/kindi-demo.gif" alt="The pi coding agent driving Kindi on a Quadro K420: it runs nvidia-smi, writes and runs a Python script, and checks disk space" width="100%"></p>
 
 <p align="center"><sub>Recorded live: the <a href="https://pi.dev">pi</a> coding agent (with a Kindi colour theme)

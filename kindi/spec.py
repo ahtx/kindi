@@ -178,9 +178,10 @@ class SpecKernels(object):
                 tcs += "\n" + open(os.path.join(HERE, "tcl.cu"), encoding="utf-8").read()
             mod = cp.RawModule(code=base + "\n" + wr + "\n" + own + "\n" + tcs + "\n" + tcf)
         elif hip:
-            # RDNA3: dp4a is v_dot4_i32_iu8; tca.cu (k_att_tc_T) is mma.sync only
+            # Reuse kindi.cu's signed dot helper: RDNA2 sdot4, RDNA3 sudot4 (both operands signed, no clamp).
+            # tca.cu (k_att_tc_T) is CUDA mma.sync only.
             tcf = tcf.replace('asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));',
-                              "d = __builtin_amdgcn_sudot4(true, a, true, b, c, false);")
+                              "d = kdp4a(a, b, c);")
             # the fused quantisers store the int8 rows in tc_hip.cu's 5-column order (tcq_word5)
             for old, new in _TCF_HIP:
                 assert tcf.count(old) == 1, old
@@ -329,11 +330,19 @@ def repack(s, log):
     bad = [(n, int(R), int(C)) for n, (_, _, R, C) in s.w.items()
            if int(R) % 16 or int(C) % 128 or (int(C) % 1024 and not pad_ok)]
     if bad:
-        log("card %d: %s (%d x %d) does not fit the tc layout; KINDI_TC is ignored for this model" % ((s.card,) + bad[0]))
-        return
+        raise SystemExit("kindi tc: %s (%d x %d) does not fit the tc layout" % bad[0])
     big = max(int(R) * ((int(C) + 1023) // 1024) * 56 for _, (_, _, R, C) in s.w.items())
+    hip = cp.cuda.runtime.is_hip
+    if hip:
+        arch = cp.cuda.runtime.getDeviceProperties(s.card).get("gcnArchName", b"")
+        arch = (arch.decode() if isinstance(arch, bytes) else str(arch)).split(":")[0]
+        # Dedicated RDNA2 VRAM must not default to two complete weight copies. Explicit dual=1 remains available.
+        dual = os.environ.get("KINDI_TC_DUAL", "0" if arch.startswith("gfx103") else "1") == "1"
+        if _tc.b2(s.card):
+            raise SystemExit("kindi tc: KINDI_TC_B2=1 is unsupported on HIP (CUDA-only kernels)")
+    else:
+        dual = False
     tmp = cp.empty(big, dtype=cp.uint32)
-    dual = cp.cuda.runtime.is_hip and os.environ.get("KINDI_TC_DUAL", "1") == "1"
     if dual:
         # a second copy for the tc layout; the lane layout stays as s.wl for the chunk path
         s.bct = cp.empty_like(s.bc)
@@ -369,7 +378,7 @@ def repack(s, log):
     del tmp
     cp.get_default_memory_pool().free_all_blocks()
     s.tc_layout = True
-    log("card %d: weights repacked for the %s%s (%.1fs)" % (s.card, "dp4a kernels" if _tc.pascal(s.card) else "tensor cores",
+    log("card %d: weights repacked for the %s%s (%.1fs)" % (s.card, "dp4a kernels" if hip or _tc.pascal(s.card) else "tensor cores",
                                                            " (decode products on the b2 layout)" if s.w2 is not None else "",
                                                            time.time() - t0))
 

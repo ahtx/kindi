@@ -19,7 +19,9 @@ counted on the GPU."""
 import ctypes
 import json
 import os
+import re
 import time
+import sys
 
 import numpy as np
 import cupy as cp
@@ -100,22 +102,85 @@ G5_PINNED_HIP = {"gfx1103": _G5_780M, "gfx1102": _G5_780M,     # Radeon 780M, 12
                  "gfx1151": _G5_8060S}                           # Radeon 8060S (Ryzen AI MAX+ 395, Strix Halo), 40 CUs
 
 
+def _g5_options(prop):
+    arch = prop.get("gcnArchName", b"")
+    arch = (arch.decode() if isinstance(arch, bytes) else str(arch)).split(":")[0]
+    g5 = os.environ.get("KINDI_G5", "")
+    g5 = g5 == "1" or (g5 != "0" and prop["major"] >= 6)
+    # HIP row decode is faster on 780M; RX 6600 keeps one lane copy for decode and chunked prompts.
+    lane = g5 and os.environ.get("KINDI_G5L", "0" if rt.is_hip and arch != "gfx1032" and os.environ.get("KINDI_TC", "0") != "1" else "1") == "1"
+    dual = os.environ.get("KINDI_G5_DUAL", "1" if rt.is_hip and arch != "gfx1032" else "0") == "1"
+    return g5, lane, dual
+
+
+def _host_placement(layers):
+    """Opt-in GPU reads of mapped host weights, not CPU dense computation."""
+    output = os.environ.get("KINDI_HOST_OUTPUT", "0")
+    if output not in ("0", "1"):
+        raise SystemExit("kindi: KINDI_HOST_OUTPUT must be 0 or 1")
+    selected = set()
+    raw = os.environ.get("KINDI_HOST_FFN_LAYERS", "")
+    if raw:
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if re.fullmatch(r"[0-9]+(?:-[0-9]+)?", entry) is None:
+                raise SystemExit("kindi: KINDI_HOST_FFN_LAYERS must contain comma-separated layer indices or inclusive ranges (e.g. 0-7)")
+            ends = [int(v) for v in entry.split("-")]
+            first, last = ends[0], ends[-1]
+            if first > last or last >= layers:
+                raise SystemExit("kindi: KINDI_HOST_FFN_LAYERS range %s is outside layers 0-%d or reversed" % (entry, layers - 1))
+            selected.update(range(first, last + 1))
+    return output == "1", selected
+
+
+def _g5_pin_overrides(lane):
+    """Explicit pins are layout-specific; built-in HIP row-layout pins do not apply to lane weights."""
+    pins = {}
+    raw = os.environ.get("KINDI_G5_PINS", "")
+    if raw and not any(entry.strip() for entry in raw.split(";")):
+        raise SystemExit("kindi: KINDI_G5_PINS must contain at least one R,NG,rowpar,threads,rpt,splits entry")
+    for entry in filter(None, raw.split(";")):
+        try:
+            values = [int(v) for v in entry.split(",")]
+        except ValueError:
+            raise SystemExit("kindi: KINDI_G5_PINS entries must be R,NG,rowpar,threads,rpt,splits") from None
+        if len(values) != 6:
+            raise SystemExit("kindi: KINDI_G5_PINS entries must be R,NG,rowpar,threads,rpt,splits")
+        R, NG, rowpar, nt, rpt, sp = values
+        if R <= 0 or NG <= 0 or rowpar not in (0, 1):
+            raise SystemExit("kindi: KINDI_G5_PINS requires positive R/NG and rowpar 0 or 1")
+        if lane:
+            if R % 16 or nt != 256 or rpt != 0:
+                raise SystemExit("kindi: lane KINDI_G5_PINS requires R divisible by 16, threads 256 and rpt 0")
+        elif nt <= 0 or nt > 512 or nt % 32 or rpt not in (1, 2, 4, 8):
+            raise SystemExit("kindi: row-layout KINDI_G5_PINS requires warp-aligned threads up to 512 and rpt 1, 2, 4 or 8")
+        limit = (8 if rt.is_hip else 16) if rowpar else 32
+        if sp not in (1, 2, 4, 8, 16, 32) or sp > min(NG, limit):
+            raise SystemExit("kindi: KINDI_G5_PINS splits must be 1, 2, 4, 8, 16 or 32, at most NG and %d for this product" % limit)
+        pins[(R, NG, bool(rowpar))] = (nt, rpt, sp)
+    return pins
+
+
 def _g5_pins(s):
     if "g5pins" not in s.__dict__:
-        arch = rt.getDeviceProperties(cp.cuda.Device().id).get("gcnArchName", b"")
-        arch = (arch.decode() if isinstance(arch, bytes) else str(arch)).split(":")[0]
-        s.g5pins = dict(G5_PINNED_HIP.get(arch, {}))
-        # KINDI_G5_PINS="R,NG,rowpar,threads,rpt,splits;...": replace single shapes (a test of other configs)
-        for e in filter(None, os.environ.get("KINDI_G5_PINS", "").split(";")):
-            v = [int(x) for x in e.split(",")]
-            s.g5pins[(v[0], v[1], bool(v[2]))] = tuple(v[3:6])
+        s.g5pins = {}
+        if rt.is_hip and not s.g5l and os.environ.get("KINDI_G5_PIN", "1") == "1":
+            arch = rt.getDeviceProperties(cp.cuda.Device().id).get("gcnArchName", b"")
+            arch = (arch.decode() if isinstance(arch, bytes) else str(arch)).split(":")[0]
+            s.g5pins.update(G5_PINNED_HIP.get(arch, {}))
+        # Explicit KINDI_G5_PINS overrides tuning and the built-in pin switch, including on lane layouts.
+        s.g5pins.update(s.g5pin_overrides)
     return s.g5pins
 
 
 def g5_tuned(s, name, R, NG, rowpar):
     """(threads, rows per thread, splits) for a 5-trit product of shape (R, 128 NG) on card s: timed once per shape."""
-    pins = _g5_pins(s) if rt.is_hip and not s.g5l and os.environ.get("KINDI_G5_PIN", "1") == "1" else {}
-    if (R, NG, rowpar) in pins and pins[(R, NG, rowpar)][2] * R <= s.gpart.size:
+    pins = _g5_pins(s)
+    key = (R, NG, rowpar)
+    capacity = s.part.size if rowpar else s.gpart.size
+    if key in s.g5pin_overrides and pins[key][2] * R > capacity:
+        raise SystemExit("kindi: KINDI_G5_PINS for %s exceeds the allocated partial-sum buffer" % (key,))
+    if key in pins and pins[key][2] * R <= s.gpart.size:
         c = tuple(pins[(R, NG, rowpar)])
         s.__dict__.setdefault("g5cfg", {})[(R, NG, rowpar)] = c[:3]
         s.__dict__.setdefault("g5var", {})[(R, NG, rowpar)] = c[3] if len(c) > 3 else "r"   # (threads, rpt, splits, kernel)
@@ -254,6 +319,20 @@ def _stream_to_card(path, chunk=1 << 26):
     return out
 
 
+def _read_cache_range(f, word_offset, target):
+    """Read directly into an existing pinned buffer; cache offsets are uint32 words, not bytes."""
+    view = memoryview(target).cast("B")
+    f.seek(word_offset * 4)
+    read = 0
+    while read < view.nbytes:
+        count = f.readinto(view[read:])
+        if not count:
+            raise SystemExit("kindi: truncated G5 cache %s at byte %d" % (f.name, word_offset * 4 + read))
+        read += count
+    if hasattr(os, "posix_fadvise"):
+        os.posix_fadvise(f.fileno(), word_offset * 4, view.nbytes, os.POSIX_FADV_DONTNEED)
+
+
 def _ranges(*rs):
     return np.concatenate([np.arange(a, b) for a, b in rs]).astype(np.int64)
 
@@ -339,6 +418,9 @@ def _drv():
 class Shard(object):
     def __init__(self, tp, card, log):
         self.tp, self.card, self.log = tp, card, log
+        self.host_weight_bytes = 0
+        self.host_weight_owners = {}
+        self.g5pin_overrides = tp.g5pin_overrides.get(card, {})
         self.D, self.NL, self.HD, self.HK, self.HB = tp.D, tp.NL, tp.HD, tp.HK, tp.HB
         self.dims = tp.dims
         self.NK, self.NV = tp.NKg // tp.W, tp.NVg // tp.W
@@ -354,10 +436,7 @@ class Shard(object):
             self.k = Kernels()
             prop = rt.getDeviceProperties(card)
             self.nsm = prop["multiProcessorCount"]
-            g5 = os.environ.get("KINDI_G5", "")
-            self.g5 = g5 == "1" or (g5 != "0" and prop["major"] >= 6)
-            # lane-owned tables (k_g5n4); on HIP the row kernels (k_g5r*) decode ~20% faster (780M, 27B)
-            self.g5l = self.g5 and os.environ.get("KINDI_G5L", "0" if rt.is_hip and os.environ.get("KINDI_TC", "0") != "1" else "1") == "1"
+            self.g5, self.g5l, self.g5dual = _g5_options(prop)
             self.dp4a = prop["major"] * 10 + prop["minor"] >= 61 and os.environ.get("KINDI_DP4A", "1" if rt.is_hip else "0") == "1"   # dp4a scores: slower than the float path at long context on the 1080 (measured), off by default
             self._load()
             self._alloc_fixed()
@@ -441,7 +520,7 @@ class Shard(object):
             ipath = os.path.join(tp.pack, "g5_%s.json" % key)
             lpath = os.path.join(tp.pack, "g5n_%s.bin" % key)
             lane = False
-            dual = not self.g5l and os.environ.get("KINDI_G5_DUAL", "1" if rt.is_hip else "0") == "1"
+            dual = not self.g5l and self.g5dual
             # (re)built when a file this card uses is missing: a row cache made without the lane copy (by an older
             # build, or a run with dual off) left HIP prompts token by token (780M 27B read 10.8 tok/s)
             # a cache without one of this card's tensors (made before the tied-head alias: the 2B / 4B's output.weight)
@@ -488,11 +567,14 @@ class Shard(object):
             if self.g5l and not lane:
                 raise SystemExit("kindi: the lane-layout cache %s is missing; delete %s to rebuild both" % (lpath, cpath))
             del bparts, dparts
-            self.bc = _stream_to_card(lpath if lane else cpath)       # 256 MB at a time
+            if tp.host_output or tp.host_ffn_layers:
+                self._load_host_g5(lpath, offs, tern)
+            else:
+                self.bc = _stream_to_card(lpath if lane else cpath)       # 256 MB at a time
+                self.w = {n: ("g5", self.bc[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
             self.dp = cp.zeros(1, dtype=cp.uint16)
-            self.w = {n: ("g5", self.bc[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
             # row-layout decode weights plus the lane-layout copy for the chunked prompt GEMM (k_mm_g5n needs it):
-            # KINDI_G5_DUAL=1, the default on HIP, where the card's memory is the host's (unified memory)
+            # KINDI_G5_DUAL=1 defaults on HIP except gfx1032: RX 6600 has dedicated, limited VRAM.
             self.wl = None
             if dual and os.path.exists(lpath):
                 self.bcl = _stream_to_card(lpath)
@@ -535,8 +617,81 @@ class Shard(object):
         self.sA = cp.asarray(s[tp.NHg * self.HD][self.cols["sA"][0]:self.cols["sA"][1]])
         self.sF = cp.asarray(s[tp.NFFg][self.cols["sF"][0]:self.cols["sF"][1]])
         cp.get_default_pinned_memory_pool().free_all_blocks()
-        self.log("card %d: %.2f GB of weights (%.0fs)" % (self.card, (self.bc.nbytes + self.dp.nbytes) / 1e9,
-                                                          time.time() - t0))
+        if self.host_weight_bytes:
+            self.log("card %d: G5 weight placement: host %d bytes (%.2f GB), device %d bytes (%.2f GB); GPU reads mapped host weights (%.0fs)" %
+                     (self.card, self.host_weight_bytes, self.host_weight_bytes / 1e9,
+                      self.bc.nbytes, self.bc.nbytes / 1e9, time.time() - t0))
+        else:
+            self.log("card %d: %.2f GB of weights (%.0fs)" % (self.card, (self.bc.nbytes + self.dp.nbytes) / 1e9,
+                                                              time.time() - t0))
+
+    def _load_host_g5(self, path, offs, tern, chunk=1 << 26):
+        """KINDI_HOST_OUTPUT=1 / KINDI_HOST_FFN_LAYERS=0-7: map selected lane tensors for GPU reads.
+
+        The JSON offsets and array sizes are uint32 words: R * (C / 128) * 7 per tensor, unchanged by placement.
+        No full-model GPU upload or pageable weight copy: read selected cache ranges into their pinned owners,
+        and stream the rest through one bounded pinned staging buffer into a compact device array.
+        """
+        if set(offs) != set(tern):
+            raise SystemExit("kindi: host weight placement requires a G5 cache index matching this card's tensors")
+        ranges = []
+        for name, values in offs.items():
+            if len(values) != 3 or any(type(v) is not int for v in values):
+                raise SystemExit("kindi: invalid G5 cache offset/shape for %s" % name)
+            offset, R, C = values
+            rows, cols = tern[name]
+            rec = self.tp.bi[name]
+            expected_R = len(rows) if rows is not None else rec["rows"]
+            expected_C = cols[1] - cols[0] if cols is not None else rec["ne0"]
+            if offset < 0 or R <= 0 or R % 16 or C <= 0 or C % 128 or (R, C) != (expected_R, expected_C):
+                raise SystemExit("kindi: invalid lane G5 cache dimensions for %s" % name)
+            ranges.append((offset, R * (C // 128) * 7, name, R, C))
+        ranges.sort()
+        total_words = 0
+        for offset, words, name, R, C in ranges:
+            if offset != total_words:
+                raise SystemExit("kindi: G5 cache word ranges overlap or contain a gap at %s" % name)
+            total_words += words
+        if os.path.getsize(path) != total_words * 4:
+            raise SystemExit("kindi: lane G5 cache byte size does not match its uint32-word index")
+        host_names = {"blk.%d.%s.weight" % (il, tensor)
+                      for il in self.tp.host_ffn_layers for tensor in ("ffn_gate", "ffn_up", "ffn_down")}
+        if self.tp.host_output:
+            host_names.add("output.weight")
+        if not host_names <= set(offs):
+            raise SystemExit("kindi: selected host weights are missing from the G5 cache")
+        host_words = sum(words for _, words, name, _, _ in ranges if name in host_names)
+        device_words = total_words - host_words
+        stage_words = min(chunk, device_words)
+        hostram.check((host_words + stage_words) * 4, "card %d's mapped host weights and upload buffer" % self.card, self.log)
+        flags = rt.hostAllocMapped | rt.hostAllocPortable
+        with cp.cuda.Device(self.card), open(path, "rb", buffering=0) as f:
+            self.bc = cp.empty(device_words, dtype=cp.uint32)
+            self.w = {}
+            self.host_weight_bytes = host_words * 4
+            stage = cp.cuda.PinnedMemory(stage_words * 4) if stage_words else None
+            stage_view = (ctypes.c_ubyte * (stage_words * 4)).from_address(stage.ptr) if stage is not None else None
+            device_offset = 0
+            for offset, words, name, R, C in ranges:
+                if name in host_names:
+                    owner = cp.cuda.PinnedMemory(words * 4, flags=flags)
+                    self.host_weight_owners[name] = owner
+                    # HIP may return a different mapped device address. Never substitute the CPU address.
+                    device_ptr = rt.pointerGetAttributes(owner.ptr).devicePointer
+                    if not device_ptr:
+                        raise SystemExit("kindi: HIP did not map pinned host weight %s into the current device" % name)
+                    memory = cp.cuda.UnownedMemory(device_ptr, words * 4, owner, device_id=self.card)
+                    weight = cp.ndarray((words,), dtype=cp.uint32, memptr=cp.cuda.MemoryPointer(memory, 0))
+                    _read_cache_range(f, offset, (ctypes.c_ubyte * (words * 4)).from_address(owner.ptr))
+                else:
+                    weight = self.bc[device_offset:device_offset + words]
+                    for start in range(0, words, stage_words):
+                        count = min(stage_words, words - start)
+                        _read_cache_range(f, offset + start, memoryview(stage_view).cast("B")[:count * 4])
+                        # Synchronous transfer: the staging buffer can be overwritten immediately, with no extra copy.
+                        rt.memcpy(weight.data.ptr + start * 4, stage.ptr, count * 4, rt.memcpyHostToDevice)
+                    device_offset += words
+                self.w[name] = ("g5", weight, i32(R), i32(C))
 
     def f(self, name):
         return self._f[name]
@@ -572,6 +727,15 @@ class Shard(object):
 
     def free_bytes(self):
         with cp.cuda.Device(self.card):
+            if self.tp.wddm_budget:
+                from .wddm import available_local_bytes
+                pool = cp.get_default_memory_pool()
+                pool.free_all_blocks()
+                cp.cuda.Device().synchronize()
+                name = rt.getDeviceProperties(self.card)['name']
+                if isinstance(name, bytes):
+                    name = name.decode('utf-8')
+                return min(rt.memGetInfo()[0], available_local_bytes(name, self.log))
             return rt.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
 
     def alloc_ctx(self, ctx):
@@ -816,6 +980,12 @@ class TPEngine(object):
         self.W = int(os.environ.get("KINDI_CARDS") or min(2, rt.getDeviceCount()))
         if self.W not in (1, 2) or rt.getDeviceCount() < self.W:
             raise SystemExit("kindi: the plan engine runs on 1 or 2 cards (%d found)" % rt.getDeviceCount())
+        budget_mode = os.environ.get('KINDI_WDDM_BUDGET', '0')
+        if budget_mode not in ('0', '1'):
+            raise SystemExit('kindi: KINDI_WDDM_BUDGET must be 0 or 1')
+        self.wddm_budget = budget_mode == '1'
+        if self.wddm_budget and (sys.platform != 'win32' or not rt.is_hip or self.W != 1):
+            raise SystemExit('kindi: KINDI_WDDM_BUDGET requires one native Windows HIP card')
         man = self.man = json.load(open(os.path.join(pack, "kindi_pack.json")))
         self.pack = pack
         self.dims = dict(DEFAULT_DIMS, **man.get("dimensions", {}))
@@ -825,6 +995,20 @@ class TPEngine(object):
         self.NKg, self.HK = self.dims["groups"], self.dims["state_size"]
         self.NVg = self.dims["gdn_inner"] // self.HK
         self.NFFg = self.dims["ffn"]
+        self.host_output, self.host_ffn_layers = _host_placement(self.NL)
+        if self.host_output or self.host_ffn_layers:
+            for flag in ("KINDI_G5", "KINDI_G5L", "KINDI_G5_DUAL", "KINDI_TC"):
+                value = os.environ.get(flag)
+                if value is not None and value not in ("0", "1"):
+                    raise SystemExit("kindi: %s must be 0 or 1 with host weight placement" % flag)
+            if not rt.is_hip or self.W != 1 or os.environ.get("KINDI_TC", "0") != "0":
+                raise SystemExit("kindi: host weight placement requires one HIP card and KINDI_TC=0")
+            prop = rt.getDeviceProperties(0)
+            g5, lane, dual = _g5_options(prop)
+            if not g5 or not lane or dual:
+                raise SystemExit("kindi: host weight placement requires KINDI_G5=1, KINDI_G5L=1 and KINDI_G5_DUAL=0 (including defaults)")
+            if not prop.get("canMapHostMemory", False):
+                raise SystemExit("kindi: this HIP card does not support mapped pinned host weight memory")
         self.inv_freq = np.float64(self.dims["rope_base"]) ** (-2.0 * np.arange(self.dims["rope_dim"] // 2) / self.dims["rope_dim"])
         if self.W == 1:
             self.ffn_rows, self.ffn_cols, self.head_split = [(0, self.NFFg)], [(0, self.NFFg)], [0, VOCAB]
@@ -845,6 +1029,24 @@ class TPEngine(object):
                 self.ffn_rows = self.ffn_cols = [(0, m), (m, self.NFFg)]
                 self.split_tag = "-b"
             self.head_split = [0, VOCAB // 2, VOCAB]
+        self.g5pin_overrides = {}
+        if os.environ.get("KINDI_G5_PINS", ""):
+            for card in range(self.W):
+                prop = rt.getDeviceProperties(card)
+                g5, lane, _ = _g5_options(prop)
+                if not g5:
+                    raise SystemExit("kindi: KINDI_G5_PINS requires G5 weights")
+                pins = _g5_pin_overrides(lane)
+                NK, NV = self.NKg // self.W, self.NVg // self.W
+                NH = self.NHg // self.W
+                capacity = 16 * max(self.head_split[card + 1] - self.head_split[card],
+                                    self.ffn_rows[card][1] - self.ffn_rows[card][0],
+                                    2 * NH * self.HD, (2 * NK + NV) * self.HK)
+                work = max(self.D, self.ffn_rows[card][1] - self.ffn_rows[card][0], NV * self.HK)
+                row_capacity = prop["multiProcessorCount"] * work
+                if any(R * config[2] > (row_capacity if rowpar else capacity) for (R, _, rowpar), config in pins.items()):
+                    raise SystemExit("kindi: KINDI_G5_PINS exceeds card %d's partial-sum buffer" % card)
+                self.g5pin_overrides[card] = pins
         self.idx = json.load(open(os.path.join(pack, "index.json")))
         self.bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
         self.tied_head = "output.weight" not in self.bi   # tied embeddings (2B, 4B): the head is token_embd
