@@ -14,6 +14,13 @@ cache, tool calls, a thinking mode and speculative decoding. With the exact head
 the output of llama.cpp for the same model file, token for token. Version 0.6.0 adds two mixture-of-experts models
 that keep experts in host memory, the DSpine drafter for the 27B, and a one-command installer for Windows.
 
+**Experimental native Windows RX6600 branch:** this source includes RDNA2
+kernel support and opt-in host-weight/budget fitting. It requires the separately
+source-built [Windows HIP CuPy fork](https://github.com/JohnUzoka/cupy/tree/windows-hip-rdna2),
+not the Linux Docker installer. Bonsai27B reaches about24tok/s after8K in a
+budget-fitted18K-class window; the frozen three-task Pi test passed1/3, so this
+is not a demonstrated coding-quality upgrade. See [build and tuning details](docs/AMD.md).
+
 ### Measured speed
 
 Kindi and llama.cpp on the same card, with the same model file and the same context. Tokens per second, one stream,

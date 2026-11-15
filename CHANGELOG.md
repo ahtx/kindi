@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Experimental
+
+- RDNA2 signed-dot compilation path for gfx1030–gfx1036. On an RX6600,
+  the complete core kernel module compiled with native Windows TheRock HIP;
+  its signed-dot helper passed 256 device-executed cases against integer reference values.
+- RX6600 defaults to one lane-layout packed-weight copy rather than two resident
+  copies. Linux-only `prctl` handling is skipped on other platforms.
+- With the separately patched native Windows CuPy HIP build, Bonsai 2B and 27B
+  each matched all four llama.cpp reference prompts (40 tokens per prompt) on RX6600.
+  A real 8,192-token prompt at a 32,768-token allocation measured 278 tokens/s
+  prefill and 20.1 tokens/s greedy decode for the 27B PTQ1_0 pack.
+- This remains experimental: CuPy is a source-built dependency, profiling APIs
+  are explicitly unavailable without real ROCm profiling libraries, and the
+  existing Windows installer does not install this native AMD configuration.
+- Opt-in `KINDI_HOST_OUTPUT` and `KINDI_HOST_FFN_LAYERS` use mapped pinned host
+  weights with GPU computation; remaining weights occupy compact GPU storage.
+- Opt-in `KINDI_WDDM_BUDGET` fits context to this process's native Windows local
+  memory budget. On the tested desktop, that was about 6.6 GiB. A budget-fitted
+  18K-class window held about 24 tokens/s after 8K and 22 tokens/s near full;
+  large 60K/64K allocations were much slower.
+- Explicit lane split pins now apply; unused g5/int8 prompt split scratch is
+  removed (40 MiB at chunk 256) without changing its compute path.
+- RDNA2 dp4a compilation is available on the optional HIP TC/speculative path;
+  gfx103x defaults to one copy. N-gram copying was faster in one exact file-edit
+  workload, but TC changed general output and was not selected as the default.
+  Incompatible explicit TC layouts and HIP B2 requests fail instead of falling
+  back; this behavior also applies outside RDNA2.
+- Saved-state arithmetic fingerprints include `tc_hip.cu`.
+
 ## 0.6.0 (2026-11-12)
 
 ### New

@@ -7,6 +7,7 @@ Arithmetic follows llama.cpp's reference for this model (fp64 norm sums, fp16 K/
 it token for token (kindi verify)."""
 import json
 import os
+import sys
 import time
 
 import numpy as np
@@ -66,7 +67,7 @@ KERNELS = ("k_g4", "k_g4l", "k_fold_fwht", "k_rmsfold", "k_smfold", "k_l2w", "k_
 
 def _no_thp():
     """ROCm: no khugepaged collapses in this process (they evict the GPU queues mid-kernel; see AMD-NOTES.md)"""
-    if cp is None or not getattr(cp.cuda.runtime, "is_hip", False) or os.environ.get("KINDI_THP", "0") == "1":
+    if sys.platform != "linux" or cp is None or not getattr(cp.cuda.runtime, "is_hip", False) or os.environ.get("KINDI_THP", "0") == "1":
         return
     try:
         import ctypes

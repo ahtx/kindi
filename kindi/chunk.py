@@ -165,10 +165,8 @@ def reserve(eng):
             uw = max(NFF, s.CONV_CH + 2 * s.NK * HK, 2 * s.NH * HD, 3 * s.NHKV * HD + 2 * s.NH * HD)
             c["U1"], c["U2"] = z(T * uw), z(T * uw)
             c["OUT"] = z(T * max(s.NV * HK, s.NH * HD))
-            # split parts: the 5-trit path splits only the small K/V products; the 2-bit path may split D-row ones
             ctc = getattr(s, "tc_layout", False) and getattr(s, "wl", None) is None and not getattr(s, "tc_lane", False)
-            # (HIP keeps the lane copy, sm_60 the lane layout itself: no tc GEMMs)
-            c["SPL"] = z(1 if ctc else 8 * T * max(s.NHKV * HD, D))   # (small models split D-row products too)   # (tc: not used)
+            # HIP dual-copy and sm_60 keep lane-layout chunk products; single-copy HIP uses the tc kernels.
             c["YP"] = z(T * D) if eng.W == 2 else None          # the other card's row-parallel part
             tv = os.environ.get("KINDI_CHUNK_TILE", "")
             c["small"] = tv == "64" or (tv != "128" and cp.cuda.runtime.getDeviceProperties(s.card)["major"] < 5)
@@ -185,6 +183,10 @@ def reserve(eng):
                 c["XQ"], c["XS"] = cp.zeros(T * work // 4, dtype=cp.uint32), z(T * work // 128)
             c["tc"] = ctc                               # tc layout (spec.py): tensor-core GEMMs, XQ in the tc order
             c["f16"] = f16_prompt(s.card) and (ctc or s.g5)
+            # k_mm_g5q writes Y directly and returns before either split-scratch user. Keep scratch for the
+            # float 5-trit and 2-bit branches; their k_sumsplits launches still consume it.
+            g5q8 = s.g5 and c["q8"] and not ctc and not c["f16"]
+            c["SPL"] = None if g5q8 else z(1 if ctc else 8 * T * max(s.NHKV * HD, D))
             if c["f16"]:                                # the fp16 prompt path (f16p.cu): inputs, a weight piece, a result
                 rw = max(NFF, D, uw, s.NV * HK, s.NH * HD)
                 c["X16"] = cp.zeros(T * work, dtype=cp.float16)
