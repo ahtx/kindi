@@ -1,12 +1,17 @@
-# Kindi runtime image for AMD GPUs (ROCm). The host needs only the amdgpu kernel driver (in the Linux kernel) and
-# Docker: ROCm 6.3, Python and CuPy are in the image. For the Radeon 780M (gfx1103), also set
-# HSA_OVERRIDE_GFX_VERSION=11.0.2 and boot with amdgpu.cwsr_enable=0 (see docs/AMD.md).
+# syntax=docker/dockerfile:1
+# Kindi runtime image for AMD GPUs (ROCm 6.3). The host
+# needs only the amdgpu kernel driver (in the Linux kernel) and Docker: ROCm 6.3, Python and CuPy are in the image.
+# For the Radeon 780M (gfx1103), also set HSA_OVERRIDE_GFX_VERSION=11.0.2 and boot with amdgpu.cwsr_enable=0
+# (see docs/AMD.md).
 #
-#   docker build -t kindi-rocm:0.5.0 -f docker/Dockerfile.rocm .
-#   docker run -d --name kindi --device /dev/kfd --device /dev/dri --group-add video --group-add render \
+#   docker build -t kindi-rocm:0.6.0 -f docker/Dockerfile.rocm --build-arg KINDI_VERSION=0.6.0 .
+#   docker run -d --name kindi --device /dev/kfd --device /dev/dri \
+#       --group-add $(getent group video | cut -d: -f3) --group-add $(getent group render | cut -d: -f3) \
 #       --security-opt seccomp=unconfined -e HSA_OVERRIDE_GFX_VERSION=11.0.2 \
-#       -p 127.0.0.1:8093:8093 -v $HOME/.kindi:/data kindi-rocm:0.5.0
-FROM rocm/dev-ubuntu-24.04:6.3.3
+#       -p 127.0.0.1:8093:8093 -v kindi-data:/data -e KINDI_MODEL=bonsai-4b kindi-rocm:0.6.0
+#
+# The base image is pinned by digest (rocm/dev-ubuntu-24.04:6.3.3).
+FROM rocm/dev-ubuntu-24.04:6.3.3@sha256:17811ff26c4c9067e774aeb0829742633dff5927caaead1e78434a975e15af64
 
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 # the ROCm math libraries that CuPy builds against (the versions of the ROCm 6.3.3 base image)
@@ -24,11 +29,33 @@ RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir "fastapi==0.115.6" "uvicorn==0.32.1" "Jinja2==3.1.4" "MarkupSafe==3.0.2"
 ENV PATH=/opt/venv/bin:$PATH
 
+# a fixed non-root user (1000:1000, in the video and render groups) owns /data. Ubuntu 24.04's own 'ubuntu' user has
+# uid 1000 and is removed. The GPU device nodes belong to the HOST's video and render groups: add their numbers with
+# --group-add (compose: VIDEO_GID and RENDER_GID). Rootless Docker/Podman use -u 0:0.
+RUN (userdel -r ubuntu 2>/dev/null || true) \
+    && groupadd -g 1000 kindi && useradd -u 1000 -g 1000 -m -d /home/kindi -s /usr/sbin/nologin kindi \
+    && for g in video render; do getent group $g >/dev/null && usermod -aG $g kindi; done; \
+    mkdir -p /data && chown 1000:1000 /data
+
 COPY kindi /opt/kindi/kindi
 WORKDIR /opt/kindi
-# /data holds the converted model (pack/) and the cache (state/); see docs/DOCKER.md
-ENV KINDI_PACK=/data/pack KINDI_STATE_DIR=/data/state KINDI_HOST=0.0.0.0 CUPY_CACHE_DIR=/data/state/cupy
+# /data holds the models (models/), the packs (packs/ or pack/) and the cache (state/); see docs/DOCKER.md
+ENV KINDI_PACK=/data/pack KINDI_STATE_DIR=/data/state KINDI_HOST=0.0.0.0 CUPY_CACHE_DIR=/data/state/cupy HOME=/home/kindi
 VOLUME ["/data"]
 EXPOSE 8093
-ENTRYPOINT ["python3", "-m", "kindi"]
+USER 1000:1000
+
+ARG KINDI_VERSION=dev
+ARG KINDI_REVISION=unknown
+LABEL org.opencontainers.image.title="Kindi (AMD ROCm 6.3)" \
+      org.opencontainers.image.description="Kindi: local LLM inference on low-cost GPUs. AMD RDNA3 graphics (ROCm 6.3; tested: Radeon 780M)." \
+      org.opencontainers.image.source="https://github.com/ahtx/kindi" \
+      org.opencontainers.image.url="https://amirhusain.com/kindi" \
+      org.opencontainers.image.documentation="https://github.com/ahtx/kindi/blob/main/docs/DOCKER.md" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.vendor="Amir Husain" \
+      org.opencontainers.image.version="${KINDI_VERSION}" \
+      org.opencontainers.image.revision="${KINDI_REVISION}" \
+      org.opencontainers.image.base.name="docker.io/rocm/dev-ubuntu-24.04:6.3.3"
+ENTRYPOINT ["python3", "-m", "kindi.container"]
 CMD ["serve"]

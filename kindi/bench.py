@@ -27,6 +27,12 @@ def run(cfg, log=print):
             return 2
         from .nanbeige_cli import bench
         return bench(cfg, man, log=log)
+    if man.get("backend") == "kindi_lightning":
+        if cp is None:
+            log("kindi bench: the Lightning backend runs only on an NVIDIA GPU (KINDI_DEVICE=cpu is set or CuPy is missing)")
+            return 2
+        from .lightning_cli import bench
+        return bench(cfg, man, log=log)
     cl = os.path.join(pack, "head_clusters.npz")
     eng = make_engine(pack, ctx=cfg["ctx"], clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log)
     if cp is not None:

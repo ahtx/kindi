@@ -28,9 +28,14 @@ DEFAULTS = {
     "prefix_min": "512",                # smallest opening worth saving (tokens)
     "park_max": "3",                    # other conversations kept in host RAM
     "checkpoint_budget_mb": "0",        # host RAM for checkpoints and parked conversations (0: 20% of the RAM)
+    "turn_save": "1",                   # 1: save the state at the end of each turn to disk, in the background
+    "turn_keep": "4",                   # saved turns: conversations kept on disk (the newest turn of each)
+    "turn_disk_mb": "4096",             # saved turns: disk space they may use
+    "turn_min": "64",                   # saved turns: shortest conversation worth saving (tokens)
     "repeat_stop": "0",                 # 1: stop a reply caught in a repeating loop (close it while thinking)
     "lookup": "5",                      # Nanbeige: prompt-lookup drafting, up to this many tokens per check (0: off)
     "mtp_head": "",                     # Nanbeige: an MTP head file, a second draft source (empty: none)
+    "kv_cache": "auto",                 # Nanbeige: the K/V cache, auto, f16 or q8_0 (auto: f16 when it fits, else q8_0)
     "reasoning_effort": "",             # 27B template: xhigh | medium | low (empty: the template default, xhigh)
     # generation defaults (a request's own values win)
     "max_tokens": "1024",
@@ -43,6 +48,7 @@ DEFAULTS = {
 }
 
 INT_KEYS = {"repeat_stop", "lookup", "port", "ctx", "fast_clusters", "checkpoint_every", "checkpoint_budget_mb", "prefix_max", "prefix_min", "park_max",
+            "turn_save", "turn_keep", "turn_disk_mb", "turn_min",
             "max_tokens", "top_k", "repeat_last_n"}
 FLOAT_KEYS = {"temperature", "top_p", "min_p", "repeat_penalty"}
 PATH_KEYS = {"pack", "state_dir"}
@@ -106,7 +112,7 @@ def load(explicit=None, overrides=None):
     if cfg["model_name"] == "auto":
         manifest = os.path.join(cfg["pack"], "kindi_pack.json")
         m = json.load(open(manifest)) if os.path.isfile(manifest) else {}
-        if m.get("backend") == "kindi_gemma4":
+        if m.get("backend") in ("kindi_gemma4", "kindi_lightning"):
             cfg["model_name"] = m.get("model_id", "gemma4")
         else:
             # the GGUF's general.name, then its file name: some files name the model only "Hf"

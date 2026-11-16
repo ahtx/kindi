@@ -28,7 +28,7 @@ Kindi has one head: `kindi-mtp-2b-v1.npz` (61 MB), for Ternary-Bonsai-2-2B. It i
 
 MTP runs only on the tensor-core path: NVIDIA sm_80 and later, with `KINDI_TC=1`.
 
-On older cards, Kindi does not use MTP. On these cards, a pass over T tokens costs almost T single steps, so a
+On cards before sm_80 (for example the Quadro K1200 and the GTX 1080), Kindi does not use MTP. On these cards, a pass over T tokens costs almost T single steps, so a
 draft cannot save time. These are the measurements for T = 2, 3 and 4 tokens per pass (pass time / step time):
 
 | Card | T = 2 | T = 3 | T = 4 | Mode A, predicted |
@@ -39,22 +39,16 @@ draft cannot save time. These are the measurements for T = 2, 3 and 4 tokens per
 ## Measured speed
 
 These measurements used greedy decoding, 128 tokens (2B: 512 tokens, the median of 3 runs), and the same text on
-each card. The cells give tok/s and (speed-up). The full tables are in `docs/dev/bench-0.4.0/mtp.md`.
+each card. The cells give tok/s in auto mode (the default). On the RTX 3080, the 27B now drafts with DSpine:
+115.5 tok/s at 32K ([DSPINE.md](DSPINE.md)).
 
-| Card | Model and mode | 512 tokens of context | 8K | 24K |
+| Card | Model | 512 tokens of context | 8K | 24K |
 |---|---|---|---|---|
-| RTX 3080 (190 W) | 27B, no speculation | 62.3 | 61.4 | 58.2 |
-| RTX 3080 (190 W) | 27B, 2B drafter, k=2 | 91.1 (1.46x) | 103.2 (1.68x) | 98.7 (1.70x) |
-| RTX 3080 (190 W) | 27B, 2B drafter, k=3 | 85.1 (1.37x) | 111.5 (1.82x) | 102.5 (1.76x) |
-| RTX 3060 | 27B, no speculation | 41.1 | 40.4 | 36.9 |
-| RTX 3060 | 27B, auto | 60.6 (1.48x) | 73.5 (1.82x) | 66.7 (1.81x) |
-| RTX 3080 (190 W) | 2B, no MTP | 370.8 | 368.6 | 349.0 |
-| RTX 3080 (190 W) | 2B, head, k=2 | 409.0 (1.10x) | 395.5 (1.07x) | 336.1 (0.96x) |
-| RTX 3060 | 2B, no MTP | 316.9 | 314.4 | 287.0 |
-| RTX 3060 | 2B, head, k=2 | 350.7 (1.11x) | 340.3 (1.08x) | 273.3 (0.95x) |
+| RTX 3060 | 27B (the 2B drafter) | 60.6 | 73.5 | 66.7 |
+| RTX 3080 (190 W) | 2B (its own head up to 8K) | 409.0 | 395.5 | 349.0 |
+| RTX 3060 | 2B (its own head up to 8K) | 350.7 | 340.3 | 287.0 |
 
-The output of every mode was the same as without speculation. B2 was slower than the 2B drafter alone (B0) on
-both cards.
+The output of every mode was the same as without speculation.
 
 ## How auto mode selects
 

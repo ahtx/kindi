@@ -1,0 +1,54 @@
+# Kindi with Docker Compose v2 (`docker compose`) or podman-compose, NVIDIA cards (and the CPU engine). It pulls the
+# published image: no clone and no build. The project name is the folder name (or -p kindi). See docs/CONTAINERS.md.
+#
+#   curl -fsSLO https://raw.githubusercontent.com/ahtx/kindi/main/compose.yaml
+#   KINDI_MODEL=bonsai-4b docker compose up -d        # or: podman-compose up -d
+#
+# The first start downloads the model (or uses a GGUF in the volume), builds its pack once and starts the server on
+# 127.0.0.1:8093. Later starts reuse the pack. `kindi models` lists the model ids:
+#   docker compose run --rm kindi models
+#
+# Settings (environment or a .env file beside this file):
+#   KINDI_MODEL       a model id (bonsai-2b, bonsai-4b, bonsai-9b, bonsai-27b, nemotron-e4b, nanbeige-33b) or a GGUF
+#                     path in the container, for example /data/models/my-model.gguf
+#   KINDI_TAG         the image tag (default: cuda = the latest release; pin a release with 0.6.0-cuda)
+#   KINDI_PORT        the host port (default 8093); KINDI_BIND=0.0.0.0 serves the LAN (set KINDI_API_KEY then)
+#   KINDI_DATA        a host folder for /data instead of the named volume (an absolute path)
+#   KINDI_VOLUME      the name of the named volume (default kindi-data, the same as in the docker run examples)
+#   KINDI_UID         the container user (default 1000:1000; rootless Docker and Podman: 0:0)
+#
+# Rootless Podman: podman-compose 1.1 or later turns the GPU reservation below into a CDI device. If it does not,
+# replace the deploy: block with   devices: ["nvidia.com/gpu=all"]   (needs `nvidia-ctk cdi generate`). Full Podman
+# support (the installer, rootless GPU mapping) is planned for a later release; this is best effort.
+services:
+  kindi:
+    image: ghcr.io/ahtx/kindi:${KINDI_TAG:-cuda}
+    restart: unless-stopped
+    user: "${KINDI_UID:-1000:1000}"
+    ports:
+      - "${KINDI_BIND:-127.0.0.1}:${KINDI_PORT:-8093}:8093"
+    volumes:
+      - ${KINDI_DATA:-kindi-data}:/data
+    environment:
+      KINDI_MODEL: ${KINDI_MODEL:-bonsai-4b}
+      KINDI_CTX: ${KINDI_CTX:-24576}
+      KINDI_API_KEY: ${KINDI_API_KEY:-}
+      KINDI_VERIFY_ON_START: ${KINDI_VERIFY_ON_START:-0}
+      # the driver's JIT cache and CuPy's kernel cache stay in the volume (the first start compiles the kernels)
+      CUDA_CACHE_PATH: /data/state/cudacache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if b'\"ok\":true' in urllib.request.urlopen('http://127.0.0.1:8093/health', timeout=5).read() else 1)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30m
+      retries: 3
+volumes:
+  kindi-data:
+    name: ${KINDI_VOLUME:-kindi-data}

@@ -6,7 +6,7 @@ language modelling.
 import os
 import subprocess
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 
 def _commit():

@@ -14,9 +14,25 @@ __device__ __forceinline__ u32 nbq_h2(float a, float b) {
     return *reinterpret_cast<u32*>(&h);
 }
 
-template <int G>
+/* 8 q8_0 values (one fp16 scale) -> 8 fp16 values q * d */
+__device__ __forceinline__ uint4 nbq_deq8(uint2 b, float d) {
+    uint4 r;
+    u32* w = reinterpret_cast<u32*>(&r);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const u32 x = i < 2 ? b.x : b.y;
+        const int sh = 16 * (i & 1);
+        w[i] = nbq_h2((float)(signed char)((x >> sh) & 255u) * d, (float)(signed char)((x >> (sh + 8)) & 255u) * d);
+    }
+    return r;
+}
+
+/* Q8: the cache is q8_0 (nbq_q8kv.cu): kc, vc int8 [nkv][ctx][128], kd, vd their fp16 scales [nkv][ctx][4] */
+template <int G, bool Q8>
 __device__ __forceinline__ void nbq_fa_t(const float* qkv, int ld, int nt, int pos0,
-        const __half* kc, const __half* vc, int ctx, float scale, float* out) {
+        const void* kc_, const __half* kd, const void* vc_, const __half* vd, int ctx, float scale, float* out) {
+    const __half* kc = reinterpret_cast<const __half*>(kc_);
+    const __half* vc = reinterpret_cast<const __half*>(vc_);
     extern __shared__ __align__(16) unsigned char fsm[];
     __half* Ks = reinterpret_cast<__half*>(fsm);            /* [64][NBQ_FLD] */
     __half* Vs = Ks + 64 * NBQ_FLD;                          /* [64][NBQ_FLD] */
@@ -50,10 +66,19 @@ __device__ __forceinline__ void nbq_fa_t(const float* qkv, int ld, int nt, int p
 #pragma unroll
         for (int h = 0; h < 8; h++) {                       /* K and V tiles: 64 positions x 16 pieces of 8 halves */
             int idx = tid + 128 * h, pc = idx >> 6, p = idx & 63;
-            uint4 kv = *reinterpret_cast<const uint4*>(kc + nbq_kofs(hk, ctx, p0 + p, pc));
-            *reinterpret_cast<uint4*>(Ks + p * NBQ_FLD + 8 * pc) = kv;
             int vp = idx >> 4, vpc = idx & 15;
-            uint4 vv = *reinterpret_cast<const uint4*>(vbase + (size_t)(p0 + vp) * 128 + 8 * vpc);
+            uint4 kv, vv;
+            if (Q8) {
+                const size_t rk = (size_t)hk * ctx + p0 + p, rv = (size_t)hk * ctx + p0 + vp;
+                kv = nbq_deq8(*reinterpret_cast<const uint2*>(reinterpret_cast<const signed char*>(kc_) + rk * 128 + 8 * pc),
+                              __half2float(kd[rk * 4 + (pc >> 2)]));
+                vv = nbq_deq8(*reinterpret_cast<const uint2*>(reinterpret_cast<const signed char*>(vc_) + rv * 128 + 8 * vpc),
+                              __half2float(vd[rv * 4 + (vpc >> 2)]));
+            } else {
+                kv = *reinterpret_cast<const uint4*>(kc + nbq_kofs(hk, ctx, p0 + p, pc));
+                vv = *reinterpret_cast<const uint4*>(vbase + (size_t)(p0 + vp) * 128 + 8 * vpc);
+            }
+            *reinterpret_cast<uint4*>(Ks + p * NBQ_FLD + 8 * pc) = kv;
             *reinterpret_cast<uint4*>(Vs + vp * NBQ_FLD + 8 * vpc) = vv;
         }
         __syncthreads();
@@ -126,8 +151,11 @@ __device__ __forceinline__ void nbq_fa_t(const float* qkv, int ld, int nt, int p
 }
 #define NBQ_FA(G, NAME) extern "C" __global__ void __launch_bounds__(128) NAME(const float* qkv, int ld, int nt, \
     int pos0, const __half* kc, const __half* vc, int ctx, float scale, float* out) { \
-    nbq_fa_t<G>(qkv, ld, nt, pos0, kc, vc, ctx, scale, out); }
+    nbq_fa_t<G, false>(qkv, ld, nt, pos0, kc, nullptr, vc, nullptr, ctx, scale, out); }
+#define NBQ_FA_Q8(G, NAME) extern "C" __global__ void __launch_bounds__(128) NAME(const float* qkv, int ld, int nt,     int pos0, const signed char* kq, const __half* kd, const signed char* vq, const __half* vd, int ctx, float scale,     float* out) { nbq_fa_t<G, true>(qkv, ld, nt, pos0, kq, kd, vq, vd, ctx, scale, out); }
 #if NBQ_TC
 NBQ_FA(7, nbq_fa_prefill)
 NBQ_FA(5, nbq_fa_prefill_g5)
+NBQ_FA_Q8(7, nbq_fa_prefill_q8)
+NBQ_FA_Q8(5, nbq_fa_prefill_q8_g5)
 #endif

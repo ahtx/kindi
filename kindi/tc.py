@@ -90,10 +90,10 @@ def supported(card=None):
 
 
 def ptx_target(arch):
-    """the PTX target for this card: PTX ISA 7.1 knows sm_80 and sm_86 only (ptxas: "PTX .version 7.1 does not
-    support .target sm_89"), so a later card (sm_87, Ada sm_89, Hopper, Blackwell) gets sm_80 code, which its
-    driver builds for the card"""
-    return arch if arch in ("sm_80", "sm_86") else "sm_80"
+    """the PTX target for this card: PTX ISA 7.1 knows sm_75, sm_80 and sm_86 only (ptxas: "PTX .version 7.1 does
+    not support .target sm_89"), so a later card (sm_87, Ada sm_89, Hopper, Blackwell) gets sm_80 code, which its
+    driver builds for the card. A Turing card keeps sm_75: its driver cannot build sm_80 code"""
+    return arch if arch in ("sm_75", "sm_80", "sm_86") else "sm_80"
 
 
 def _patched_module(src, arch, opts=()):

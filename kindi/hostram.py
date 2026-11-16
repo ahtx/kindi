@@ -6,16 +6,49 @@ import os
 MARGIN = 1 << 30                       # the rest of the load (tokenizer, plans, Python) besides the weights
 
 
-def available():
-    """MemAvailable in bytes, or None when /proc/meminfo cannot be read"""
+def _meminfo(key):
     try:
         with open("/proc/meminfo") as f:
             for line in f:
-                if line.startswith("MemAvailable:"):
+                if line.startswith(key + ":"):
                     return int(line.split()[1]) * 1024
     except (OSError, ValueError, IndexError):
         pass
     return None
+
+
+def _windows():
+    """(total, available) bytes from GlobalMemoryStatusEx on native Windows, else None"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        m = MEMORYSTATUSEX()
+        m.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            return None
+        return int(m.ullTotalPhys), int(m.ullAvailPhys)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def total():
+    """physical RAM in bytes (MemTotal, or GlobalMemoryStatusEx on native Windows), or None when unknown"""
+    w = _windows()
+    return w[0] if w else _meminfo("MemTotal")
+
+
+def available():
+    """free RAM in bytes (MemAvailable, or GlobalMemoryStatusEx on native Windows), or None when unknown"""
+    w = _windows()
+    return w[1] if w else _meminfo("MemAvailable")
 
 
 def check(need, what, log=print, avail=None):

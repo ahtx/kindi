@@ -19,7 +19,8 @@ KERNELS = ("nbq_mv_q4k", "nbq_mv_q5k", "nbq_mv_iq3xxs", "nbq_mv_iq3s", "nbq_mv_i
            "nbq_add_rms_q8", "nbq_add_rms", "nbq_q8", "nbq_swiglu_q8", "nbq_embed_t21", "nbq_embed_t12", "nbq_embed_t13", "nbq_rope_store",
            "nbq_attn_part", "nbq_attn_merge", "nbq_add", "nbq_argmax_part", "nbq_argmax_final",
            "nbq_mm_q4k", "nbq_mm_q5k", "nbq_mm_iq3xxs", "nbq_mm_iq3s", "nbq_mm_iq2s", "nbq_mm_iq2s_q4k", "nbq_attn_part_g5", "nbq_fa_prefill_g5",
-           "nbq_add_rms_q8_rows", "nbq_swiglu_q8_rows", "nbq_q8_rows", "nbq_rope_store_rows", "nbq_fa_prefill", "nbq_qkv_rope", "nbq_attn_merge_q8", "nbq_attn_merge_q8_rows", "nbq_argmax_rows") + tuple(
+           "nbq_add_rms_q8_rows", "nbq_swiglu_q8_rows", "nbq_q8_rows", "nbq_rope_store_rows", "nbq_fa_prefill", "nbq_qkv_rope", "nbq_attn_merge_q8", "nbq_attn_merge_q8_rows", "nbq_argmax_rows",
+           "nbq_rope_store_q8", "nbq_attn_q8", "nbq_attn_q8_g5", "nbq_fa_prefill_q8", "nbq_fa_prefill_q8_g5") + tuple(
     "nbq_mvn_%s_%d" % (t, n) for t in ("q4k", "q5k", "iq3xxs", "iq3s", "iq2s") for n in range(1, 9))
 TCV = {12: "nbq_tcv_q4k", 13: "nbq_tcv_q5k", 18: "nbq_tcv_iq3xxs", 21: "nbq_tcv_iq3s", 22: "nbq_tcv_iq2s"}
 KERNELS = KERNELS + tuple(TCV.values()) + ("nbq_tcv_sum",)
@@ -37,14 +38,17 @@ MVN = {12: "nbq_mvn_q4k", 13: "nbq_mvn_q5k", 18: "nbq_mvn_iq3xxs", 21: "nbq_mvn_
 FA_SMEM = 2 * 64 * 136 * 2                                   # nbq_fa.cu: K and V tiles
 MM = {12: "nbq_mm_q4k", 13: "nbq_mm_q5k", 18: "nbq_mm_iq3xxs", 21: "nbq_mm_iq3s", 22: "nbq_mm_iq2s", (22, 12): "nbq_mm_iq2s_q4k"}
 GEMM_SMEM = 2 * 128 * 144 + 128 * 8 * 4 + 3 * 128 * 4 * 4    # NBQ_GEMM_SMEM in nbq_mm.cu
-TC_KERNELS = set(MM.values()) | set(TCV.values()) | {"nbq_fa_prefill", "nbq_fa_prefill_g5"}
+FA_KERNELS = ("nbq_fa_prefill", "nbq_fa_prefill_g5", "nbq_fa_prefill_q8", "nbq_fa_prefill_q8_g5")
+TC_KERNELS = set(MM.values()) | set(TCV.values()) | set(FA_KERNELS)
+KV_TYPES = ("f16", "q8_0")                                  # the K/V cache (config kv_cache)
+KV_DEFAULT = "auto"                                         # f16 when it fits at ctx, else q8_0
 CHUNK = 512                                                 # prompt tokens per pass
 ATT_SUB = 32                                                # prompt tokens per attention launch
 
 
 def source():
     here = os.path.dirname(os.path.abspath(__file__))
-    return "".join(open(os.path.join(here, f), encoding="utf-8").read() for f in ("nbq_grids.h", "nbq.cu", "nbq_mm.cu", "nbq_fa.cu", "nbq_mvn.cu", "nbq_tcv.cu", "nbq_k35.cu"))
+    return "".join(open(os.path.join(here, f), encoding="utf-8").read() for f in ("nbq_grids.h", "nbq.cu", "nbq_mm.cu", "nbq_fa.cu", "nbq_q8kv.cu", "nbq_mvn.cu", "nbq_tcv.cu", "nbq_k35.cu"))
 
 
 def module(cp, src, tc=True, extra=()):
@@ -223,17 +227,21 @@ class Card(object):
             for n in KERNELS:
                 if n.startswith("nbq_mvn_") and tc:          # (the launches use none now: stage_x is off; sm_61
                     _smem(cp, self.k[n], 65536)               # cannot give a block more than 48 KB)
-            for n in ("nbq_fa_prefill", "nbq_fa_prefill_g5") if tc else ():
+            for n in FA_KERNELS if tc else ():
                 _smem(cp, self.k[n], FA_SMEM)
             self.stream = cp.cuda.Stream(non_blocking=True)
         self.w = {}
-        self.kc, self.vc = {}, {}
+        self.kc, self.vc, self.kd, self.vd = {}, {}, {}, {}    # kd, vd: the q8_0 scales
         self.graph = {}
 
 
 class Engine(object):
-    def __init__(self, path, ctx=4096, devices=None, split=None, keep=None, reserve_mb=None, log=print):
+    def __init__(self, path, ctx=4096, devices=None, split=None, keep=None, reserve_mb=None, kv=None, log=print):
         import cupy as cp
+        self.kv = kv or os.environ.get("KINDI_KV_CACHE") or KV_DEFAULT
+        if self.kv not in KV_TYPES + ("auto",):
+            raise SystemExit("kindi: kv_cache must be auto or one of %s, not %r" % (", ".join(KV_TYPES), self.kv))
+        self.q8 = self.kv == "q8_0"
         ctx = (ctx + 255) // 256 * 256 if ctx > 0 else 0  # the attention kernels read whole tiles of 256 positions
         self.cp, self.log, self.ctx = cp, log, ctx
         g = GGUF(path)
@@ -250,8 +258,6 @@ class Engine(object):
         self.vocab = len(kv["tokenizer.ggml.tokens"])
         self.G = self.n_head // self.n_kv
         assert self.hd == 128 and self.G in (5, 7), "nbq.cu is written for 128-wide heads, 5 or 7 per K/V head"
-        self.k_attn = "nbq_attn_part" if self.G == 7 else "nbq_attn_part_g%d" % self.G
-        self.k_fa = "nbq_fa_prefill" if self.G == 7 else "nbq_fa_prefill_g%d" % self.G
         self.keep = keep or {}                             # bytes to leave free per device (for a draft model)
         self.reserve = int(os.environ.get("KINDI_NB_RESERVE_MB", "300") if reserve_mb is None else reserve_mb) * 2 ** 20
         self.tinfo = {n: (ne, ty, off) for n, ne, ty, off in g.tensors}
@@ -263,6 +269,19 @@ class Engine(object):
         # the embedding in pinned host memory: a step reads one row of it (5 KB over PCIe). Default on Kepler,
         # where the cards are small.
         self.embd_host = os.environ.get("KINDI_NB_EMBD_HOST", "1" if kepler(cp, devices[0]) else "0") == "1"
+        if self.kv == "auto":
+            # auto: the f16 cache when the whole model and its cache fit on the cards at ctx, else q8_0 (half the
+            # memory) on cards with dp4a, so a long context stays on the cards instead of using host layers
+            self.kv = "f16"
+            dp4a = min(int(cp.cuda.Device(d).compute_capability) for d in devices) >= 61 and not kepler(cp, devices[0])
+            if self.ctx > 0 and dp4a and split is None:
+                ok, _ = self._fit(devices, _free_bytes(cp, devices), self.ctx, quiet=True)
+                if not ok or self.n_host:
+                    self.kv, self.q8 = "q8_0", True
+                    log("kv_cache auto: f16 does not fit ctx %d on the cards, using q8_0" % self.ctx)
+        g5 = "" if self.G == 7 else "_g%d" % self.G
+        self.k_attn = ("nbq_attn_q8" if self.q8 else "nbq_attn_part") + g5
+        self.k_fa = ("nbq_fa_prefill_q8" if self.q8 else "nbq_fa_prefill") + g5
         if split is None:
             split = self._plan(devices)
         bounds = [0] + list(split) + [self.n_layer]
@@ -274,6 +293,8 @@ class Engine(object):
         self.cards = [Card(cp, d, bounds[i], bounds[i + 1], {"tc": self.tc}) for i, d in enumerate(devices)]
         self.k35 = any(c.k35 for c in self.cards)
         self.kslow = any(c.kslow for c in self.cards)
+        if self.q8 and (self.k35 or self.kslow or cc < 61):
+            raise SystemExit("kindi: the q8_0 K/V cache needs dp4a (compute capability 6.1 or newer); use kv_cache f16")
         if not self.tc and not self.k35:
             log("compute capability %d: no tensor-core prompt kernels; the prompt is read 8 tokens per pass" % cc)
         last = self.cards[-1]
@@ -340,7 +361,11 @@ class Engine(object):
         w = max(sum(self._nbytes("blk.%d.%s.weight" % (il, t)) for t in ("attn_q", "attn_k", "attn_v", "attn_output",
                                                                           "ffn_gate", "ffn_up", "ffn_down"))
                 for il in range(self.n_layer))
-        return w + 2 * self.n_kv * ctx * self.hd * 2
+        return w + self._kvl(ctx)
+
+    def _kvl(self, ctx):
+        """bytes of one layer's K/V cache at ctx (q8_0: 32 int8 and an fp16 scale per 32 values)"""
+        return 2 * self.n_kv * ctx * (self.hd + self.hd // 16 if self.q8 else self.hd * 2)
 
     def _fit(self, devices, free0, ctx, quiet=False):
         """(fits, layers per card) at ctx; may set self.n_host (KINDI_NB_HOST=1, the last card)"""
@@ -359,7 +384,7 @@ class Engine(object):
             # host layers: the layers that do not fit keep their weights in pinned host memory (the last card).
             # At each pass the card copies them, one layer after the other, into HOST_SLOTS layer buffers, while
             # it computes the layers before them (_hcopy). Their K/V stay on the card.
-            kvl = 2 * self.n_kv * ctx * self.hd * 2
+            kvl = self._kvl(ctx)
             slots = HOST_SLOTS * (per - kvl)
             dev = lambda h: max(0, int((free[-1] - h * kvl - (slots if h else 0)) // per))
             while sum(cap[:-1]) + self.n_host + dev(self.n_host) < self.n_layer and (self.n_host + 1) * kvl <= free[-1]:
@@ -559,8 +584,14 @@ class Engine(object):
                         cp.get_default_memory_pool().free_all_blocks()
                 if c.k35 or c.host:                  # the repack / reorder copies: back to the driver
                     cp.get_default_memory_pool().free_all_blocks()
-                c.kc[il] = cp.zeros((self.n_kv, self.ctx, self.hd), cp.float16)
-                c.vc[il] = cp.zeros((self.n_kv, self.ctx, self.hd), cp.float16)
+                if self.q8:
+                    for a in (c.kc, c.vc):
+                        a[il] = cp.zeros((self.n_kv, self.ctx, self.hd), cp.int8)
+                    for a in (c.kd, c.vd):
+                        a[il] = cp.zeros((self.n_kv, self.ctx, self.hd // 32), cp.float16)
+                else:
+                    c.kc[il] = cp.zeros((self.n_kv, self.ctx, self.hd), cp.float16)
+                    c.vc[il] = cp.zeros((self.n_kv, self.ctx, self.hd), cp.float16)
             if c.host:
                 self._hslots(c)
             if last:
@@ -632,6 +663,16 @@ class Engine(object):
     def _grid(self, rows):
         return min((rows + 7) // 8, self.nsm * int(os.environ.get("KINDI_NB_BPS", "4")))
 
+    def _kv(self, c, il):
+        """the cache arguments of the attention kernels for layer il"""
+        return (c.kc[il], c.kd[il], c.vc[il], c.vd[il]) if self.q8 else (c.kc[il], c.vc[il])
+
+    def _store_q8(self, c, il, q, k, v, ld, n, pos, theta_scale):
+        """RoPE and the q8_0 K/V store of n rows (q, k, v: row 0; row t at + t * ld floats)"""
+        c.k["nbq_rope_store_q8"]((self.n_head + self.n_kv, n), (128,), (q, k, v, np.int32(ld), pos, np.int32(self.n_head),
+                                 np.int32(self.n_kv), theta_scale, c.kc[il], c.kd[il], c.vc[il], c.vd[il],
+                                 np.int32(self.ctx)))
+
     def _layers(self, c, first, head):
         """the kernel launches of one token on card c (recorded into its graph)"""
         k, E, F = c.k, self.n_embd, self.n_ff
@@ -647,7 +688,7 @@ class Engine(object):
             add = c.br if il > c.lo else NULL
             k["nbq_add_rms_q8"]((1,), (1024,), (c.x, add, c.w[(il, "attn_norm")], np.int32(E), eps, c.xq, c.xs))
             wq, wk, wv = c.w[(il, "attn_q")], c.w[(il, "attn_k")], c.w[(il, "attn_v")]
-            if FUSED_QKV and (wq.ty, wk.ty, wv.ty) == (22, 22, 12) and not c.k35:
+            if FUSED_QKV and (wq.ty, wk.ty, wv.ty) == (22, 22, 12) and not c.k35 and not self.q8:
                 k["nbq_qkv_rope"]((self._grid((wq.rows + wk.rows + wv.rows) // 2),), (256,),
                                   (wq.body, wq.d, wk.body, wk.d, wv.body, c.xq, c.xs, np.int32(self.n_head),
                                    np.int32(self.n_kv), np.int32(E), c.pos, theta_scale, c.q, c.kc[il], c.vc[il],
@@ -656,9 +697,12 @@ class Engine(object):
                 self._mv(c, wq, c.q)
                 self._mv(c, wk, c.kk)
                 self._mv(c, wv, c.vv)
-                k["nbq_rope_store"]((self.n_head + self.n_kv,), (64,), (c.q, c.kk, c.vv, c.pos, np.int32(self.n_head),
-                                    np.int32(self.n_kv), theta_scale, c.kc[il], c.vc[il], np.int32(self.ctx)))
-            k[self.k_attn]((self.n_kv, NSPLIT), (256,), (c.q, c.kc[il], c.vc[il], c.pos, np.int32(self.ctx), scale,
+                if self.q8:
+                    self._store_q8(c, il, c.q, c.kk, c.vv, 0, 1, c.pos, theta_scale)
+                else:
+                    k["nbq_rope_store"]((self.n_head + self.n_kv,), (64,), (c.q, c.kk, c.vv, c.pos, np.int32(self.n_head),
+                                        np.int32(self.n_kv), theta_scale, c.kc[il], c.vc[il], np.int32(self.ctx)))
+            k[self.k_attn]((self.n_kv, NSPLIT), (256,), (c.q,) + self._kv(c, il) + (c.pos, np.int32(self.ctx), scale,
                                c.part_o, c.part_ms, np.int32(0)))
             k["nbq_attn_merge_q8"]((self.n_head,), (128,), (c.part_o, c.part_ms, np.int32(NSPLIT), c.xq, c.xs))
             self._mv(c, c.w[(il, "attn_output")], c.br)
@@ -891,16 +935,19 @@ class Engine(object):
             k["nbq_add_rms_q8_rows"]((nt,), (1024,), (c.X, add, c.w[(il, "attn_norm")], np.int32(E), eps, c.XQ, c.XS))
             self._mm3(c, [(c.w[(il, "attn_q")], 0), (c.w[(il, "attn_k")], E),
                           (c.w[(il, "attn_v")], E + self.n_kv * self.hd)], nt, c.QKV, ld)
-            k["nbq_rope_store_rows"]((self.n_head + self.n_kv, nt), (64,), (c.QKV, c.P, np.int32(self.n_head),
-                                     np.int32(self.n_kv), theta_scale, c.kc[il], c.vc[il], np.int32(self.ctx)))
+            if self.q8:
+                self._store_q8(c, il, c.QKV, c.QKV[0, E:], c.QKV[0, E + self.n_kv * self.hd:], ld, nt, c.P, theta_scale)
+            else:
+                k["nbq_rope_store_rows"]((self.n_head + self.n_kv, nt), (64,), (c.QKV, c.P, np.int32(self.n_head),
+                                         np.int32(self.n_kv), theta_scale, c.kc[il], c.vc[il], np.int32(self.ctx)))
             if os.environ.get("KINDI_NB_FA", "1") == "1" and not c.k35:     # Kepler: no tensor cores
                 k[self.k_fa](((self.G * nt + 63) // 64, self.n_kv), (128,),
-                                    (c.QKV, np.int32(ld), np.int32(nt), np.int32(pos0), c.kc[il], c.vc[il],
-                                     np.int32(self.ctx), scale, c.ATT), shared_mem=FA_SMEM)
+                                    (c.QKV, np.int32(ld), np.int32(nt), np.int32(pos0)) + self._kv(c, il) +
+                                    (np.int32(self.ctx), scale, c.ATT), shared_mem=FA_SMEM)
             else:
                 for t0 in range(0, nt, ATT_SUB):
                     n = min(ATT_SUB, nt - t0)
-                    k[self.k_attn]((self.n_kv, NSPLIT, n), (256,), (c.QKV[t0], c.kc[il], c.vc[il], c.P[t0:],
+                    k[self.k_attn]((self.n_kv, NSPLIT, n), (256,), (c.QKV[t0],) + self._kv(c, il) + (c.P[t0:],
                                        np.int32(self.ctx), scale, c.PO, c.PMS, np.int32(ld)))
                     k["nbq_attn_merge"]((self.n_head, n), (128,), (c.PO, c.PMS, np.int32(NSPLIT), c.ATT[t0]))
             k["nbq_q8_rows"](((E // 32 + 7) // 8, nt), (256,), (c.ATT, np.int32(E), c.XQ, c.XS))
@@ -1045,7 +1092,7 @@ class Engine(object):
             add = c.BR if il > c.lo else NULL
             k["nbq_add_rms_q8_rows"]((n,), (1024,), (c.X, add, c.w[(il, "attn_norm")], np.int32(E), eps, c.XQ, c.XS))
             wq, wk, wv = c.w[(il, "attn_q")], c.w[(il, "attn_k")], c.w[(il, "attn_v")]
-            if FUSED_QKV and (wq.ty, wk.ty, wv.ty) == (22, 22, 12) and n <= 4 and not c.k35:
+            if FUSED_QKV and (wq.ty, wk.ty, wv.ty) == (22, 22, 12) and n <= 4 and not c.k35 and not self.q8:
                 k["nbq_qkvn_rope_%d" % n]((self._grid((wq.rows + wk.rows + wv.rows) // 2),), (256,),
                                           (wq.body, wq.d, wk.body, wk.d, wv.body, c.XQ, c.XS, np.int32(self.n_head),
                                            np.int32(self.n_kv), np.int32(E), c.P, theta_scale, c.QKV, np.int32(ld),
@@ -1054,9 +1101,13 @@ class Engine(object):
                 self._mvn(c, wq, n, c.QKV, ld, 0)
                 self._mvn(c, wk, n, c.QKV, ld, E)
                 self._mvn(c, wv, n, c.QKV, ld, E + self.n_kv * self.hd)
-                k["nbq_rope_store_rows"]((self.n_head + self.n_kv, n), (64,), (c.QKV, c.P, np.int32(self.n_head),
-                                         np.int32(self.n_kv), theta_scale, c.kc[il], c.vc[il], np.int32(self.ctx)))
-            k[self.k_attn]((self.n_kv, NSPLIT, n), (256,), (c.QKV, c.kc[il], c.vc[il], c.P, np.int32(self.ctx), scale,
+                if self.q8:
+                    self._store_q8(c, il, c.QKV, c.QKV[0, E:], c.QKV[0, E + self.n_kv * self.hd:], ld, n, c.P,
+                                   theta_scale)
+                else:
+                    k["nbq_rope_store_rows"]((self.n_head + self.n_kv, n), (64,), (c.QKV, c.P, np.int32(self.n_head),
+                                             np.int32(self.n_kv), theta_scale, c.kc[il], c.vc[il], np.int32(self.ctx)))
+            k[self.k_attn]((self.n_kv, NSPLIT, n), (256,), (c.QKV,) + self._kv(c, il) + (c.P, np.int32(self.ctx), scale,
                            c.PO, c.PMS, np.int32(ld)))
             k["nbq_attn_merge_q8_rows"]((self.n_head, n), (128,), (c.PO, c.PMS, np.int32(NSPLIT), c.XQ, c.XS))
             self._mvn(c, c.w[(il, "attn_output")], n, c.BR, E, 0)
