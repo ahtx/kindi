@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.1 (2026-11-16)
+
+### Fixed
+
+- The 2B with its MTP head on tensor-core cards stopped at start with `cuGraphAddKernelNode failed (1)`, and
+  `kindi verify` failed. A kernel that the MTP head uses got one more argument in 0.5.0, and the MTP head did not pass
+  it. Affected: 0.5.0 and 0.6.0, the installer's setup "Ternary-Bonsai-2 2B" on an NVIDIA card of compute capability
+  8.0 or later with 9.5 GB or more (RTX 3060 12 GB, 3080, 3090, 40 series, A100), chosen with `--model 2b`,
+  `--config` or the setup list (the recommended setup on these cards is the 27B, which does not use the MTP head), and
+  any setup that sets `KINDI_MTP_HEAD` or `KINDI_SPEC_DRAFT_HEAD` by hand. The 2B, 4B, 9B and 27B without an MTP head
+  were not affected.
+- When a CUDA graph cannot be built, the error names the node, its grid and block, and the number of arguments.
+
 ## 0.6.0 (2026-11-12)
 
 ### New

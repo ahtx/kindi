@@ -203,7 +203,9 @@ class MTPDraft(object):
         P = _tp.Plan()
         P.add(SK.k_rmsfold_qT, (D // HB, 1), (512,), (self.src, b["Y"], self.h2, self.ones, s.sD, self.xn, self.xp,
                                                       i32(D), i32(0), i32(HB), TT, i32(D), i32(D), i32(D), i32(D),
-                                                      i32(work), b["XQ"], b["XS"], b["XA"]))
+                                                      i32(work), b["XQ"], b["XS"], b["XA"], i32(0)))
+        # (k_rmsfold_qT's last argument, hp: 0 = one int8 row per token, as the head GEMV below reads them. 0.5.0
+        # added it to the kernel but not here, so the head's CUDA graph did not build: fixed in 0.6.1)
         _, Wt, R, C = s.w[s.head_name]
         R, C = int(R), int(C)
         nw, sp = _sp.tune(s, R, C)

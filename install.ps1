@@ -42,7 +42,7 @@ param(
   [switch]$ElevatedEnableWsl  # internal: the administrator step that turns on WSL
 )
 
-$KindiWinVersion = '0.6.0'
+$KindiWinVersion = '0.6.1'
 $RootfsBase = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/current'
 $RootfsFile = 'ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz'
 $MinBuild = 19041      # Windows 10 2004: WSL2

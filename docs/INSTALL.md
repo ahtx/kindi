@@ -29,17 +29,17 @@ Download the script, compare its sha256 with the value below, read it, and then 
 
 ```bash
 curl -fsSLO https://amirhusain.com/kindi/install.sh
-echo "ec0f3f19cf5c5c2d6f0f660db1efb9a6e289a4cfaf0a7c8decfb996f5e4471dc  install.sh" | sha256sum -c -
+echo "31c4a86025c4c25303b94ba7ff7436a34b2486de0621ac44a57f4b805f0a5a1c  install.sh" | sha256sum -c -
 bash install.sh --dry-run
 bash install.sh
 ```
 
 | File | sha256 |
 |---|---|
-| `install.sh` (Kindi 0.6.0) | `ec0f3f19cf5c5c2d6f0f660db1efb9a6e289a4cfaf0a7c8decfb996f5e4471dc` |
+| `install.sh` (Kindi 0.6.1) | `31c4a86025c4c25303b94ba7ff7436a34b2486de0621ac44a57f4b805f0a5a1c` |
 
 If `sha256sum -c` does not print `install.sh: OK`, do not run the script. The same script is in the repository root
-and in the 0.6.0 release.
+and in the 0.6.1 release.
 
 ## What it does
 
@@ -48,7 +48,7 @@ and in the 0.6.0 release.
 | 1. Check the machine | Linux x86-64, RAM, free disk, each NVIDIA GPU with its compute capability, and each AMD RDNA3 or RDNA 3.5 GPU. No GPU: the CPU engine. | no |
 | 2. Docker and GPU access | Finds Docker, and the NVIDIA Container Toolkit or the AMD devices `/dev/kfd` and `/dev/dri`. If something is missing, it asks before it installs it (apt). Without the toolkit, it gives the container the NVIDIA devices and the driver libraries directly. | only to install |
 | 3. Select the setup | Shows each setup for this computer, the recommended one first, and asks which one (below). | no |
-| 4. Build the image | Builds `kindi:0.6.0` (CUDA 10.2), `kindi-rocm:0.6.0` (ROCm 6.3, RDNA3) or `kindi-rocm7:0.6.0` (ROCm 7, RDNA 3.5) from the release source, and checks that the Kindi modules load. A re-run with the same source does not build again. | no |
+| 4. Build the image | Builds `kindi:0.6.1` (CUDA 10.2), `kindi-rocm:0.6.1` (ROCm 6.3, RDNA3) or `kindi-rocm7:0.6.1` (ROCm 7, RDNA 3.5) from the release source, and checks that the Kindi modules load. A re-run with the same source does not build again. | no |
 | 5. Download the models | Downloads each GGUF from Hugging Face. The sha256 must match the value in the script (table below). | no |
 | 6. Convert and verify | `kindi convert`, then `kindi verify` one time for each model on each kind of card. | no |
 | 7. Start the servers | One Docker container for each server, with `--restart unless-stopped`, on `127.0.0.1`. It waits until each `/health` answers. | no |
@@ -184,7 +184,7 @@ curl http://<address>:8093/v1/chat/completions -H 'Content-Type: application/jso
 | `--name N` | The name of the first container (default `kindi`; later ones are `N-2`, `N-3`, ...). |
 | `--threads N` | The CPU engine: the number of threads. |
 | `--memory M` | The container memory limit, for example `8g`. |
-| `--source S` | The Kindi source: a folder, or a `.tar.gz` path or URL (default: the 0.6.0 release). |
+| `--source S` | The Kindi source: a folder, or a `.tar.gz` path or URL (default: the 0.6.1 release). |
 | `--with-bridge` | Also installs Kindi Bridge, the terminal workspace for agents on Kindi (see below). |
 | `--no-bridge` | Does not ask about Kindi Bridge. |
 | `--bridge-source D` | Installs Kindi Bridge from folder D (default: `bridge/` in the Kindi source). |

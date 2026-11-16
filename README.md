@@ -1,10 +1,10 @@
-<p align="center"><img src="assets/kindi-banner.svg?v=0.6.0" alt="Kindi 0.6.0: language models on low-cost GPUs, from a 1 GB Quadro K420 to the RTX 50 series, the CMP 170HX and Radeon graphics. Ternary Bonsai 2B to 27B, AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B and DeepSeek-V4.1-Flash." width="100%"></p>
+<p align="center"><img src="assets/kindi-banner.svg?v=0.6.1" alt="Kindi 0.6.1: language models on low-cost GPUs, from a 1 GB Quadro K420 to the RTX 50 series, the CMP 170HX and Radeon graphics. Ternary Bonsai 2B to 27B, AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B and DeepSeek-V4.1-Flash." width="100%"></p>
 
-# Kindi 0.6.0
+# Kindi 0.6.1
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Commercial licenses available](https://img.shields.io/badge/commercial%20licenses-available-green.svg)](COMMERCIAL-LICENSE.md)
-[![Release v0.6.0](https://img.shields.io/badge/release-v0.6.0-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.6.0)
+[![Release v0.6.1](https://img.shields.io/badge/release-v0.6.1-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.6.1)
 
 Kindi is a custom inference engine for language models on low-cost GPUs. It runs Prism ML's ternary
 Bonsai models (2B, 4B, 9B and 27B), AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B and DeepSeek-V4.1-Flash.
@@ -167,11 +167,11 @@ exactly that.
 
 ```sh
 git clone https://github.com/ahtx/kindi.git && cd kindi
-docker build -t kindi:0.6.0 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
+docker build -t kindi:0.6.1 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
 ```
 
-For AMD RDNA3 graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.6.0`, about 6 GB to download). For
-RDNA 3.5 graphics, build `docker/Dockerfile.rocm7` (`kindi-rocm7:0.6.0`, about 9 GB to download). See
+For AMD RDNA3 graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.6.1`, about 6 GB to download). For
+RDNA 3.5 graphics, build `docker/Dockerfile.rocm7` (`kindi-rocm7:0.6.1`, about 9 GB to download). See
 [docs/AMD.md](docs/AMD.md).
 
 You can also use the release archive. Download `kindi-0.4.0.tar.gz` from the
