@@ -34,6 +34,7 @@ typedef struct {
   /* scratch */
   float *h, *xn, *xp, *y, *qkv, *zv, *cs, *qk, *gout, *outn, *m, *qn, *kr, *vv, *qr, *kro, *sc, *att, *ffg, *ffu,
         *T, *logits, *gb, *gg;
+  int16_t *s01;                          /* v3.1 streamed-lookup partial sums (ARM only; layout parity) */
   double* red;                           /* per-thread partial sums */
 } Model;
 

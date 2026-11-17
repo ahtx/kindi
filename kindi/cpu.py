@@ -47,17 +47,39 @@ class Model(ctypes.Structure):
                                              "rope_half", "ctx", "vocab")]
                 + [("L", ctypes.POINTER(Layer)), ("emb", Mat), ("head", Mat)]
                 + [(n, PF) for n in ("out_norm", "sD", "sV", "sA", "sF", "cos_t", "sin_t")]
-                + [(n, PF) for n in _SCR] + [("red", ctypes.POINTER(ctypes.c_double))])
+                + [(n, PF) for n in _SCR] + [("s01", PU16), ("red", ctypes.POINTER(ctypes.c_double))])
 
 
 def _lib():
-    src = os.path.join(HERE, "kcpu.c")
     cache = os.environ.get("KINDI_CPU_CACHE") or os.path.join(os.path.expanduser("~"), ".cache", "kindi")
     os.makedirs(cache, exist_ok=True)
-    so = os.path.join(cache, "libkcpu.so")
+    # Android/ARM64 path: set KINDI_ARM=1 to force, or auto-detect aarch64 with kcpu_arm.c present.
+    # KINDI_CPU_SRC can override the source filename (e.g. kcpu_arm.c) for explicit control.
+    import platform
+    arm_src = os.path.join(HERE, "kcpu_arm.c")
+    force_arm = os.environ.get("KINDI_ARM", "").lower() in ("1", "true", "yes")
+    is_aarch64 = platform.machine().lower() in ("aarch64", "arm64")
+    use_arm = force_arm or (is_aarch64 and os.path.exists(arm_src))
+    src_override = os.environ.get("KINDI_CPU_SRC")
+    if src_override:
+        src = os.path.join(HERE, src_override) if not os.path.isabs(src_override) else src_override
+        use_arm = "arm" in os.path.basename(src).lower() or use_arm
+    else:
+        src = arm_src if use_arm and os.path.exists(arm_src) else os.path.join(HERE, "kcpu.c")
+        if use_arm and not os.path.exists(arm_src):
+            src = os.path.join(HERE, "kcpu.c")
+    so_name = "libkcpu_arm.so" if os.path.basename(src) == "kcpu_arm.c" else "libkcpu.so"
+    so = os.path.join(cache, so_name)
+    # Build flags: arm build uses armv8.2-a+simd (scalar port, NEON headers present); x86 uses -march=native.
+    if os.path.basename(src) == "kcpu_arm.c":
+        cflags = os.environ.get("KINDI_CPU_CFLAGS", "-O3 -march=armv8.2-a+simd -fopenmp -fno-math-errno")
+    else:
+        cflags = os.environ.get("KINDI_CPU_CFLAGS", "-O3 -march=native -fopenmp -fno-math-errno")
+    cc = os.environ.get("CC", "gcc")
     if not os.path.exists(so) or os.path.getmtime(so) < os.path.getmtime(src):
-        if os.system("gcc -O3 -march=native -fopenmp -fno-math-errno -shared -fPIC -o %s %s -lm" % (so, src)):
-            raise SystemExit("kindi: could not build the CPU engine (%s); it needs gcc with OpenMP" % so)
+        cmd = "%s %s -shared -fPIC -o %s %s -lm" % (cc, cflags, so, src)
+        if os.system(cmd):
+            raise SystemExit("kindi: could not build the CPU engine (%s); tried: %s" % (so, cmd))
     lib = ctypes.CDLL(so)
     lib.kc_init()
     lib.kc_step.argtypes = [ctypes.POINTER(Model), ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -178,12 +200,15 @@ class Engine(object):
         sizes = {"h": D, "xn": D, "xp": W, "y": D, "qkv": CC, "zv": NV * HK, "cs": CC, "qk": 2 * NK * HK,
                  "gout": NV * HK, "outn": NV * HK, "m": W, "qn": NH * 2 * HD, "kr": NHKV * HD, "vv": NHKV * HD,
                  "qr": NH * HD, "kro": NHKV * HD, "sc": NH * self.ctx, "att": NH * HD, "ffg": NFF, "ffu": NFF,
-                 "T": W // 2 * 8, "logits": max(VOCAB, mats[self.head_name].R), "gb": NV, "gg": NV}
+                 "T": W // 2 * 16, "logits": max(VOCAB, mats[self.head_name].R), "gb": NV, "gg": NV}
         for k in _SCR:
             a = z(sizes[k])
             setattr(m, k, _p(a))
             if k == "logits":
                 self.logits = a
+        # v3.1 streamed-lookup partial sums: 16 int16 per 8-row block, indexed by absolute
+        # block id (thread-disjoint spans). Largest matrix is the head (R = VOCAB).
+        m.s01 = _p(z(VOCAB // 8 * 16, np.int16), PU16)
         m.red = _p(z(256, np.float64), ctypes.POINTER(ctypes.c_double))
         self.ylog, self.ylog_n, self.ylog_map = self.logits, VOCAB, None
         self.hsl, self.shortlist = None, 0

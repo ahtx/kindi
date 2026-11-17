@@ -1,0 +1,93 @@
+{
+ "variant": "v31-fixed-full",
+ "pack": "/data/data/com.termux/files/home/kindi-pack-2b",
+ "env": {
+  "OMP_NUM_THREADS": "4",
+  "KINDI_CPU_CFLAGS": "-O3 -march=armv8.2-a -fopenmp -fno-math-errno -DKINDI_I16_STREAM -ffp-contract=off",
+  "KINDI_CPU_CACHE": "/data/data/com.termux/files/home/.cache/kindi",
+  "KINDI_DEVICE": "cpu"
+ },
+ "status_at_start": {
+  "Threads": "1",
+  "Cpus_allowed_list": "3-7"
+ },
+ "load_log": [
+  "kindi-cpu ready: Ternary-Bonsai-2-2B, 4 threads, ctx 1024 (23.4s)"
+ ],
+ "load_s": 23.41,
+ "so_path": "/data/data/com.termux/files/home/.cache/kindi/libkcpu_arm.so",
+ "verify": {
+  "all_pass": true,
+  "prompts": [
+   {
+    "i": 0,
+    "ok": true,
+    "match": 40,
+    "n": 40,
+    "s": 6.59
+   },
+   {
+    "i": 1,
+    "ok": true,
+    "match": 40,
+    "n": 40,
+    "s": 6.98
+   },
+   {
+    "i": 2,
+    "ok": true,
+    "match": 40,
+    "n": 40,
+    "s": 7.33
+   },
+   {
+    "i": 3,
+    "ok": true,
+    "match": 40,
+    "n": 40,
+    "s": 7.07
+   }
+  ],
+  "blended_tok_s": 6.578
+ },
+ "decode": [
+  {
+   "g": 64,
+   "s": 10.585,
+   "tok_s": 6.046
+  },
+  {
+   "g": 256,
+   "s": 43.919,
+   "tok_s": 5.829
+  }
+ ],
+ "prefill": [
+  {
+   "n": 256,
+   "s": 23.881,
+   "tok_s": 10.72
+  },
+  {
+   "n": 1024,
+   "s": 108.644,
+   "tok_s": 9.425
+  }
+ ],
+ "kc_times_frac": {
+  "0": 0.0002,
+  "1": 0.0059,
+  "2": 0.948,
+  "3": 0.0207,
+  "4": 0.0174,
+  "5": 0.0067,
+  "6": 0.0011,
+  "7": 0.0
+ },
+ "kc_times_total_s": 215.74,
+ "thread_samples_max": 5,
+ "status_at_end": {
+  "Threads": "4",
+  "Cpus_allowed_list": "3-5,7"
+ }
+}

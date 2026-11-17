@@ -1,0 +1,22 @@
+Full 158-item kbench textjobs on S24 (`RFCX9076A9H`) completed on 2026-11-16.
+
+**Results: 110/158 pass = 69.6%**
+
+| Category | Pass | Total |
+|---|---|---|
+| sentiment | 25/30 | 30 |
+| escalate | 28/30 | 30 |
+| spam | 29/30 | 30 |
+| topic | 28/30 | 30 |
+| spell | 0/15 | 15 |
+| grammar | 0/12 | 12 |
+| table | 0/5 | 5 |
+| notes | 0/3 | 3 |
+| news | 0/3 | 3 |
+| **TOTAL** | **110/158** | **158** |
+
+Wall time: ~3.1 hours (11,173 seconds)
+Pattern matches S23 #1/#2: classify tasks strong (83–97%), spell/grammar/table/notes/news fail 0%
+(2B model capability boundary — think-tag emission, not a Kindi engine bug).
+
+Results file: `phone_textjobs_full.json`

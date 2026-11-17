@@ -1,0 +1,5 @@
+# Build provenance for the verified S24 v3 run (2026-11-17).
+# The compiled .so is NOT shipped — rebuild from source with the flags in RELEASE-arm-v3-int16-lut.md.
+d74333caaca2bb5b800b62c0ad634f85  kindi/kcpu_arm.c (source, v3 int16-LUT)
+601ecce9c7b6d2a739397f87873f6ad4  kindi/cpu.py (source, ARM auto-build)
+529ad3c37150a9917c0f9e127cf00307  s24-libkcpu_arm.so (verified S24 build, md5 recorded; not shipped)

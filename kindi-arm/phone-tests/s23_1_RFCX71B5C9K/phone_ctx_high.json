@@ -1,0 +1,27 @@
+{
+ "meta": {
+  "pack": "/data/data/com.termux/files/home/kindi-pack-2b",
+  "ctx_max": 8192,
+  "threads": 4,
+  "start": 3072,
+  "engine_ctx": 8192
+ },
+ "max_context": [
+  {
+   "target_ctx": 3072,
+   "prompt_tokens": 3064,
+   "gen_tokens": 9,
+   "ok": true,
+   "s": 2200.4903,
+   "tail_text": " This is a context length test sentence. This"
+  },
+  {
+   "target_ctx": 4096,
+   "prompt_tokens": 4088,
+   "gen_tokens": 9,
+   "ok": true,
+   "s": 3109.9492,
+   "tail_text": " This is a context length test sentence. This"
+  }
+ ]
+}

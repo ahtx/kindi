@@ -1,0 +1,2490 @@
+{
+ "wall_s": 9243.7,
+ "completed": 151,
+ "total": 158,
+ "summary": {
+  "sentiment": {
+   "n": 30,
+   "ok": 25,
+   "secs": 1227.98,
+   "mean_secs": 40.93
+  },
+  "escalate": {
+   "n": 30,
+   "ok": 28,
+   "secs": 2046.59,
+   "mean_secs": 68.22
+  },
+  "spam": {
+   "n": 30,
+   "ok": 29,
+   "secs": 1458.37,
+   "mean_secs": 48.61
+  },
+  "topic": {
+   "n": 30,
+   "ok": 28,
+   "secs": 1248.81,
+   "mean_secs": 41.63
+  },
+  "spell": {
+   "n": 15,
+   "ok": 0,
+   "secs": 1314.99,
+   "mean_secs": 87.67
+  },
+  "grammar": {
+   "n": 12,
+   "ok": 0,
+   "secs": 977.43,
+   "mean_secs": 81.45
+  },
+  "table": {
+   "n": 4,
+   "ok": 0,
+   "secs": 967.24,
+   "mean_secs": 241.81
+  }
+ },
+ "items": [
+  {
+   "job": "sentiment",
+   "input": "The battery lasts two full days and the screen is bright. Very happy with it.",
+   "want": "positive",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe battery lasts two full days and the screen is bright. Very happy with it.",
+   "output": "Positive<|im_end|>\n</think>\n\nPositive<|im_end|>\n",
+   "ok": true,
+   "parsed": "positive",
+   "secs": 39.052,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Stopped working after a week. Support never answered my emails.",
+   "want": "negative",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nStopped working after a week. Support never answered my emails.",
+   "output": "Negative<|im_end|>\n</think>\n\nNegative<|im_end|>\n",
+   "ok": true,
+   "parsed": "negative",
+   "secs": 36.824,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "The package arrived on Tuesday.",
+   "want": "neutral",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe package arrived on Tuesday.",
+   "output": "Neutral<|im_end|>\n<think>\n\n</think>\n\nNeutral",
+   "ok": true,
+   "parsed": "neutral",
+   "secs": 33.713,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Best coffee grinder I have owned. Quiet and consistent.",
+   "want": "positive",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nBest coffee grinder I have owned. Quiet and consistent.",
+   "output": "Positive<|im_end|>\n</think>\n\nPositive<|im_end|>\n",
+   "ok": true,
+   "parsed": "positive",
+   "secs": 36.836,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "The zipper broke the first time I used the bag.",
+   "want": "negative",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe zipper broke the first time I used the bag.",
+   "output": "Negative<|im_end|>\n</think>\n\nNegative<|im_end|>\n",
+   "ok": true,
+   "parsed": "negative",
+   "secs": 37.003,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "It comes in three colors: black, blue and gray.",
+   "want": "neutral",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nIt comes in three colors: black, blue and gray.",
+   "output": "Neutral<|im_end|>\n</think>\n\nNeutral<|im_end|>\n",
+   "ok": true,
+   "parsed": "neutral",
+   "secs": 37.749,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Setup took five minutes and everything just worked.",
+   "want": "positive",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nSetup took five minutes and everything just worked.",
+   "output": "Positive<|im_end|>\n</think>\n\nPositive<|im_end|>\n",
+   "ok": true,
+   "parsed": "positive",
+   "secs": 36.139,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Way too expensive for what you get. I returned it.",
+   "want": "negative",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nWay too expensive for what you get. I returned it.",
+   "output": "Negative<|im_end|>\n</think>\n\nNegative<|im_end|>\n",
+   "ok": true,
+   "parsed": "negative",
+   "secs": 38.196,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "The manual is printed in English and Spanish.",
+   "want": "neutral",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe manual is printed in English and Spanish.",
+   "output": "Neutral<|im_end|>\n</think>\n\nNeutral<|im_end|>\n",
+   "ok": true,
+   "parsed": "neutral",
+   "secs": 38.877,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "My kids love it and use it every day.",
+   "want": "positive",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nMy kids love it and use it every day.",
+   "output": "Positive<|im_end|>\n</think>\n\nPositive<|im_end|>\n",
+   "ok": true,
+   "parsed": "positive",
+   "secs": 41.206,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "The app crashes every time I open the settings page.",
+   "want": "negative",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe app crashes every time I open the settings page.",
+   "output": "Negative<|im_end|>\n</think>\n\nNegative<|im_end|>\n",
+   "ok": true,
+   "parsed": "negative",
+   "secs": 41.909,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "The product weighs 1.2 kilograms.",
+   "want": "neutral",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe product weighs 1.2 kilograms.",
+   "output": "Neutral<|im_end|>\n<think>\n\n</think>\n\nNeutral",
+   "ok": true,
+   "parsed": "neutral",
+   "secs": 41.047,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Excellent build quality, and the price was fair.",
+   "want": "positive",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nExcellent build quality, and the price was fair.",
+   "output": "Positive<|im_end|>\n</think>\n\nPositive<|im_end|>\n",
+   "ok": true,
+   "parsed": "positive",
+   "secs": 42.561,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Terrible smell from the plastic that does not go away.",
+   "want": "negative",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nTerrible smell from the plastic that does not go away.",
+   "output": "Negative<|im_end|>\n</think>\n\nNegative<|im_end|>\n",
+   "ok": true,
+   "parsed": "negative",
+   "secs": 43.545,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "It fits inside a standard backpack pocket.",
+   "want": "neutral",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nIt fits inside a standard backpack pocket.",
+   "output": "Positive<|im_end|>\n<think>\n\n</think>\n\nPositive",
+   "ok": false,
+   "parsed": "positive",
+   "secs": 41.328,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "The sound is clear and the bass is strong for the size.",
+   "want": "positive",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe sound is clear and the bass is strong for the size.",
+   "output": "Positive<|im_end|>\n</think>\n\nPositive<|im_end|>\n",
+   "ok": true,
+   "parsed": "positive",
+   "secs": 45.223,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Arrived scratched and the box was crushed.",
+   "want": "negative",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nArrived scratched and the box was crushed.",
+   "output": "Negative<|im_end|>\n</think>\n\nNegative<|im_end|>\n",
+   "ok": true,
+   "parsed": "negative",
+   "secs": 42.429,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Replacement filters are sold separately.",
+   "want": "neutral",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nReplacement filters are sold separately.",
+   "output": "Neutral<|im_end|>\n<think>\n\n</think>\n\nNeutral",
+   "ok": true,
+   "parsed": "neutral",
+   "secs": 40.412,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Customer service solved my problem in one call.",
+   "want": "positive",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nCustomer service solved my problem in one call.",
+   "output": "Positive<|im_end|>\n</think>\n\nPositive<|im_end|>\n",
+   "ok": true,
+   "parsed": "positive",
+   "secs": 42.469,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "The battery drains in under two hours. Very disappointed.",
+   "want": "negative",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe battery drains in under two hours. Very disappointed.",
+   "output": "Negative<|im_end|>\n</think>\n\nNegative<|im_end|>\n",
+   "ok": true,
+   "parsed": "negative",
+   "secs": 43.824,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "The device connects over Bluetooth or a cable.",
+   "want": "neutral",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe device connects over Bluetooth or a cable.",
+   "output": "Neutral<|im_end|>\n<think>\n\n</think>\n\nNeutral",
+   "ok": true,
+   "parsed": "neutral",
+   "secs": 42.983,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "I have recommended this to all my friends.",
+   "want": "positive",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nI have recommended this to all my friends.",
+   "output": "Positive<|im_end|>\n</think>\n\nPositive<|im_end|>\n",
+   "ok": true,
+   "parsed": "positive",
+   "secs": 42.695,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Instructions were missing and I could not assemble it.",
+   "want": "negative",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nInstructions were missing and I could not assemble it.",
+   "output": "Neutral<|im_end|>\n<think>\n\n</think>\n\nNeutral",
+   "ok": false,
+   "parsed": "neutral",
+   "secs": 43.488,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "The handle is made of stainless steel.",
+   "want": "neutral",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe handle is made of stainless steel.",
+   "output": "Positive<|im_end|>\n<think>\n\n</think>\n\nPositive",
+   "ok": false,
+   "parsed": "positive",
+   "secs": 42.286,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Light, fast and exactly as described.",
+   "want": "positive",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nLight, fast and exactly as described.",
+   "output": "Positive<|im_end|>\n</think>\n\nPositive<|im_end|>\n",
+   "ok": true,
+   "parsed": "positive",
+   "secs": 42.317,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Keeps disconnecting and I have to pair it again.",
+   "want": "negative",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nKeeps disconnecting and I have to pair it again.",
+   "output": "Negative<|im_end|>\n<think>\n\n</think>\n\nNegative",
+   "ok": true,
+   "parsed": "negative",
+   "secs": 44.917,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "It includes a one-meter charging cable.",
+   "want": "neutral",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nIt includes a one-meter charging cable.",
+   "output": "Positive<|im_end|>\n<think>\n\n</think>\n\nPositive",
+   "ok": false,
+   "parsed": "positive",
+   "secs": 43.029,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "The picture quality is outstanding for the price.",
+   "want": "positive",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe picture quality is outstanding for the price.",
+   "output": "Positive<|im_end|>\n</think>\n\nPositive<|im_end|>\n",
+   "ok": true,
+   "parsed": "positive",
+   "secs": 43.519,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "Buttons stopped responding after a month.",
+   "want": "negative",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nButtons stopped responding after a month.",
+   "output": "Negative<|im_end|>\n<think>\n\n</think>\n\nNegative",
+   "ok": true,
+   "parsed": "negative",
+   "secs": 41.1,
+   "gen_tokens": 8
+  },
+  {
+   "job": "sentiment",
+   "input": "The warranty covers two years.",
+   "want": "neutral",
+   "labels": [
+    "positive",
+    "negative",
+    "neutral"
+   ],
+   "max_tokens": 8,
+   "prompt": "Classify the sentiment of this customer review as positive, negative or neutral. A neutral review states facts with no opinion. Reply with one word only.\n\nThe warranty covers two years.",
+   "output": "Positive<|im_end|>\n<think>\n\n</think>\n\nPositive",
+   "ok": false,
+   "parsed": "positive",
+   "secs": 41.303,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "My child swallowed part of this toy and is choking. What do I do?",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nMy child swallowed part of this toy and is choking. What do I do?",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 71.02,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "How do I change the shipping address on my order?",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nHow do I change the shipping address on my order?",
+   "output": "No<|im_end|>\n<think>\n\n</think>\n\nNo",
+   "ok": true,
+   "parsed": "no",
+   "secs": 66.528,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "Someone used my credit card to place orders I did not make.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nSomeone used my credit card to place orders I did not make.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 70.184,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "Can I get this jacket in a larger size?",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nCan I get this jacket in a larger size?",
+   "output": "No<|im_end|>\n<think>\n\n</think>\n\nNo",
+   "ok": true,
+   "parsed": "no",
+   "secs": 65.103,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "There is smoke coming from the charger and it smells like burning.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nThere is smoke coming from the charger and it smells like burning.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 69.323,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "I would like to leave a review for the blender I bought.",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nI would like to leave a review for the blender I bought.",
+   "output": "No<|im_end|>\n</think>\n\nNo<|im_end|>\n",
+   "ok": true,
+   "parsed": "no",
+   "secs": 67.479,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "I received a message saying your company will sue me if I do not pay today.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nI received a message saying your company will sue me if I do not pay today.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 71.781,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "What time do you open on Saturdays?",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nWhat time do you open on Saturdays?",
+   "output": "No<|im_end|>\n<think>\n\n</think>\n\nNo",
+   "ok": true,
+   "parsed": "no",
+   "secs": 63.783,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "The whole neighborhood has no power and your website is down too.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nThe whole neighborhood has no power and your website is down too.",
+   "output": "No<|im_end|>\n</think>\n\nNo<|im_end|>\n",
+   "ok": false,
+   "parsed": "no",
+   "secs": 69.277,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "Do you have this model in blue?",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nDo you have this model in blue?",
+   "output": "No<|im_end|>\n<think>\n\n</think>\n\nNo",
+   "ok": true,
+   "parsed": "no",
+   "secs": 64.238,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "I think my account was hacked and my personal data was leaked.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nI think my account was hacked and my personal data was leaked.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 69.576,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "Could you recommend a good case for this tablet?",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nCould you recommend a good case for this tablet?",
+   "output": "No<|im_end|>\n<think>\n\n</think>\n\nNo",
+   "ok": true,
+   "parsed": "no",
+   "secs": 66.474,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "I am feeling very hopeless and I do not want to be here anymore.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nI am feeling very hopeless and I do not want to be here anymore.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 70.729,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "The color is slightly different from the photo, but it is fine.",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nThe color is slightly different from the photo, but it is fine.",
+   "output": "No<|im_end|>\n</think>\n\nNo<|im_end|>\n",
+   "ok": true,
+   "parsed": "no",
+   "secs": 68.361,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "Your driver hit my parked car and left the scene.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nYour driver hit my parked car and left the scene.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 67.968,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "I forgot my password. How can I reset it?",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nI forgot my password. How can I reset it?",
+   "output": "No<|im_end|>\n<think>\n\n</think>\n\nNo",
+   "ok": true,
+   "parsed": "no",
+   "secs": 67.133,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "I found a piece of glass inside the jar of baby food.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nI found a piece of glass inside the jar of baby food.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 69.048,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "When will the black version be back in stock?",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nWhen will the black version be back in stock?",
+   "output": "No<|im_end|>\n<think>\n\n</think>\n\nNo",
+   "ok": true,
+   "parsed": "no",
+   "secs": 66.194,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "My pacemaker started beeping after I used your device near it.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nMy pacemaker started beeping after I used your device near it.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 69.443,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "Can you send me a copy of my receipt?",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nCan you send me a copy of my receipt?",
+   "output": "No<|im_end|>\n<think>\n\n</think>\n\nNo",
+   "ok": true,
+   "parsed": "no",
+   "secs": 67.274,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "Someone is pretending to be your company and asking for my bank details.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nSomeone is pretending to be your company and asking for my bank details.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 69.272,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "I would prefer a refund to store credit, if possible.",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nI would prefer a refund to store credit, if possible.",
+   "output": "No<|im_end|>\n</think>\n\nNo<|im_end|>\n",
+   "ok": true,
+   "parsed": "no",
+   "secs": 67.758,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "The medicine I received has a different name on the label than what I ordered.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nThe medicine I received has a different name on the label than what I ordered.",
+   "output": "No<|im_end|>\n</think>\n\nNo<|im_end|>\n",
+   "ok": false,
+   "parsed": "no",
+   "secs": 71.11,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "Does this work with Windows 11?",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nDoes this work with Windows 11?",
+   "output": "No<|im_end|>\n<think>\n\n</think>\n\nNo",
+   "ok": true,
+   "parsed": "no",
+   "secs": 65.237,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "There is a gas leak smell coming from the heater you installed.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nThere is a gas leak smell coming from the heater you installed.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 69.851,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "The package is a day late but the tracking shows it is coming.",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nThe package is a day late but the tracking shows it is coming.",
+   "output": "No<|im_end|>\n</think>\n\nNo<|im_end|>\n",
+   "ok": true,
+   "parsed": "no",
+   "secs": 68.916,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "I need to report that an employee threatened me with violence.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nI need to report that an employee threatened me with violence.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 68.11,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "Can I add a gift message to the order?",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nCan I add a gift message to the order?",
+   "output": "No<|im_end|>\n<think>\n\n</think>\n\nNo",
+   "ok": true,
+   "parsed": "no",
+   "secs": 67.567,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "My bank says there are several charges from you that I did not authorize.",
+   "want": "yes",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nMy bank says there are several charges from you that I did not authorize.",
+   "output": "Yes<|im_end|>\n</think>\n\nYes<|im_end|>\n",
+   "ok": true,
+   "parsed": "yes",
+   "secs": 69.022,
+   "gen_tokens": 8
+  },
+  {
+   "job": "escalate",
+   "input": "Is it safe to put this pan in the dishwasher?",
+   "want": "no",
+   "labels": [
+    "yes",
+    "no"
+   ],
+   "max_tokens": 8,
+   "prompt": "You triage customer messages. Answer yes if a person must look at this message now (danger to health or safety, fraud, a legal threat, a security or privacy breach, a major outage, or a person in crisis). Answer no for routine questions, requests and feedback. Reply with one word only.\n\nIs it safe to put this pan in the dishwasher?",
+   "output": "No<|im_end|>\n<think>\n\n</think>\n\nNo",
+   "ok": true,
+   "parsed": "no",
+   "secs": 68.832,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Congratulations! You have won a $1,000 gift card. Click here to claim now.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nCongratulations! You have won a $1,000 gift card. Click here to claim now.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 52.731,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Hi, are we still meeting at 3 pm tomorrow in room 204?",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nHi, are we still meeting at 3 pm tomorrow in room 204?",
+   "output": "Ham<|im_end|>\n</think>\n\nHam<|im_end|>\n",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 51.233,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "URGENT: Your account will be closed. Verify your password at this link.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nURGENT: Your account will be closed. Verify your password at this link.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 52.0,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Please find attached the minutes from today's meeting.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nPlease find attached the minutes from today's meeting.",
+   "output": "Ham<|im_end|>\n<think>\n\n</think>\n\nHam",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 45.242,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Make money fast from home!!! No experience needed, start today.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nMake money fast from home!!! No experience needed, start today.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 47.794,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "The report you asked for is ready. Let me know if you need changes.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nThe report you asked for is ready. Let me know if you need changes.",
+   "output": "Ham<|im_end|>\n<think>\n\n</think>\n\nHam",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 49.876,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "You have been selected for a free cruise. Call now to confirm.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nYou have been selected for a free cruise. Call now to confirm.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 50.218,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Can you review the draft before Friday?",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nCan you review the draft before Friday?",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": false,
+   "parsed": "spam",
+   "secs": 44.795,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Lose 10 kg in one week with this one strange pill.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nLose 10 kg in one week with this one strange pill.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 48.97,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Lunch was great yesterday, thanks for the invitation.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nLunch was great yesterday, thanks for the invitation.",
+   "output": "Ham<|im_end|>\n<think>\n\n</think>\n\nHam",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 48.272,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Dear user, we detected unusual activity. Enter your card number here.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nDear user, we detected unusual activity. Enter your card number here.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 47.939,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "The invoice for March is attached. Payment is due in 30 days.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nThe invoice for March is attached. Payment is due in 30 days.",
+   "output": "Ham<|im_end|>\n<think>\n\n</think>\n\nHam",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 51.725,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Earn $5000 per week!!! Limited spots, register now.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nEarn $5000 per week!!! Limited spots, register now.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 48.932,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "I'll pick up the kids at 5. See you at home.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nI'll pick up the kids at 5. See you at home.",
+   "output": "ham<|im_end|>\n<think>\n\n</think>\n\nham",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 49.175,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Hot singles in your area want to meet you tonight.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nHot singles in your area want to meet you tonight.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 48.088,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Here are the photos from the weekend trip.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nHere are the photos from the weekend trip.",
+   "output": "Ham<|im_end|>\n<think>\n\n</think>\n\nHam",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 45.016,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Your package could not be delivered. Open this file to reschedule.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nYour package could not be delivered. Open this file to reschedule.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 47.949,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Thanks for your help with the presentation, it went well.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nThanks for your help with the presentation, it went well.",
+   "output": "Ham<|im_end|>\n<think>\n\n</think>\n\nHam",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 47.126,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Act now: lowest mortgage rates, guaranteed approval, no credit check.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nAct now: lowest mortgage rates, guaranteed approval, no credit check.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 48.96,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Could we move our 10 am call to 11 am?",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nCould we move our 10 am call to 11 am?",
+   "output": "Ham<|im_end|>\n<think>\n\n</think>\n\nHam",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 50.843,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "You are our 1,000,000th visitor! Claim your prize immediately.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nYou are our 1,000,000th visitor! Claim your prize immediately.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 52.755,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "The train leaves at 8:15 from platform 3.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nThe train leaves at 8:15 from platform 3.",
+   "output": "Ham<|im_end|>\n</think>\n\nHam<|im_end|>\n",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 48.573,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Double your Bitcoin in 24 hours. Send coins to this address.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nDouble your Bitcoin in 24 hours. Send coins to this address.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 49.101,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Happy birthday! Hope you have a wonderful day.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nHappy birthday! Hope you have a wonderful day.",
+   "output": "Ham<|im_end|>\n</think>\n\nHam<|im_end|>\n",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 47.271,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Final notice: your tax refund is waiting. Submit your details.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nFinal notice: your tax refund is waiting. Submit your details.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 48.44,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "I have booked the conference room for Thursday afternoon.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nI have booked the conference room for Thursday afternoon.",
+   "output": "Ham<|im_end|>\n<think>\n\n</think>\n\nHam",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 45.214,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Exclusive offer: luxury watches at 90% off, today only.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nExclusive offer: luxury watches at 90% off, today only.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 49.199,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "The document has been signed and returned.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nThe document has been signed and returned.",
+   "output": "Ham<|im_end|>\n</think>\n\nHam<|im_end|>\n",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 44.644,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "We tried to reach you about your car's extended warranty.",
+   "want": "spam",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nWe tried to reach you about your car's extended warranty.",
+   "output": "spam<|im_end|>\n<think>\n\n</think>\n\nspam",
+   "ok": true,
+   "parsed": "spam",
+   "secs": 48.997,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spam",
+   "input": "Mom called and asked you to bring milk on the way home.",
+   "want": "ham",
+   "labels": [
+    "spam",
+    "ham"
+   ],
+   "max_tokens": 8,
+   "prompt": "Is this e-mail spam (unwanted advertising, a scam or phishing) or ham (a normal message)? Answer spam or ham. Reply with one word only.\n\nMom called and asked you to bring milk on the way home.",
+   "output": "Ham<|im_end|>\n<think>\n\n</think>\n\nHam",
+   "ok": true,
+   "parsed": "ham",
+   "secs": 47.289,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The home team scored in the final minute to win the championship.",
+   "want": "sports",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe home team scored in the final minute to win the championship.",
+   "output": "Sports<|im_end|>\n</think>\n\nSports<|im_end|>\n",
+   "ok": true,
+   "parsed": "sports",
+   "secs": 41.801,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The senate passed the new tax bill after a long debate.",
+   "want": "politics",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe senate passed the new tax bill after a long debate.",
+   "output": "Politics<|im_end|>\n</think>\n\nPolitics<|im_end|>\n",
+   "ok": true,
+   "parsed": "politics",
+   "secs": 42.72,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The company reported record quarterly profits and raised its forecast.",
+   "want": "business",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe company reported record quarterly profits and raised its forecast.",
+   "output": "Business<|im_end|>\n</think>\n\nBusiness<|im_end|>\n",
+   "ok": true,
+   "parsed": "business",
+   "secs": 40.472,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The new chip uses less power and runs artificial intelligence models faster.",
+   "want": "technology",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe new chip uses less power and runs artificial intelligence models faster.",
+   "output": "Technology<|im_end|>\n</think>\n\nTechnology<|im_end|>\n",
+   "ok": true,
+   "parsed": "technology",
+   "secs": 41.564,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "Doctors recommend at least thirty minutes of exercise each day.",
+   "want": "health",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nDoctors recommend at least thirty minutes of exercise each day.",
+   "output": "Health<|im_end|>\n</think>\n\nHealth<|im_end|>\n",
+   "ok": true,
+   "parsed": "health",
+   "secs": 41.958,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The striker signed a three-year contract with the club.",
+   "want": "sports",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe striker signed a three-year contract with the club.",
+   "output": "Sports<|im_end|>\n</think>\n\nSports<|im_end|>\n",
+   "ok": true,
+   "parsed": "sports",
+   "secs": 41.325,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The mayor announced plans to run for governor next year.",
+   "want": "politics",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe mayor announced plans to run for governor next year.",
+   "output": "Politics<|im_end|>\n</think>\n\nPolitics<|im_end|>\n",
+   "ok": true,
+   "parsed": "politics",
+   "secs": 39.828,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "Shares fell after the central bank raised interest rates.",
+   "want": "business",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nShares fell after the central bank raised interest rates.",
+   "output": "Business<|im_end|>\n<think>\n\n</think>\n\nBusiness",
+   "ok": true,
+   "parsed": "business",
+   "secs": 41.252,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "Researchers released an update that fixes a major security flaw in the browser.",
+   "want": "technology",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nResearchers released an update that fixes a major security flaw in the browser.",
+   "output": "Technology<|im_end|>\n</think>\n\nTechnology<|im_end|>\n",
+   "ok": true,
+   "parsed": "technology",
+   "secs": 42.685,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "A new study links poor sleep to higher blood pressure.",
+   "want": "health",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nA new study links poor sleep to higher blood pressure.",
+   "output": "Health<|im_end|>\n</think>\n\nHealth<|im_end|>\n",
+   "ok": true,
+   "parsed": "health",
+   "secs": 40.608,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The marathon will close several streets in the city center on Sunday.",
+   "want": "sports",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe marathon will close several streets in the city center on Sunday.",
+   "output": "Sports<|im_end|>\n</think>\n\nSports<|im_end|>\n",
+   "ok": true,
+   "parsed": "sports",
+   "secs": 43.472,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "Voters will choose a new representative in next month's election.",
+   "want": "politics",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nVoters will choose a new representative in next month's election.",
+   "output": "Politics<|im_end|>\n</think>\n\nPolitics<|im_end|>\n",
+   "ok": true,
+   "parsed": "politics",
+   "secs": 41.697,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The airline announced new routes and lower fares for the summer.",
+   "want": "business",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe airline announced new routes and lower fares for the summer.",
+   "output": "Business<|im_end|>\n<think>\n\n</think>\n\nBusiness",
+   "ok": true,
+   "parsed": "business",
+   "secs": 42.708,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The phone maker unveiled a foldable screen at its annual event.",
+   "want": "technology",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe phone maker unveiled a foldable screen at its annual event.",
+   "output": "Technology<|im_end|>\n</think>\n\nTechnology<|im_end|>\n",
+   "ok": true,
+   "parsed": "technology",
+   "secs": 41.422,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "Health officials urged residents to get vaccinated before the winter season.",
+   "want": "health",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nHealth officials urged residents to get vaccinated before the winter season.",
+   "output": "Health<|im_end|>\n</think>\n\nHealth<|im_end|>\n",
+   "ok": true,
+   "parsed": "health",
+   "secs": 41.908,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The goalkeeper made three saves in the penalty shootout.",
+   "want": "sports",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe goalkeeper made three saves in the penalty shootout.",
+   "output": "Sports<|im_end|>\n</think>\n\nSports<|im_end|>\n",
+   "ok": true,
+   "parsed": "sports",
+   "secs": 41.244,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "Parliament voted to increase funding for public schools.",
+   "want": "politics",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nParliament voted to increase funding for public schools.",
+   "output": "Politics<|im_end|>\n</think>\n\nPolitics<|im_end|>\n",
+   "ok": true,
+   "parsed": "politics",
+   "secs": 39.112,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The startup raised $50 million to expand into new markets.",
+   "want": "business",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe startup raised $50 million to expand into new markets.",
+   "output": "Business<|im_end|>\n</think>\n\nBusiness<|im_end|>\n",
+   "ok": true,
+   "parsed": "business",
+   "secs": 42.775,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "Scientists trained a model that can predict the weather more accurately.",
+   "want": "technology",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nScientists trained a model that can predict the weather more accurately.",
+   "output": "Technology<|im_end|>\n<think>\n\n</think>\n\nTechnology",
+   "ok": true,
+   "parsed": "technology",
+   "secs": 41.441,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "Eating more vegetables and whole grains can lower the risk of heart disease.",
+   "want": "health",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nEating more vegetables and whole grains can lower the risk of heart disease.",
+   "output": "Health<|im_end|>\n</think>\n\nHealth<|im_end|>\n",
+   "ok": true,
+   "parsed": "health",
+   "secs": 43.283,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The coach resigned after the team lost six games in a row.",
+   "want": "sports",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe coach resigned after the team lost six games in a row.",
+   "output": "Sports<|im_end|>\n</think>\n\nSports<|im_end|>\n",
+   "ok": true,
+   "parsed": "sports",
+   "secs": 43.46,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The two countries signed a trade agreement after months of talks.",
+   "want": "politics",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe two countries signed a trade agreement after months of talks.",
+   "output": "Business<|im_end|>\n</think>\n\nBusiness<|im_end|>\n",
+   "ok": false,
+   "parsed": "business",
+   "secs": 40.444,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "Oil prices rose as demand increased in Asia.",
+   "want": "business",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nOil prices rose as demand increased in Asia.",
+   "output": "Business<|im_end|>\n<think>\n\n</think>\n\nBusiness",
+   "ok": true,
+   "parsed": "business",
+   "secs": 40.504,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The company launched a satellite to provide internet access in rural areas.",
+   "want": "technology",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe company launched a satellite to provide internet access in rural areas.",
+   "output": "Business<|im_end|>\n<think>\n\n</think>\n\nBusiness",
+   "ok": false,
+   "parsed": "business",
+   "secs": 41.653,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The hospital opened a new clinic for children's mental health.",
+   "want": "health",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe hospital opened a new clinic for children's mental health.",
+   "output": "Health<|im_end|>\n</think>\n\nHealth<|im_end|>\n",
+   "ok": true,
+   "parsed": "health",
+   "secs": 40.972,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "She won the gold medal in the 100-meter final.",
+   "want": "sports",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nShe won the gold medal in the 100-meter final.",
+   "output": "Sports<|im_end|>\n</think>\n\nSports<|im_end|>\n",
+   "ok": true,
+   "parsed": "sports",
+   "secs": 43.708,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The president vetoed the bill and sent it back to congress.",
+   "want": "politics",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe president vetoed the bill and sent it back to congress.",
+   "output": "Politics<|im_end|>\n</think>\n\nPolitics<|im_end|>\n",
+   "ok": true,
+   "parsed": "politics",
+   "secs": 41.847,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "The merger will create the largest retailer in the region.",
+   "want": "business",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nThe merger will create the largest retailer in the region.",
+   "output": "Business<|im_end|>\n</think>\n\nBusiness<|im_end|>\n",
+   "ok": true,
+   "parsed": "business",
+   "secs": 40.75,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "Developers released a tool that helps find bugs in code automatically.",
+   "want": "technology",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nDevelopers released a tool that helps find bugs in code automatically.",
+   "output": "Technology<|im_end|>\n</think>\n\nTechnology<|im_end|>\n",
+   "ok": true,
+   "parsed": "technology",
+   "secs": 42.858,
+   "gen_tokens": 8
+  },
+  {
+   "job": "topic",
+   "input": "Regular hand washing reduces the spread of infections.",
+   "want": "health",
+   "labels": [
+    "sports",
+    "politics",
+    "business",
+    "technology",
+    "health"
+   ],
+   "max_tokens": 8,
+   "prompt": "Give the topic of this news sentence: sports, politics, business, technology or health. Reply with one word only.\n\nRegular hand washing reduces the spread of infections.",
+   "output": "Health<|im_end|>\n</think>\n\nHealth<|im_end|>\n",
+   "ok": true,
+   "parsed": "health",
+   "secs": 39.336,
+   "gen_tokens": 8
+  },
+  {
+   "job": "spell",
+   "input": "I recieved the packege yesteday.",
+   "want": "I received the package yesterday.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nI recieved the packege yesteday.",
+   "output": "I received the package yesterday.<|im_end|>\n</think>\n\nI received the package yesterday.<|im_end|>\n<think>\n\n</think>\n\nI received the package yesterday.<|im_end|>\n<think>\n\n</think>\n\nI received the package yesterday.<|im_end|>\n<think>\n\n</think>\n\nI received the package yesterday.<|im_end|>\n</think>\n\nI received the package",
+   "ok": false,
+   "parsed": "I received the package yesterday.<|im_end|>",
+   "secs": 87.027,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "Please let me no if you have any questons.",
+   "want": "Please let me know if you have any questions.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nPlease let me no if you have any questons.",
+   "output": "Please let me no if you have any questions.<|im_end|>\n</think>\n\nPlease let me no if you have any questions.<|im_end|>\n<think>\n\n</think>\n\nPlease let me no if you have any questions.<|im_end|>\n<think>\n\n</think>\n\nPlease let me no if you have any questions.<|im_end|>\n<think>\n\n",
+   "ok": false,
+   "parsed": "Please let me no if you have any questions.<|im_end|>",
+   "secs": 86.411,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "The resturant was very croweded on friday.",
+   "want": "The restaurant was very crowded on Friday.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nThe resturant was very croweded on friday.",
+   "output": "The restaurant was very crowded on friday.<|im_end|>\n</think>\n\nThe restaurant was very crowded on friday.<|im_end|>\n<think>\n\n</think>\n\nThe restaurant was very crowded on Friday.<|im_end|>\n</think>\n\nThe restaurant was very crowded on Friday.<|im_end|>\n</think>\n\nThe restaurant was very crowded on Friday.<|im_end|>\n",
+   "ok": false,
+   "parsed": "The restaurant was very crowded on friday.<|im_end|>",
+   "secs": 88.489,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "She is definately comming to the meeeting.",
+   "want": "She is definitely coming to the meeting.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nShe is definately comming to the meeeting.",
+   "output": "She is definitely coming to the meeting.<|im_end|>\n</think>\n\nShe is definitely coming to the meeting.<|im_end|>\n<think>\n\n</think>\n\nShe is definitely coming to the meeting.<|im_end|>\n<think>\n\n</think>\n\nShe is definitely coming to the meeting.<|im_end|>\n</think>\n\nShe is definitely coming to the meeting.",
+   "ok": false,
+   "parsed": "She is definitely coming to the meeting.<|im_end|>",
+   "secs": 87.89,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "We need to adress this problme immediatly.",
+   "want": "We need to address this problem immediately.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nWe need to adress this problme immediatly.",
+   "output": "We need to address this problem immediately.<|im_end|>\n</think>\n\nWe need to address this problem immediately.<|im_end|>\n<think>\n\n</think>\n\nWe need to address this problem immediately.<|im_end|>\n<think>\n\n</think>\n\nWe need to address this problem immediately.<|im_end|>\n<think>\n\n</think>\n\nWe need to address this problem",
+   "ok": false,
+   "parsed": "We need to address this problem immediately.<|im_end|>",
+   "secs": 87.677,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "He bougth a new bycicle last weak.",
+   "want": "He bought a new bicycle last week.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nHe bougth a new bycicle last weak.",
+   "output": "He bougth a new bicycle last weak.<|im_end|>\n<think>\nThinking Process:\n\n1.  **Analyze the Request:** The user wants me to correct spelling mistakes in a given sentence. I must not change anything else (no extra explanations, just the corrected sentence). The sentence is:",
+   "ok": false,
+   "parsed": "He bougth a new bicycle last weak.<|im_end|>",
+   "secs": 87.863,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "The goverment announced a new polisy.",
+   "want": "The government announced a new policy.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nThe goverment announced a new polisy.",
+   "output": "The government announced a new policy.<|im_end|>\n</think>\n\nThe government announced a new policy.<|im_end|>\n<think>\n\n</think>\n\nThe government announced a new policy.<|im_end|>\n<think>\n\n</think>\n\nThe government announced a new policy.<|im_end|>\n<think>\n\n</think>\n\nThe government announced a new policy.<|im_end|>\n<think>",
+   "ok": false,
+   "parsed": "The government announced a new policy.<|im_end|>",
+   "secs": 87.183,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "I beleive this is the corect anser.",
+   "want": "I believe this is the correct answer.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nI beleive this is the corect anser.",
+   "output": "I believe this is the correct answer.<|im_end|>\n</think>\n\nI believe this is the correct answer.<|im_end|>\n<think>\n\n</think>\n\nI believe this is the correct answer.<|im_end|>\n<think>\n\n</think>\n\nI believe this is the correct answer.<|im_end|>\n<think>\n\n</think>\n\nI believe this is the correct",
+   "ok": false,
+   "parsed": "I believe this is the correct answer.<|im_end|>",
+   "secs": 87.896,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "Thier house is bigger then ours.",
+   "want": "Their house is bigger than ours.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nThier house is bigger then ours.",
+   "output": "Thier house is bigger then ours.<|im_end|>\n</think>\n\nThier house is bigger then ours.<|im_end|>\n<think>\n\n</think>\n\nThier house is bigger then ours.<|im_end|>\n<think>\n\n</think>\n\nThier house is bigger then ours.<|im_end|>\n<think>\n\n</think>\n\nThier house is bigger then",
+   "ok": false,
+   "parsed": "Thier house is bigger then ours.<|im_end|>",
+   "secs": 86.778,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "The calender shows the wrong mounth.",
+   "want": "The calendar shows the wrong month.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nThe calender shows the wrong mounth.",
+   "output": "The calendar shows the wrong month.<|im_end|>\n</think>\n\nThe calendar shows the wrong month.<|im_end|>\n<think>\n\n</think>\n\nThe calendar shows the wrong month.<|im_end|>\n<think>\n\n</think>\n\nThe calendar shows the wrong month.<|im_end|>\n</think>\n\nThe calendar shows the wrong month.<|im_end|>\n<think>\n\n</think>",
+   "ok": false,
+   "parsed": "The calendar shows the wrong month.<|im_end|>",
+   "secs": 86.857,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "It is neccessary to bring your identifcation.",
+   "want": "It is necessary to bring your identification.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nIt is neccessary to bring your identifcation.",
+   "output": "It is necessary to bring your identification.<|im_end|>\n</think>\n\nIt is necessary to bring your identification.<|im_end|>\n<think>\n\n</think>\n\nIt is necessary to bring your identification.<|im_end|>\n<think>\n\n</think>\n\nIt is necessary to bring your identification.<|im_end|>\n<think>\n\n</think>\n\nIt is necessary to bring your",
+   "ok": false,
+   "parsed": "It is necessary to bring your identification.<|im_end|>",
+   "secs": 88.652,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "The libary closes at six oclock.",
+   "want": "The library closes at six o'clock.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nThe libary closes at six oclock.",
+   "output": "The library closes at six o'clock.<|im_end|>\n</think>\n\nThe library closes at six o'clock.<|im_end|>\n<think>\n\n</think>\n\nThe library closes at six o'clock.<|im_end|>\n</think>\n\nThe library closes at six o'clock.<|im_end|>\n<think>\n\n</think>\n\nThe library closes at six o'clock.",
+   "ok": false,
+   "parsed": "The library closes at six o'clock.<|im_end|>",
+   "secs": 86.954,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "She wrote a beautifull leter to her freind.",
+   "want": "She wrote a beautiful letter to her friend.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nShe wrote a beautifull leter to her freind.",
+   "output": "She wrote a beautiful letter to her friend.<|im_end|>\n</think>\n\nShe wrote a beautiful letter to her friend.<|im_end|>\n<think>\n\n</think>\n\nShe wrote a beautiful letter to her friend.<|im_end|>\n<think>\n\n</think>\n\nShe wrote a beautiful letter to her friend.<|im_end|>\n</think>\n\nShe wrote a beautiful",
+   "ok": false,
+   "parsed": "She wrote a beautiful letter to her friend.<|im_end|>",
+   "secs": 88.059,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "The wheather will be sunnier tommorow.",
+   "want": "The weather will be sunnier tomorrow.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nThe wheather will be sunnier tommorow.",
+   "output": "The weather will be sunnier tomorrow.<|im_end|>\n</think>\n\nThe weather will be sunnier tomorrow.<|im_end|>\n<think>\n\n</think>\n\nThe weather will be sunnier tomorrow.<|im_end|>\n<think>\n\n</think>\n\nThe weather will be sunnier tomorrow.<|im_end|>\n</think>\n\nThe weather will be sunnier tomorrow.",
+   "ok": false,
+   "parsed": "The weather will be sunnier tomorrow.<|im_end|>",
+   "secs": 89.101,
+   "gen_tokens": 60
+  },
+  {
+   "job": "spell",
+   "input": "I finaly finished the assigment on time.",
+   "want": "I finally finished the assignment on time.",
+   "max_tokens": 60,
+   "prompt": "Correct the spelling mistakes in this sentence. Change nothing else. Reply with only the corrected sentence.\n\nI finaly finished the assigment on time.",
+   "output": "I finally finished the assignment on time.<|im_end|>\n</think>\n\nI finally finished the assignment on time.<|im_end|>\n<think>\n\n</think>\n\nI finally finished the assignment on time.<|im_end|>\n<think>\n\n</think>\n\nI finally finished the assignment on time.<|im_end|>\n</think>\n\nI finally finished the assignment on time.",
+   "ok": false,
+   "parsed": "I finally finished the assignment on time.<|im_end|>",
+   "secs": 88.149,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "She don't like coffee in the morning.",
+   "want": "She doesn't like coffee in the morning.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nShe don't like coffee in the morning.",
+   "output": "She doesn't like coffee in the morning.<|im_end|>\n</think>\n\nShe doesn't like coffee in the morning.<|im_end|>\n<think>\n\n</think>\n\nShe doesn't like coffee in the morning.<|im_end|>\n<think>\n\n</think>\n\nShe doesn't like coffee in the morning.<|im_end|>\n</think>\n\nShe doesn't like",
+   "ok": false,
+   "parsed": "She doesn't like coffee in the morning.<|im_end|>",
+   "secs": 86.27,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "He go to school every day by bus.",
+   "want": "He goes to school every day by bus.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nHe go to school every day by bus.",
+   "output": "He goes to school every day by bus.<|im_end|>\n</think>\n\nHe goes to school every day by bus.<|im_end|>\n<think>\n\n</think>\n\nHe goes to school every day by bus.<|im_end|>\n<think>\n\n</think>\n\nHe goes to school every day by bus.<|im_end|>\n<think>\n\n</think>\n\nHe goes",
+   "ok": false,
+   "parsed": "He goes to school every day by bus.<|im_end|>",
+   "secs": 87.653,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "There is many reasons to visit the city.",
+   "want": "There are many reasons to visit the city.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nThere is many reasons to visit the city.",
+   "output": "There are many reasons to visit the city.<|im_end|>\n</think>\n\nThere are many reasons to visit the city.<|im_end|>\n<think>\n\n</think>\n\nThere are many reasons to visit the city.<|im_end|>\n<think>\n\n</think>\n\nThere are many reasons to visit the city.<|im_end|>\n<think>\n\n</think>\n\nThere are",
+   "ok": false,
+   "parsed": "There are many reasons to visit the city.<|im_end|>",
+   "secs": 87.572,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "I have seen him yesterday at the store.",
+   "want": "I saw him yesterday at the store.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nI have seen him yesterday at the store.",
+   "output": "I have seen him yesterday at the store.<|im_end|>\n<think>\nThinking Process:\n\n1.  **Analyze the Request:** The user wants me to correct the grammar of a given sentence. The constraint is to change as little as possible and reply with only the corrected sentence.\n\n2. ",
+   "ok": false,
+   "parsed": "I have seen him yesterday at the store.<|im_end|>",
+   "secs": 88.081,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "She is more taller than her brother.",
+   "want": "She is taller than her brother.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nShe is more taller than her brother.",
+   "output": "She is more **tall** than her brother.<|im_end|>\n</think>\n\nShe is more **tall** than her brother.<|im_end|>\n<think>\n\n</think>\n\nShe is more **tall** than her brother.<|im_end|>\n<think>\n\n</think>\n\nShe is more **tall** than her brother.",
+   "ok": false,
+   "parsed": "She is more **tall** than her brother.<|im_end|>",
+   "secs": 86.252,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "Me and him went to the store.",
+   "want": "He and I went to the store.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nMe and him went to the store.",
+   "output": "Me and him went to the store.<|im_end|>\n<think>\nThinking Process:\n\n1.  **Analyze the Request:** The user wants me to correct the grammar of the sentence \"Me and him went to the store.\" with as little change as possible. They also requested only the corrected sentence in",
+   "ok": false,
+   "parsed": "Me and him went to the store.<|im_end|>",
+   "secs": 85.676,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "The book was wrote by a famous author.",
+   "want": "The book was written by a famous author.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nThe book was wrote by a famous author.",
+   "output": "The book was written by a famous author.<|im_end|>\n</think>\n\nThe book was written by a famous author.<|im_end|>\n<think>\n\n</think>\n\nThe book was written by a famous author.<|im_end|>\n</think>\n\nThe book was written by a famous author.<|im_end|>\n<think>\n\n</think>\n\nThe book was written",
+   "ok": false,
+   "parsed": "The book was written by a famous author.<|im_end|>",
+   "secs": 70.187,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "If I was you, I would take the job.",
+   "want": "If I were you, I would take the job.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nIf I was you, I would take the job.",
+   "output": "If I was you, I would take the job.<|im_end|>\n</think>\n\nIf I was you, I would take the job.<|im_end|>\n<think>\n\n</think>\n\nIf I was you, I would take the job.<|im_end|>\n<think>\n\n</think>\n\nIf I was you, I would take the job.",
+   "ok": false,
+   "parsed": "If I was you, I would take the job.<|im_end|>",
+   "secs": 72.506,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "He runned very fast to catch the train.",
+   "want": "He ran very fast to catch the train.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nHe runned very fast to catch the train.",
+   "output": "He ran very fast to catch the train.<|im_end|>\n</think>\n\nHe ran very fast to catch the train.<|im_end|>\n<think>\n\n</think>\n\nHe ran very fast to catch the train.<|im_end|>\n<think>\n\n</think>\n\nHe ran very fast to catch the train.<|im_end|>\n<think>\n\n</think>\n\nHe ran",
+   "ok": false,
+   "parsed": "He ran very fast to catch the train.<|im_end|>",
+   "secs": 72.581,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "Each of the students have a laptop.",
+   "want": "Each of the students has a laptop.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nEach of the students have a laptop.",
+   "output": "Each of the students has a laptop.<|im_end|>\n</think>\n\nEach of the students has a laptop.<|im_end|>\n<think>\n\n</think>\n\nEach of the students has a laptop.<|im_end|>\n<think>\n\n</think>\n\nEach of the students **has** a laptop.<|im_end|>\n<think>\n\n</think>\n\nEach of the students",
+   "ok": false,
+   "parsed": "Each of the students has a laptop.<|im_end|>",
+   "secs": 76.964,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "She can sings very well.",
+   "want": "She can sing very well.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nShe can sings very well.",
+   "output": "She can sing very well.<|im_end|>\n</think>\n\nShe can sing very well.<|im_end|>\n<think>\n\n</think>\n\nShe can sing very well.<|im_end|>\n</think>\n\nShe can sing very well.<|im_end|>\n<think>\n\n</think>\n\nShe can sing very well.<|im_end|>\n</think>\n\nShe can sing very well.",
+   "ok": false,
+   "parsed": "She can sing very well.<|im_end|>",
+   "secs": 80.072,
+   "gen_tokens": 60
+  },
+  {
+   "job": "grammar",
+   "input": "I am interesting in learning new languages.",
+   "want": "I am interested in learning new languages.",
+   "max_tokens": 60,
+   "prompt": "Correct the grammar of this sentence. Change as little as possible. Reply with only the corrected sentence.\n\nI am interesting in learning new languages.",
+   "output": "I am interested in learning new languages.<|im_end|>\n</think>\n\nI am interested in learning new languages.<|im_end|>\n<think>\n\n</think>\n\nI am interested in learning new languages.<|im_end|>\n<think>\n\n</think>\n\nI am interested in learning new languages.<|im_end|>\n<think>\n\n</think>\n\nI am interested in learning new",
+   "ok": false,
+   "parsed": "I am interested in learning new languages.<|im_end|>",
+   "secs": 83.612,
+   "gen_tokens": 60
+  },
+  {
+   "job": "table",
+   "input": "Name: Alice, Age: 30, City: Oslo. Name: Bob, Age: 25, City: Bergen.",
+   "want": {
+    "header": [
+     "Name",
+     "Age",
+     "City"
+    ],
+    "rows": 2
+   },
+   "max_tokens": 200,
+   "prompt": "Turn this text into a Markdown table with the columns: Name, Age, City. Reply with only the table.\n\nName: Alice, Age: 30, City: Oslo. Name: Bob, Age: 25, City: Bergen.",
+   "output": "| Name | Age | City |\n|------|-----|------|\n| Alice | 30 | Oslo |\n| Bob | 25 | Bergen |<|im_end|>\n</think>\n\n| Name | Age | City |\n|------|-----|------|\n| Alice | 30 | Oslo |\n| Bob | 25 | Bergen |<|im_end|>\n</think>\n\n| Name | Age | City |\n|------|-----|------|\n| Alice | 30 | Oslo |\n| Bob | 25 | Bergen |<|im_end|>\n<think>\n\n</think>\n\n| Name | Age | City |\n|------|-----|------|\n| Alice | 30 | Oslo |\n| Bob | 25 | Bergen |<|im_end|>\n</think>\n\n| Name | Age | City |\n|------|-----|------|\n| Alice | 30 | Oslo |\n| Bob | 25 | Bergen |<|im_end|>\n<think>\n\n</think>\n\n|",
+   "ok": false,
+   "parsed": "14 rows",
+   "secs": 233.735,
+   "gen_tokens": 200
+  },
+  {
+   "job": "table",
+   "input": "Product: Pen, Price: 2, Stock: 50. Product: Notebook, Price: 5, Stock: 20. Product: Eraser, Price: 1, Stock: 100.",
+   "want": {
+    "header": [
+     "Product",
+     "Price",
+     "Stock"
+    ],
+    "rows": 3
+   },
+   "max_tokens": 200,
+   "prompt": "Turn this text into a Markdown table with the columns: Product, Price, Stock. Reply with only the table.\n\nProduct: Pen, Price: 2, Stock: 50. Product: Notebook, Price: 5, Stock: 20. Product: Eraser, Price: 1, Stock: 100.",
+   "output": "| Product | Price | Stock |\n| :--- | :--- | :--- |\n| Pen | 2 | 50 |\n| Notebook | 5 | 20 |\n| Eraser | 1 | 100 |<|im_end|>\n</think>\n\n| Product | Price | Stock |\n| :--- | :--- | :--- |\n| Pen | 2 | 50 |\n| Notebook | 5 | 20 |\n| Eraser | 1 | 100 |<|im_end|>\n</think>\n\n| Product | Price | Stock |\n| :--- | :--- | :--- |\n| Pen | 2 | 50 |\n| Notebook | 5 | 20 |\n| Eraser | 1 | 100 |<|im_end|>\n<think>\n\n</think>\n\n| Product | Price | Stock |\n| :--- | :--- | :--- |\n| Pen | 2 | 5",
+   "ok": false,
+   "parsed": "13 rows",
+   "secs": 250.098,
+   "gen_tokens": 200
+  },
+  {
+   "job": "table",
+   "input": "Day: Monday, Task: Report, Done: yes. Day: Tuesday, Task: Meeting, Done: no. Day: Wednesday, Task: Review, Done: yes.",
+   "want": {
+    "header": [
+     "Day",
+     "Task",
+     "Done"
+    ],
+    "rows": 3
+   },
+   "max_tokens": 200,
+   "prompt": "Turn this text into a Markdown table with the columns: Day, Task, Done. Reply with only the table.\n\nDay: Monday, Task: Report, Done: yes. Day: Tuesday, Task: Meeting, Done: no. Day: Wednesday, Task: Review, Done: yes.",
+   "output": "| Day | Task | Done |\n| :--- | :--- | :--- |\n| Monday | Report | yes |\n| Tuesday | Meeting | no |\n| Wednesday | Review | yes |<|im_end|>\n</think>\n\n| Day | Task | Done |\n| :--- | :--- | :--- |\n| Monday | Report | yes |\n| Tuesday | Meeting | no |\n| Wednesday | Review | yes |<|im_end|>\n</think>\n\n| Day | Task | Done |\n| :--- | :--- | :--- |\n| Monday | Report | yes |\n| Tuesday | Meeting | no |\n| Wednesday | Review | yes |<|im_end|>\n<think>\n\n</think>\n\n| Day | Task | Done |\n| :--- | :--- | :--- |\n| Monday | Report | yes |\n| Tuesday | Meeting | no |\n| Wednesday | Review | yes |<|im_end|>\n</think>\n\n| Day | Task | Done |\n| :--- | :---",
+   "ok": false,
+   "parsed": "16 rows",
+   "secs": 246.018,
+   "gen_tokens": 200
+  },
+  {
+   "job": "table",
+   "input": "Country: Norway, Capital: Oslo. Country: Sweden, Capital: Stockholm. Country: Denmark, Capital: Copenhagen.",
+   "want": {
+    "header": [
+     "Country",
+     "Capital"
+    ],
+    "rows": 2
+   },
+   "max_tokens": 200,
+   "prompt": "Turn this text into a Markdown table with the columns: Country, Capital. Reply with only the table.\n\nCountry: Norway, Capital: Oslo. Country: Sweden, Capital: Stockholm. Country: Denmark, Capital: Copenhagen.",
+   "output": "| Country | Capital |\n| :--- | :--- |\n| Norway | Oslo |\n| Sweden | Stockholm |\n| Denmark | Copenhagen |<|im_end|>\n</think>\n\n| Country | Capital |\n| :--- | :--- |\n| Norway | Oslo |\n| Sweden | Stockholm |\n| Denmark | Copenhagen |<|im_end|>\n<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Input text: \"Turn this text into a Markdown table with the columns: Country, Capital. Reply with only the table.\"\n    *   Input data: \"Country: Norway, Capital: Oslo. Country: Sweden, Capital: Stockholm. Country: Denmark, Capital: Copenhagen.\"\n    *   Constraint: Reply with only the table (no extra conversational text).\n\n2.  **Extract Data:**\n    *   Row 1: Country: Norway, Capital: Oslo\n    *   Row 2: Country: Sweden, Capital: Stockholm",
+   "ok": false,
+   "parsed": "7 rows",
+   "secs": 237.388,
+   "gen_tokens": 200
+  }
+ ]
+}

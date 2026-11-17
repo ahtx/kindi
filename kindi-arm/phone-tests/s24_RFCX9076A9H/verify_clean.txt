@@ -1,0 +1,6 @@
+kindi-cpu ready: Ternary-Bonsai-2-2B, 4 threads, ctx 1024 (37.7s)
+prompt 1 PASS 40/40 52.0s
+prompt 2 PASS 40/40 52.0s
+prompt 3 PASS 40/40 56.4s
+prompt 4 PASS 40/40 51.6s
+ALL_PASS 0.87 tok/s
