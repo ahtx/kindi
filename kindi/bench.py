@@ -48,8 +48,21 @@ def run(cfg, log=print):
             return 2
         from .lightning_cli import bench
         return bench(cfg, man, log=log)
+    from .vram import VramMonitor
+    # sample the card the engine runs on (the cupy device ordinal), not unconditionally GPU 0
+    dev = 0
+    if cp is not None:
+        try:
+            dev = int(cp.cuda.Device().id)
+        except Exception:                                          # noqa: BLE001 - no usable device: GPU 0
+            dev = 0
+    monitor = VramMonitor(cfg.get("vram_sample_s", 0.5), device=dev) if cfg.get("sample_vram") else None
+    if monitor is not None:
+        monitor.start()
     cl = os.path.join(pack, "head_clusters.npz")
     eng = make_engine(pack, ctx=cfg["ctx"], clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log)
+    if monitor is not None:
+        monitor.mark("loaded")
     if cp is not None:
         free, total = cp.cuda.runtime.memGetInfo()
         log("GPU memory: %.0f MiB free of %.0f with a %d-token context" % (free / 2 ** 20, total / 2 ** 20, eng.ctx))
@@ -82,4 +95,12 @@ def run(cfg, log=print):
             ms = timed(lambda i: eng.step(2000 + i, p + i), 10)
             log("generation (%s head) at position %5d: %5.1f tokens/s" % (name, p, 1000 / ms))
     eng.shortlist = 0
+    if monitor is not None:
+        monitor.stop()
+        s = monitor.summary()
+        if s.get("available"):
+            log("VRAM peak: %d MiB used (%+d over idle), %d MiB free at the peak, phase %s"
+                % (s["peak_used_mib"], s["peak_delta_mib"], s["peak_free_mib"], s["peak_phase"]))
+        else:
+            log("VRAM peak: unavailable (nvidia-smi did not report GPU %d)" % dev)
     return 0
