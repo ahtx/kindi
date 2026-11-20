@@ -72,6 +72,13 @@ def cmd_verify(cfg, a):
 
 def cmd_bench(cfg, a):
     _setup_gpu_env(cfg)
+    overrides = {}
+    if getattr(a, "sample_vram", False):
+        overrides["sample_vram"] = True
+    if getattr(a, "vram_sample_s", None) is not None:
+        overrides["vram_sample_s"] = a.vram_sample_s
+    if overrides:
+        cfg = dict(cfg, **overrides)
     from .bench import run
     return run(cfg, log=log)
 
@@ -199,7 +206,10 @@ def main(argv=None):
     s.add_argument("--clusters", type=int, default=1024)
     s.add_argument("--iters", type=int, default=12)
     sub.add_parser("verify", help="check against llama.cpp's reference output")
-    sub.add_parser("bench", help="measure speed")
+    s = sub.add_parser("bench", help="measure speed")
+    s.add_argument("--sample-vram", action="store_true", help="sample device-wide VRAM and log the peak during the run")
+    s.add_argument("--vram-sample-s", type=float, default=None, metavar="SECONDS",
+                   help="VRAM sampling interval in seconds (default: 0.5)")
     s = sub.add_parser("serve", help="run the OpenAI-compatible server")
     s.add_argument("--host")
     s.add_argument("--port", type=int)
