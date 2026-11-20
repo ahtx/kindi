@@ -17,6 +17,33 @@ def _meminfo(key):
     return None
 
 
+def _cgroup_limit(root=None):
+    """The effective RAM limit of the cgroup the process runs in, or None when unknown/unlimited.
+
+    A container's physical RAM is not the budget Kindi should plan against: the process can be
+    killed when it crosses the cgroup limit even though the host has more free memory. Read both
+    the cgroup v2 (memory.max) and v1 (memory/memory.limit_in_bytes) files and return the most
+    restrictive positive value. `max`/huge sentinels mean unlimited.
+    """
+    root = root or "/sys/fs/cgroup"
+    limits = []
+    for relpath in ("memory.max", "memory/memory.limit_in_bytes"):
+        try:
+            with open(os.path.join(root, relpath)) as f:
+                text = f.read().strip()
+        except (OSError, ValueError):
+            continue
+        if text == "max":
+            continue
+        try:
+            value = int(text)
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and value != 9223372036854771712:
+            limits.append(value)
+    return min(limits) if limits else None
+
+
 def _windows():
     """(total, available) bytes from GlobalMemoryStatusEx on native Windows, else None"""
     if os.name != "nt":
@@ -40,15 +67,25 @@ def _windows():
 
 
 def total():
-    """physical RAM in bytes (MemTotal, or GlobalMemoryStatusEx on native Windows), or None when unknown"""
+    """physical RAM in bytes (MemTotal, or GlobalMemoryStatusEx on native Windows), capped at the
+    cgroup limit when the process runs in a memory-limited container; None when unknown"""
     w = _windows()
-    return w[0] if w else _meminfo("MemTotal")
+    base = w[0] if w else _meminfo("MemTotal")
+    limit = _cgroup_limit()
+    if base and limit:
+        return min(base, limit)
+    return base or limit
 
 
 def available():
-    """free RAM in bytes (MemAvailable, or GlobalMemoryStatusEx on native Windows), or None when unknown"""
+    """free RAM in bytes (MemAvailable, or GlobalMemoryStatusEx on native Windows), or None when
+    unknown. A cgroup limit caps the value: MemAvailable can exceed the container's budget."""
     w = _windows()
-    return w[1] if w else _meminfo("MemAvailable")
+    base = w[1] if w else _meminfo("MemAvailable")
+    limit = _cgroup_limit()
+    if base and limit:
+        return min(base, limit)
+    return base
 
 
 def check(need, what, log=print, avail=None):
