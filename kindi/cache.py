@@ -22,6 +22,9 @@ import threading
 import time
 
 import numpy as np
+
+from .jsonio import load_json
+
 try:
     import cupy as cp
 except ImportError:               # the CPU engine (no VRAM checkpoint slot)
@@ -245,7 +248,7 @@ class Openings(object):
             for key in os.listdir(root):
                 d = os.path.join(root, key)
                 try:
-                    meta = json.load(open(os.path.join(d, "meta.json")))
+                    meta = load_json(os.path.join(d, "meta.json"))
                     if self.fp is not None and meta.get("engine") != self.fp[0]:
                         continue                  # made by another engine configuration
                     if meta["p"] < eng.ctx:
@@ -328,7 +331,7 @@ class Openings(object):
             eng.Vc[i][:p] = z["V%d" % i]
         self.entries[key]["used"] = time.time()
         try:
-            meta = json.load(open(os.path.join(d, "meta.json")))
+            meta = load_json(os.path.join(d, "meta.json"))
             meta["used"] = time.time()
             json.dump(meta, open(os.path.join(d, "meta.json"), "w"))
         except Exception:  # noqa: BLE001
@@ -387,7 +390,7 @@ class Turns(object):
             for key in os.listdir(os.path.join(root, "turns")):
                 d = os.path.join(root, "turns", key)
                 try:
-                    meta = json.load(open(os.path.join(d, "meta.json")))
+                    meta = load_json(os.path.join(d, "meta.json"))
                     if self.fp is not None and meta.get("engine") != self.fp[0]:
                         continue
                     if meta["p"] >= eng.ctx or any(b not in self.blocks for b in meta["blocks"]):
