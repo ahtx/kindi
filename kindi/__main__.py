@@ -4,6 +4,7 @@
   kindi fast-head               build the cluster file for the fast head (optional; ~2 minutes)
   kindi verify                  check greedy output against llama.cpp's reference (token for token)
   kindi bench                   measure speed and GPU memory
+  kindi io                      measure this host's memory-tier rates (RAM copy, disk read, PCIe)
   kindi serve                   run the OpenAI-compatible server
   kindi chat                    chat in the terminal (no server needed)
   kindi head exact|fast         choose the output head of a running server (next request, no restart)
@@ -74,6 +75,12 @@ def cmd_bench(cfg, a):
     _setup_gpu_env(cfg)
     from .bench import run
     return run(cfg, log=log)
+
+
+def cmd_io(cfg, a):
+    from . import io_probe
+    mib = a.mib if a.mib is not None else io_probe.DEFAULT_MIB
+    return io_probe.run(mib, a.disk_dir, a.skip, a.json)
 
 
 def cmd_serve(cfg, a):
@@ -230,6 +237,13 @@ def main(argv=None):
     s.add_argument("--iters", type=int, default=12)
     sub.add_parser("verify", help="check against llama.cpp's reference output")
     sub.add_parser("bench", help="measure speed")
+    s = sub.add_parser("io", help="measure this host's memory-tier rates: RAM copy, disk read, PCIe copies")
+    s.add_argument("--mib", type=int, default=None, help="buffer/file size per probe in MiB (default 128)")
+    s.add_argument("--disk-dir", default=None,
+                   help="where to create the temporary disk-probe file (default: the system temp dir)")
+    s.add_argument("--skip", default="", help="comma-separated probes to skip: ram,disk,pcie")
+    s.add_argument("--json", nargs="?", const=True, default=False, metavar="FILE",
+                   help="print the report as JSON, or write it to FILE for plan/autotune reuse")
     s = sub.add_parser("inkling", help="run experimental Inkling 2 Mini text inference")
     s.add_argument("gguf", help="local Inkling 2 Mini GGUF")
     s.add_argument("prompt")
@@ -271,7 +285,7 @@ def main(argv=None):
     ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head")}
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
-            "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
+            "io": cmd_io, "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
             "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route}[a.cmd](cfg, a)
 
 
