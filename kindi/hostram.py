@@ -44,6 +44,31 @@ def _cgroup_limit(root=None):
     return min(limits) if limits else None
 
 
+def _cgroup_usage(root=None):
+    """RAM the process's cgroup already charges in bytes, or None when unknown.
+
+    A container's limit is only half the story: once the cgroup has filled most of it, the room
+    left for a load is limit minus current usage, whatever the host's free memory says. Read both
+    the cgroup v2 (memory.current) and v1 (memory/memory.usage_in_bytes) counters and return the
+    largest value seen, the pessimistic reading when both files are present.
+    """
+    root = root or "/sys/fs/cgroup"
+    usages = []
+    for relpath in ("memory.current", "memory/memory.usage_in_bytes"):
+        try:
+            with open(os.path.join(root, relpath)) as f:
+                text = f.read().strip()
+        except (OSError, ValueError):
+            continue
+        try:
+            value = int(text)
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            usages.append(value)
+    return max(usages) if usages else None
+
+
 def _windows():
     """(total, available) bytes from GlobalMemoryStatusEx on native Windows, else None"""
     if os.name != "nt":
@@ -79,12 +104,16 @@ def total():
 
 def available():
     """free RAM in bytes (MemAvailable, or GlobalMemoryStatusEx on native Windows), or None when
-    unknown. A cgroup limit caps the value: MemAvailable can exceed the container's budget."""
+    unknown. A cgroup limit caps the value and the RAM the cgroup already uses is subtracted:
+    MemAvailable is the host's figure and says nothing about the room left in the container's own
+    budget. Returns 0 when the cgroup has no room left."""
     w = _windows()
     base = w[1] if w else _meminfo("MemAvailable")
     limit = _cgroup_limit()
     if base and limit:
-        return min(base, limit)
+        usage = _cgroup_usage()
+        room = limit - usage if usage is not None else limit
+        return min(base, max(0, room))
     return base
 
 
