@@ -185,7 +185,12 @@ class Tok(object):
             for w in pretoken(part):
                 ids = self.cache.get(w)
                 if ids is None:
-                    ids = [self.sid.get(p, 0) for p in bpe(gpt2_bytes(w), self.ranks)]
+                    pieces = bpe(gpt2_bytes(w), self.ranks)
+                    try:
+                        ids = [self.sid[p] for p in pieces]
+                    except KeyError as e:
+                        raise ValueError("tokenizer vocabulary has no token for %r; the pack's vocabulary and "
+                                         "merges are inconsistent" % e.args[0])
                     if len(self.cache) < 200000:
                         self.cache[w] = ids
                 out.extend(ids)
