@@ -1064,6 +1064,20 @@ class _Guard(object):
             self._start("spec")
 
 
+def _draft_policy(self):
+    """The optional adaptive draft-length controller (REQ-0015), created on first use when
+    KINDI_DRAFT_POLICY=1. It may only shorten the hand-tuned base k (never lengthen it), so the
+    engine's per-card tuning stays in charge; the controller just stops paying for drafts that
+    history says are rejected. Tokens are unaffected: verify() decides every output token."""
+    p = getattr(self, "_draft_policy", None)
+    if p is None:
+        if os.environ.get("KINDI_DRAFT_POLICY", "0") != "1":
+            return None
+        from .draft_policy import DraftPolicy
+        p = self._draft_policy = DraftPolicy("spec")
+    return p
+
+
 def _guard(self):
     g = getattr(self, "_sguard", None)
     if g is None:
@@ -1092,6 +1106,9 @@ def tc_step(self, tok, pos):
     elif k and getattr(self, "spec_auto", False) and self.spec_mode == "draft2b":
         k = 2 if pos < AUTO_B0_K2_MAX else 3        # measured: k=2 best at 512, k=3 from 1K
     k = min(k, self.ctx - pos - 1)
+    policy = _draft_policy(self)
+    if policy is not None and k > 0:
+        k = policy.limit_k(k)
     G = _guard(self) if k > 0 and os.environ.get("KINDI_SPEC_GUARD", "1") == "1" and pos >= GUARD_FROM else None
     if G is not None:
         G.at(pos)
@@ -1129,6 +1146,8 @@ def tc_step(self, tok, pos):
                 j += 1
         if dsp is not None:                          # the target's features of the accepted rows (tok, d[:j])
             dsp.ingest(self.cards[0].tcb["FEAT"], pos, j + 1)
+        if policy is not None:
+            policy.observe(j, len(d))                # the verify kept j of the drafted tokens
         if dr2 is not None:
             dr2.accept(j)
         if mt is not None:
@@ -1153,6 +1172,8 @@ def tc_step(self, tok, pos):
         mt.seen(pos, 1, [best])
     if G is not None:
         G.note(False, 1, G.span(t0))
+    if policy is not None and k > 0:
+        policy.observe(0, 0)                         # the drafter produced nothing this step
     if k:
         self.spec_stats["passes"] += 1
     self._best, self._ylog_ok, self._ylog_row = best, True, 0
