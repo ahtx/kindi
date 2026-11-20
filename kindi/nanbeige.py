@@ -219,7 +219,8 @@ class Card(object):
                       if tc or n not in TC_KERNELS}
             if self.k35:                       # 8-byte banks (Kepler): nbq_kmm reads float4 rows of its tiles
                 import ctypes
-                cu = ctypes.CDLL("libcuda.so.1")
+                from . import gpudrv
+                cu = gpudrv.driver()
                 for n in tuple(KMM.values()) + tuple(MVC.values()):
                     cu.cuFuncSetSharedMemConfig(ctypes.c_void_p(getattr(self.k[n], "kernel", self.k[n]).ptr), 2)
             for n in MM.values() if tc else ():
