@@ -455,6 +455,13 @@ PLAN_SMALL_HIP = ("gfx1151",)      # the AMD GPUs where the 2B / 4B / 9B take th
 def make_engine(pack, ctx=4096, clusters=None, log=print):
     """Engine on one GPU, or the two-card tensor parallel engine (kindi.tp) when the weights do not fit one card and
     two GPUs are present. KINDI_TP=1 / 0 forces the choice."""
+    if os.environ.get("KINDI_DEVICE", "gpu") == "intel":
+        # Intel integrated/discrete graphics (REQ-0020/REQ-0021): discovery, eligibility and the
+        # shared-memory budget exist (kindi/intel.py, the G0 slice), but the SYCL kernel backend
+        # does not. Refuse loudly instead of silently running the CPU engine under an Intel name.
+        raise SystemExit("kindi: KINDI_DEVICE=intel is not implemented yet - the SYCL backend "
+                         "(REQ-0020/REQ-0021) needs hardware to verify. Use KINDI_DEVICE=cpu for "
+                         "the CPU engine or the default CUDA/ROCm path for a discrete GPU.")
     if os.environ.get("KINDI_DEVICE", "gpu") == "cpu" or cp is None:
         from .cpu import Engine as CPUEngine
         if clusters is not None:
