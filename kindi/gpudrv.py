@@ -1,7 +1,8 @@
-"""The GPU driver behind Kindi's launch plans and graphs: libcuda on NVIDIA, libamdhip64 on AMD (ROCm).
+"""The GPU driver behind Kindi's launch plans and graphs: libcuda on NVIDIA (nvcuda.dll on Windows), libamdhip64 on AMD (ROCm).
 
 Kindi's launch plans, events and graphs call the CUDA driver API by name (cuLaunchKernel, cuCtxSetCurrent, ...).
-On NVIDIA, driver() is libcuda itself, unchanged. On ROCm there is no libcuda: driver() is an object with the same
+On NVIDIA, driver() is the platform's driver library itself, unchanged. On ROCm there is no libcuda: driver() is an
+object with the same
 names that forwards each call to its HIP twin. The argument layouts are the same (hipModuleLaunchKernel takes
 cuLaunchKernel's arguments, graph node parameters have the same layout), except for contexts: a HIP "context" here
 is the device index, read with hipGetDevice and set with hipSetDevice.
@@ -94,8 +95,14 @@ class _HipAsCuda(object):
 _drv = [None]
 
 
+def driver_name():
+    """the NVIDIA driver library this platform exposes (ROCm uses hip_lib instead)"""
+    return "nvcuda.dll" if os.name == "nt" else "libcuda.so.1"
+
+
 def driver():
-    """libcuda (NVIDIA) or its HIP stand-in (ROCm). On NVIDIA the caller sets the argument types as before."""
+    """libcuda (NVIDIA; nvcuda.dll on Windows) or its HIP stand-in (ROCm). On NVIDIA the caller sets the argument
+    types as before."""
     if _drv[0] is None:
-        _drv[0] = _HipAsCuda() if HIP else ctypes.CDLL("libcuda.so.1")
+        _drv[0] = _HipAsCuda() if HIP else ctypes.CDLL(driver_name())
     return _drv[0]

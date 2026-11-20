@@ -60,7 +60,8 @@ def reserve(eng):
         # 8-byte shared memory banks (Kepler; the float4 tile loads) and the larger shared memory split (CUDA only;
         # on ROCm the bank layout is fixed)
         import ctypes
-        drv = ctypes.CDLL("libcuda.so.1")
+        from . import gpudrv
+        drv = gpudrv.driver()
         fp = ctypes.c_void_p(eng.ck.k_mm_g4k.kernel.ptr)
         drv.cuFuncSetSharedMemConfig(fp, 2)
         drv.cuFuncSetCacheConfig(fp, 1)

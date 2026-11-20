@@ -50,7 +50,7 @@ def blocking_sync(log=print):
             log("blocking sync: %s - driver default kept" % e)
         return
     try:
-        cu = ctypes.CDLL("libcuda.so.1")
+        cu = gpudrv.driver()
         if cu.cuInit(0) != 0:
             log("blocking sync: cuInit failed - driver default kept")
             return
