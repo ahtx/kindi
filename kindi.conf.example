@@ -17,6 +17,10 @@ model_name = auto
 ctx = 24576
 head = exact
 fast_clusters = 256
+# CPU+GPU tandem: cap the GPU side at this many MiB (0: no ceiling) and leave this much free for the
+# display/driver. The planner uses min(free - reserve, vram budget).
+tandem_vram_mb = 0
+tandem_reserve_mb = 512
 # --- prompt cache
 checkpoint_every = 256
 prefix_max = 8

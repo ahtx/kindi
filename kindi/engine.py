@@ -52,7 +52,7 @@ FIRST_SPECIAL = 248044                 # Qwen3.5 vocabulary: ids 248044.. are th
 CU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kindi.cu")
 KERNELS = ("k_g4", "k_g4l", "k_fold_fwht", "k_rmsfold", "k_smfold", "k_l2w", "k_rmsw", "k_gdn_gates",
            "k_gdn_conv", "k_gdn_delta", "k_rope", "k_deq_emb3", "k_attn_s4w", "k_softmax_rows", "k_attn_v4p",
-           "k_attn_comb", "k_argmax", "k_sumparts", "k_fwht_hi", "k_expand", "k_mask_neg", "k_band", "k_topk",
+           "k_attn_comb", "k_argmax", "k_sumparts", "k_padd", "k_fwht_hi", "k_expand", "k_mask_neg", "k_band", "k_topk",
            "k_attn_sg", "k_attn_vg", "k_xchg",
            "k_xchg2", "k_attn_vgn", "k_attn_combn", "k_store_h", "k_cpq", "k_xchg3",
            "k_xrms", "k_gdn_pre", "k_gdn_deltan", "k_rmsw_s", "k_rope2", "k_store_q8", "k_q8row",
@@ -611,7 +611,7 @@ def tc_hp_for(man):
     return "1" if hb == 4096 else None
 
 
-def make_engine(pack, ctx=4096, clusters=None, log=print, tandem="off", cpu_layers=None):
+def make_engine(pack, ctx=4096, clusters=None, log=print, tandem="off", cpu_layers=None, gpu=None):
     """Engine on one GPU, or the two-card tensor parallel engine (kindi.tp) when the weights do not fit one card and
     two GPUs are present. KINDI_TP=1 / 0 forces the choice. tandem="cpu-first" or "gpu-first" splits the dense model
     between the CPU engine and one GPU engine."""
@@ -622,7 +622,7 @@ def make_engine(pack, ctx=4096, clusters=None, log=print, tandem="off", cpu_laye
         from .tandem import TandemEngine
         if clusters is not None:
             log("the fast head is not available in tandem mode: exact head")
-        return TandemEngine(pack, ctx=ctx, cpu_layers=cpu_layers, mode=mode, log=log)
+        return TandemEngine(pack, ctx=ctx, cpu_layers=cpu_layers, mode=mode, log=log, gpu=gpu)
     from .packcheck import check, PackError
     try:
         check(pack, "size")                 # B16: a pack file that changed size after kindi convert stops here

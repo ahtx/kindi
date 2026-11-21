@@ -1,6 +1,6 @@
 # Tandem CPU+GPU runtime
 
-Status: **dense layer split implemented; CPU tests pass, but no GPU run is part of this PR.**
+Status: **dense layer split implemented; CPU exactness tests pass, and the opt-in GPU memory gate was exercised on the 9B pack (memory fit passed, its 9B exactness child failed, so the gate returned 1); no 27B run is part of this PR.**
 
 A dense model needs every matrix on every token, so the unit of placement is a complete transformer
 block, not an expert. One backend runs a prefix or suffix of the blocks and hands the residual to the
@@ -41,21 +41,75 @@ reduce peak VRAM instead of loading the whole model and ignoring part of it.
 The CPU side uses the AVX2/FMA/F16C backend and its existing fallbacks. The handoff surface is
 `begin(tok)`, `layer(il, pos)`, `flush()`, `get_hidden()`, `set_hidden(values)` and `finish()`.
 
+## GPU owner: plan or plain
+
+`--tandem-gpu auto|plan|plain` selects the engine that runs the GPU half (`KINDI_TANDEM_GPU` sets
+a default). `auto` picks the plan engine on a single card unless `KINDI_TP=0`.
+
+- `plain` is the existing GPU engine with fp16 K/V. It uploads the whole f32 file, so an offloaded
+  layer frees less than its weights.
+- `plan` uses `TPEngine(layers=...)`. It reads only the owned layers' tensors, keeps q8_0 K/V for the
+  attention layers it owns, and steps one prebuilt plan per block. It is a single-card owner.
+
+Both owners expose `begin`/`layer`/`flush`/`get_hidden`/`set_hidden`/`finish`, so the CPU side does
+not depend on which one is selected.
+
+## Per-card VRAM ceiling and reserve
+
+The planner uses `min(free - reserve, ceiling)`:
+
+- `--vram-budget-mib N` (config `tandem_vram_mb`, environment `KINDI_TANDEM_VRAM_MB`) caps the GPU
+  side. `0` means no ceiling. This is for a 6 GiB P106-100 or a display card that must keep a lower
+  barrier than its nominal capacity.
+- `--vram-reserve-mib N` (config `tandem_reserve_mb`, environment `KINDI_TANDEM_RESERVE_MB`) is the
+  headroom left for the display, driver and allocation noise. The default is 512 MiB.
+
+The ceiling applies to `auto` planning and is reported in the chosen split's log line. `auto:MiB`
+keeps its old meaning: it is the extra headroom the split should free, not the card ceiling.
+
 ## Usage
 
 ```sh
 kindi --pack ~/.kindi/packs/bonsai-2b verify --tandem cpu-first --tandem-cpu-layers 6
 kindi --pack ~/.kindi/packs/bonsai-2b bench  --tandem gpu-first --tandem-cpu-layers 6
 kindi --pack ~/.kindi/packs/bonsai-2b serve  --tandem cpu-first --tandem-cpu-layers 6
+kindi --pack ~/.kindi/packs/bonsai-2b serve  --tandem cpu-first --tandem-cpu-layers auto       --tandem-gpu plan --vram-budget-mib 7168 --vram-reserve-mib 512
 ```
 
 The CPU library needs `gcc` with OpenMP. A tandem run needs a CUDA/ROCm GPU;
 `KINDI_DEVICE=cpu` is rejected.
 
+## GPU memory gate (opt-in)
+
+`tools/tandem_gate.py` is the measurement gate for the plan owner and the per-card ceiling. It
+refuses without a dense pack and a usable CUDA card (exit 2), plans with the same
+`vram_budget_bytes`/`plan_cpu_layers` functions the runtime uses, builds a real
+`TandemEngine(..., gpu="plan", cpu_layers="auto")`, samples free memory every 10 ms through the
+load and a fixed greedy run, and writes a path-free JSON record: pack identity and source hash,
+card, ceiling/reserve, chosen layers, planner estimate, sampled peak and minimum free, the reply
+tokens, an optional `kindi verify` result, and a verdict. Exit 0 means the sampled peak stayed
+inside the budget, the requested context was not reduced, and verify passed or had no reference;
+1 means the measurement or verify failed; 2 means missing pack/card/arguments. `--dry-run` prints
+the split without building an engine.
+
+    python tools/tandem_gate.py --pack ~/.kindi/packs/bonsai-27b \
+      --ctx 24576 --vram-budget-mib 7168 --reserve-mib 512 \
+      --json tandem-27b-24576.json
+
+The 27B claim still needs a 27B record from a host with the 27B pack. The gate itself was
+exercised on a 9B pack on 2026-11-22 (RTX 4060 Ti, sm_89, WSL2, gcc, ctx 4096, ceiling 2048 MiB,
+reserve 512 MiB, 2 tokens): it planned CPU layers `0,1,2,4,5`, kept the 4096-token context, and
+sampled a **1574.0 MiB** peak against the 2048 MiB budget (planner estimate 2004.9 MiB), so the
+memory check passed. With the exactness child enabled, `kindi verify` then failed at token 0 on
+all four 9B prompts (0/40, 0/40, 0/13 and 0/40 tokens), so the gate returned **1**; a fit alone
+is not reported as a pass. The failure is recorded as a 9B gate result and is not diagnosed here
+as a CPU, plan-owner or reference defect. That is a 9B check of the gate and the plan owner, not a
+27B measurement; the 9B records are local and not committed.
+
 ## Limits
 
 - Dense Bonsai packs only; the MoE backends keep their own expert-tier paths.
-- One GPU. The two-card tensor-parallel engine is not a tandem owner in this PR.
+- One GPU. The two-card tensor-parallel engine is not a tandem owner.
 - Exact head only; no fast head, speculative decoding or batched prompt path.
 - `TandemRunner` deliberately does not use the normal prompt cache.
 - The routing tests use fake backends. Two opt-in tests run the real CPU engine when
@@ -63,5 +117,6 @@ The CPU library needs `gcc` with OpenMP. A tandem run needs a CUDA/ROCm GPU;
   the whole-model step, and `tests/test_tandem_cpu_e2e.py` compares both placements' greedy reply
   and handoff hidden state with the whole-model CPU engine. The tandem end-to-end test ran on the
   2B pack (ctx 32, 2 threads, a 6-token reply): `cpu-first` and `gpu-first` were token-for-token
-  and bit-identical to the whole-model run. That run used the CPU engine as both owners; no GPU
-  backend, 27B pack or GPU measurement is claimed.
+  and bit-identical to the whole-model run. That run used the CPU engine as both owners. The
+  opt-in `tools/tandem_gate.py` passed its 9B memory check and failed its 9B exactness child as
+  described above; no 27B pack or 27B measurement is claimed.

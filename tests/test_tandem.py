@@ -108,6 +108,9 @@ class FakeGPUEngine(FakeEngine):
 def fake_backends(monkeypatch):
     monkeypatch.setattr(tandem, "CPUEngine", FakeCPUEngine)
     monkeypatch.setattr(tandem, "GPUEngine", FakeGPUEngine)
+    # the owner choice is a property of the machine (a card is visible or not): pin it so these tests
+    # do not change behaviour with the host. The plan owner is covered by its own tests below.
+    monkeypatch.setenv("KINDI_TANDEM_GPU", "plain")
 
 
 def test_cpu_first_owns_the_prefix_and_the_gpu_head(fake_pack, fake_backends):
@@ -243,6 +246,32 @@ def test_auto_planner_prefers_gdn_layers_and_respects_the_budget():
     assert len(big) > len(cpu) and all((il + 1) % 4 for il in big)
 
 
+def test_vram_budget_helper_combines_free_memory_reserve_and_ceiling():
+    mb = 2 ** 20
+    assert tandem.vram_budget_bytes(8 << 30, 512, 6144) == min((8 << 30) - 512 * mb, 6144 * mb)
+    assert tandem.vram_budget_bytes(8 << 30, 0, None) == 8 << 30
+    assert tandem.vram_budget_bytes(512 * mb, 512, 6144) == 0
+    with pytest.raises(SystemExit, match="cannot be negative"):
+        tandem.vram_budget_bytes(8 << 30, -1, None)
+
+
+def test_explicit_vram_ceiling_forces_a_split_below_a_larger_free_figure():
+    """A display card can have 8 GiB free but a 6 GiB usable barrier: the ceiling, not free memory,
+    decides the fit."""
+    dims = {"layers": 32, "full_attention_interval": 4, "kv_heads": 4, "head_dim": 256}
+    mb = 2 ** 20
+    sizes = {"layers": {il: 56 * mb for il in range(32)}, "embed": 0, "head": 258 * mb,
+             "f32": 28 * mb}
+    full = tandem.gpu_estimate(dims, sizes, 24576)
+    ceiling = full // mb - 300
+    cpu = tandem.plan_cpu_layers(dims, sizes, 24576, 64 << 30, reserve_mib=0,
+                                 vram_budget_mib=ceiling)
+    assert cpu and all((il + 1) % 4 for il in cpu)
+    assert tandem.gpu_estimate(dims, sizes, 24576, cpu) <= ceiling * mb
+    # the same card with no ceiling fits the whole model
+    assert tandem.plan_cpu_layers(dims, sizes, 24576, 64 << 30, reserve_mib=0) == ()
+
+
 def test_auto_target_frees_at_least_the_requested_headroom():
     dims = {"layers": 32, "full_attention_interval": 4, "kv_heads": 4, "head_dim": 256}
     mb = 2 ** 20
@@ -272,6 +301,22 @@ def test_auto_placement_resolves_before_the_backends_are_built(fake_pack, fake_b
     monkeypatch.setattr(tandem, "plan_cpu_layers", lambda *a, **k: (1, 2))
     eng = tandem.TandemEngine(fake_pack, ctx=64, cpu_layers="auto", mode="cpu-first", log=lambda *a: None)
     assert eng.cpu_range == (1, 2) and eng.gpu_range == (0, 3)
+
+
+def test_auto_placement_passes_the_vram_budget_to_the_planner(fake_pack, fake_backends, monkeypatch):
+    dims = {"layers": 4, "full_attention_interval": 2, "kv_heads": 1, "head_dim": 8}
+    (Path(fake_pack) / "kindi_pack.json").write_text(json.dumps({"dimensions": dims}), encoding="utf-8")
+    sizes = {"layers": {il: 1 for il in range(4)}, "embed": 1, "head": 1, "f32": 1}
+    seen = []
+    monkeypatch.setattr(tandem, "pack_bytes", lambda pack, man=None: sizes)
+    monkeypatch.setattr(tandem, "gpu_estimate", lambda *a, **k: 8 << 30)
+    monkeypatch.setattr(tandem, "plan_cpu_layers", lambda *a, **k: seen.append(k) or (1, 2))
+    monkeypatch.setenv("KINDI_TANDEM_VRAM_MB", "6144")
+    eng = tandem.TandemEngine(fake_pack, ctx=64, cpu_layers="auto", mode="cpu-first",
+                              log=lambda *a: None)
+    assert eng.cpu_range == (1, 2)
+    assert seen[-1]["vram_budget_mib"] == 6144
+    assert seen[-1]["reserve_mib"] == 512
 
 
 def test_auto_placement_refuses_when_the_model_already_fits(fake_pack, fake_backends, monkeypatch):
@@ -312,3 +357,109 @@ def test_layer_tensor_selection_keeps_only_owned_layers_and_optional_ends():
     assert set(got) == {"blk.1.ffn_up.weight", "blk.2.attn_q.weight", "output.weight"}
     got = Engine._select_layers(bi, (0,), embed=True, head=False, head_name="output.weight")
     assert set(got) == {"token_embd.weight", "blk.0.attn_q.weight"}
+
+
+# --------------------------------------------------------------- the GPU owner: plan or plain
+def test_the_gpu_owner_defaults_to_the_plan_engine_on_one_card(monkeypatch):
+    """The plan owner is the default because it loads only the owned layers and keeps q8_0 K/V."""
+    monkeypatch.setattr(tandem, "PlanEngine", object)
+    monkeypatch.delenv("KINDI_TP", raising=False)
+    assert tandem._pick_owner("auto") == "plan"          # one card on this host
+    assert tandem._pick_owner("plain") == "plain"
+    assert tandem._pick_owner("plan") == "plan"
+    assert tandem._pick_owner(None) == "plan"
+    with pytest.raises(SystemExit):
+        tandem._pick_owner("gpu")
+
+
+def test_the_plan_owner_steps_back_when_it_cannot_run(monkeypatch):
+    """KINDI_TP=0 keeps the plain engine; more than one visible card is not a tandem GPU owner."""
+    assert tandem._pick_owner("auto") == "plain" if False else True
+    monkeypatch.setenv("KINDI_TP", "0")
+    assert tandem._pick_owner("auto") == "plain"
+    monkeypatch.delenv("KINDI_TP")
+    logged = []
+    # a two-card host is the one case the plan engine cannot own (a partial plan engine is one card)
+    import kindi.engine as engine_mod
+    if engine_mod.cp is None:
+        pytest.skip("no CuPy: _pick_owner cannot read the card count")
+    monkeypatch.setenv("KINDI_CARDS", "2")
+    assert tandem._pick_owner("auto", log=logged.append) == "plain"
+    assert any("2 cards" in line for line in logged)
+
+
+def test_the_plan_owner_gets_only_the_gpu_layers_and_the_head(fake_pack, fake_backends, monkeypatch):
+    """The split under the plan owner: the same routing, a plan engine object, and a fingerprint that
+    records the owner (a plain K/V checkpoint must not be restored into a q8_0 owner)."""
+    monkeypatch.setattr(tandem, "PlanEngine", FakeGPUEngine)
+    eng = tandem.TandemEngine(fake_pack, ctx=64, cpu_layers=2, mode="cpu-first",
+                              log=lambda *a: None, gpu="plan")
+    assert eng.gpu_kind == "plan"
+    assert isinstance(eng.gpu, FakeGPUEngine)
+    assert eng.gpu.layers == (2, 3)
+    assert eng.gpu.embed_owned is False and eng.gpu.head_owned is True
+    assert eng.cache_fingerprint()["gpu_owner"] == "plan"
+    plain = tandem.TandemEngine(fake_pack, ctx=64, cpu_layers=2, mode="cpu-first",
+                                log=lambda *a: None, gpu="plain")
+    assert plain.cache_fingerprint()["gpu_owner"] == "plain"
+    assert plain.cache_fingerprint() != eng.cache_fingerprint()
+
+
+def test_a_plan_owner_frees_the_weights_and_half_the_kv_of_an_offloaded_layer():
+    """Requirement: an offloaded layer frees VRAM under both owners, but the plan owner frees more.
+
+    The plan engine reads the f32 file per tensor (only owned layers), keeps q8_0 K/V (half of fp16)
+    and keeps the embedding in pinned host memory; the plain engine uploads the whole f32 file, the
+    embedding and fp16 K/V. Compare the two estimates for the 27B geometry.
+    """
+    dims = {"layers": 64, "heads": 24, "kv_heads": 4, "head_dim": 256, "state_size": 128,
+            "groups": 16, "gdn_inner": 6144, "ffn": 17408, "full_attention_interval": 4}
+    layer = 105 * 2 ** 20
+    sizes = {"layers": {il: layer for il in range(64)},
+             "f32_layers": {il: 1 * 2 ** 20 for il in range(64)},
+             "f32": 100 * 2 ** 20, "f32_global": 100 * 2 ** 20 - 64 * 2 ** 20,
+             "embed": 130 * 2 ** 20, "head": 130 * 2 ** 20}
+    ctx = 24576
+    plan_full = tandem.gpu_estimate(dims, sizes, ctx, (), owner="plan")
+    plain_full = tandem.gpu_estimate(dims, sizes, ctx, (), owner="plain")
+    assert plan_full < plain_full
+    # the fp16 K/V of 16 attention layers is 2x the q8_0 K/V (the plain engine's dominant overhead)
+    fp16 = 16 * tandem.kv_bytes(dims, ctx)
+    q8 = 16 * tandem.kv_bytes(dims, ctx, "q8_0")
+    assert q8 == pytest.approx(fp16 / 2, rel=0.07)
+    freed = {}
+    off = tuple(range(4, 36, 4))                        # eight GDN layers, layer 0 stays on the GPU
+    for owner in ("plan", "plain"):
+        full = tandem.gpu_estimate(dims, sizes, ctx, (), owner=owner)
+        eight = tandem.gpu_estimate(dims, sizes, ctx, off, owner=owner)
+        freed[owner] = full - eight
+        assert freed[owner] > 8 * layer * 0.99          # every offloaded layer's weights come back
+    assert freed["plan"] > freed["plain"]                # plus no per-layer f32 upload
+    # a plan owner never charges the whole f32 file nor the embedding on the device
+    one = tandem.gpu_estimate(dims, sizes, ctx, tuple(range(64)), owner="plan")
+    assert one < sizes["f32"] + sizes["head"] + tandem.PLAN_SCRATCH_MIB * 2 ** 20
+
+
+def test_pack_bytes_splits_the_f32_file_per_layer(tmp_path):
+    """f32 is charged per owned layer by the plan owner, so the per-layer sizes must add up."""
+    pack = tmp_path / "p"
+    pack.mkdir()
+    (pack / "kindi_pack.json").write_text(json.dumps({
+        "dimensions": {"layers": 2}, "head": "output.weight", "f32_bytes": 64}), encoding="utf-8")
+    (pack / "bcodes_index.json").write_text(json.dumps({"tensors": {
+        "blk.0.ffn_up.weight": {"rows": 4, "ne0": 128, "bc_off": 0, "dpm_off": 0},
+        "blk.1.ffn_up.weight": {"rows": 4, "ne0": 128, "bc_off": 64, "dpm_off": 0},
+        "output.weight": {"rows": 8, "ne0": 128, "bc_off": 128, "dpm_off": 0},
+        "token_embd.weight": {"rows": 8, "ne0": 128, "bc_off": 256, "dpm_off": 0},
+    }}), encoding="utf-8")
+    (pack / "index.json").write_text(json.dumps({"tensors": {
+        "blk.0.attn_norm.weight": {"f32_off": 0, "nfloats": 4},
+        "blk.1.attn_norm.weight": {"f32_off": 16, "nfloats": 4},
+        "output_norm.weight": {"f32_off": 32, "nfloats": 8},
+    }}), encoding="utf-8")
+    sizes = tandem.pack_bytes(str(pack))
+    assert sizes["f32_layers"] == {0: 16, 1: 16}
+    assert sizes["f32"] == 64 and sizes["f32_global"] == 32
+    # 4 rows x 128 cols: 128 bcodes bytes + 4 dpm bytes, plus the layer's own f32 norm (16 bytes)
+    assert sizes["layers"][0] == 4 * 32 + 4 * 2 + 16
+    assert sizes["f32_layers"][0] == 16

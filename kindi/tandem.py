@@ -9,14 +9,19 @@ Two placements are supported:
 
 The hidden state is handed over once per token, between two complete residual streams.  Each
 backend keeps its own GDN state and K/V cache, so no per-layer synchronisation is needed inside a
-token.  The CPU engine is the existing AVX2/FMA/F16C backend; the GPU engine loads only the
-layers in its range (``Engine(layers=...)``), so a split really reduces VRAM rather than loading
-the whole model and ignoring part of it.
+token.  The CPU engine is the existing AVX2/FMA/F16C backend (with AVX2/F16C no-FMA and AVX-only
+fallbacks).  The GPU side is either the plain engine (``Engine(layers=...)``, fp16 K/V) or - the
+default - the plan engine (``TPEngine(layers=...)``, q8_0 K/V): both load only the layers in their
+range and allocate K/V only for the attention layers they own, so an offloaded layer really frees
+VRAM instead of being loaded and ignored.  ``--tandem-gpu auto|plan|plain`` picks the owner
+(``KINDI_TANDEM_GPU`` sets a default); a plan owner is one card, which is the only case it cannot
+serve.
 
 This is deliberately not a MoE engine.  A dense model needs every weight on every token, so an
 expert-cache policy has nothing to cache.  The MoE approach is a separate design in
 ``docs/TANDEM-RUNTIME.md`` and is not implemented here.
 """
+import hashlib
 import json
 import os
 
@@ -26,6 +31,16 @@ from .cpu import Engine as CPUEngine
 from .engine import Engine as GPUEngine
 
 MODES = ("cpu-first", "gpu-first")
+PlanEngine = None          # kindi.tp.TPEngine, imported on first use (it needs CuPy at import time)
+
+
+def plan_engine_class():
+    """The plan engine class, imported lazily so the CPU-only tests and the plain path never need it."""
+    global PlanEngine
+    if PlanEngine is None:
+        from .tp import TPEngine as _TP
+        PlanEngine = _TP
+    return PlanEngine
 
 
 def _normalise_mode(mode):
@@ -56,14 +71,71 @@ def _parse_layers(text):
 
 
 SCRATCH_MIB = 192          # measured plain-engine scratch at 24K (113 MiB on the 9B, 157 on the 27B) + slack
+PLAN_SCRATCH_MIB = 160     # the plan engine's own fixed buffers (prompt chunk buffers are not reserved here)
+Q8_0 = 1.0 + 2.0 / 32      # q8_0: one int8 per value plus one fp16 scale per 32 values, two arrays (K and V)
+GPU_OWNERS = ("auto", "plan", "plain")
+MIB = 2 ** 20
+
+
+def vram_budget_bytes(free_bytes, reserve_mib=512, budget_mib=None):
+    """The GPU owner's planning ceiling: free memory less a reserve, capped by an explicit budget.
+
+    ``reserve_mib`` is the headroom left for the display, the driver and allocation noise;
+    ``budget_mib`` is an optional hard ceiling for the card (a P106-100 limited to 6 GiB, or an
+    8 GiB display card limited to 7 GiB). A live free-memory figure still wins when it is lower:
+    the planner never promises memory that is not currently available. ``budget_mib`` of 0 or
+    None means no explicit ceiling.
+    """
+    try:
+        reserve = int(reserve_mib or 0)
+        ceiling = int(budget_mib or 0)
+    except (TypeError, ValueError):
+        raise SystemExit("kindi: tandem VRAM reserve and budget must be integers in MiB") from None
+    if reserve < 0 or ceiling < 0:
+        raise SystemExit("kindi: tandem VRAM reserve and budget cannot be negative")
+    available = max(0, int(free_bytes) - reserve * MIB)
+    if ceiling:
+        available = min(available, ceiling * MIB)
+    return available
+
+
+def _pick_owner(kind, log=None):
+    """-> 'plan' or 'plain' for the GPU side of a split.
+
+    ``auto`` takes the plan engine whenever it can run: it is the default engine for every model it
+    supports (the 2B/4B/9B are 1.5-2.5x faster there, and the 27B's kernels only exist there), its q8_0
+    K/V is half the size of the plain engine's fp16 K/V, and it loads only the tensors of the layers it
+    owns - which is what makes an offloaded layer free real VRAM. ``plain`` stays available for an A/B
+    comparison and for the one case the plan engine cannot serve: a split across two GPU cards (a tandem
+    GPU owner is one card).
+    """
+    kind = str(kind or "auto").strip().lower()
+    if kind not in GPU_OWNERS:
+        raise SystemExit("kindi: the tandem GPU owner must be auto, plan or plain (got %r)" % kind)
+    log = log or (lambda *a: None)
+    if kind != "auto":
+        return kind
+    from .engine import cp
+    if cp is None or os.environ.get("KINDI_TP", "") == "0":
+        return "plain"
+    try:
+        cards = int(os.environ.get("KINDI_CARDS") or cp.cuda.runtime.getDeviceCount())
+    except Exception:                                              # noqa: BLE001 - no usable card: plain owner
+        return "plain"
+    if cards > 1:
+        log("tandem: %d cards visible, the GPU owner stays the plain engine (a plan owner is one card)" % cards)
+        return "plain"
+    return "plan"
 
 
 def pack_bytes(pack, man=None):
-    """-> {'layers': {il: bytes}, 'embed': bytes, 'head': bytes, 'f32': bytes} for the device footprint.
+    """-> {'layers': {il: bytes}, 'f32_layers': {il: bytes}, 'f32': bytes, 'f32_global': bytes,
+    'embed', 'head'} for the device footprint.
 
     A ternary tensor costs ``rows * ne0 / 4`` bytes of bcodes plus one fp16 scale per 128-column group;
     an f32 tensor costs 4 bytes per value. The plain engine uploads exactly the selected tensors and the
-    whole f32 file, so these sizes are the engine's device bytes, not the pack's.
+    whole f32 file; the plan engine reads per tensor, so only the owned layers' norms reach the card. These
+    are the engine's device bytes, not the pack's.
     """
     man = man if man is not None else json.load(open(os.path.join(pack, "kindi_pack.json")))
     bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
@@ -75,36 +147,60 @@ def pack_bytes(pack, man=None):
             return rec["rows"] * rec["ne0"] // 4 + rec["rows"] * (rec["ne0"] // 128) * 2
         return int(idx.get(name, {}).get("nfloats", 0)) * 4
 
-    layers = {}
+    layers, f32_layers = {}, {}
     for name in bi:
         if name.startswith("blk."):
             il = int(name.split(".")[1])
             layers[il] = layers.get(il, 0) + nbytes(name)
     for name in idx:
-        if name.startswith("blk.") and name not in bi:
+        if name.startswith("blk."):
             il = int(name.split(".")[1])
+            if name in bi:
+                continue
             layers[il] = layers.get(il, 0) + nbytes(name)
+            if "f32_off" in idx[name]:
+                f32_layers[il] = f32_layers.get(il, 0) + nbytes(name)
     head_name = man.get("head", "token_embd.weight")
-    return {"layers": layers, "embed": nbytes("token_embd.weight"), "head": nbytes(head_name),
-            "f32": int(man.get("f32_bytes", 0))}
+    f32 = int(man.get("f32_bytes", 0))
+    return {"layers": layers, "f32_layers": f32_layers, "embed": nbytes("token_embd.weight"),
+            "head": nbytes(head_name), "f32": f32,
+            "f32_global": max(0, f32 - sum(f32_layers.values()))}
 
 
-def kv_bytes(dims, ctx):
-    """fp16 K and V bytes for one attention layer at this context."""
-    return int(ctx) * int(dims["kv_heads"]) * int(dims["head_dim"]) * 2 * 2
+def kv_bytes(dims, ctx, mode="f16"):
+    """K and V bytes for one attention layer at this context: fp16 (plain) or q8_0 (plan)."""
+    values = int(ctx) * int(dims["kv_heads"]) * int(dims["head_dim"]) * 2      # K and V
+    if mode == "q8_0":
+        return int(values * Q8_0)
+    return values * 2                                                          # fp16
 
 
-def gpu_estimate(dims, sizes, ctx, cpu_layers=()):
-    """Device bytes the plain engine needs when the GPU owns every layer except ``cpu_layers``.
+def gpu_estimate(dims, sizes, ctx, cpu_layers=(), owner="plain"):
+    """Device bytes the GPU owner needs when it owns every layer except ``cpu_layers``.
 
-    This is the engine's real allocation: the whole f32 file (it is uploaded as one file), the output
-    head, the embedding unless the CPU owns layer 0, each remaining layer's tensors and the fp16 K/V of
-    each remaining attention layer, plus the measured scratch allowance.
+    ``plain``: the whole f32 file (it is uploaded as one file), the output head, the embedding unless the
+    CPU owns layer 0, each remaining layer's tensors, the fp16 K/V of each remaining attention layer and
+    the measured plain scratch.
+
+    ``plan``: the same weights, but the f32 file only for the owned layers (the plan engine reads tensor by
+    tensor), q8_0 K/V (half of fp16), no device copy of the embedding (it lives in pinned host memory) and
+    the plan engine's own scratch. This is the reason to prefer the plan owner: an offloaded layer costs
+    its weights, and the layers that stay cost half the K/V for the same context.
     """
     NL = int(dims["layers"])
     interval = max(1, int(dims["full_attention_interval"]))
     cpu = frozenset(int(x) for x in cpu_layers)
     gpu = [il for il in range(NL) if il not in cpu]
+    f32l = sizes.get("f32_layers") or {}
+    if owner == "plan":
+        total = int(sizes.get("f32_global", 0)) + PLAN_SCRATCH_MIB * 2 ** 20
+        if gpu:
+            total += sizes["head"]
+        for il in gpu:
+            total += sizes["layers"].get(il, 0) + int(f32l.get(il, 0))
+            if (il + 1) % interval == 0:
+                total += kv_bytes(dims, ctx, "q8_0")
+        return total
     total = sizes["f32"] + SCRATCH_MIB * 2 ** 20
     if gpu:
         total += sizes["head"]
@@ -117,44 +213,51 @@ def gpu_estimate(dims, sizes, ctx, cpu_layers=()):
     return total
 
 
-def plan_cpu_layers(dims, sizes, ctx, free_bytes, reserve_mib=512, target_mib=None, log=None):
+def plan_cpu_layers(dims, sizes, ctx, free_bytes, reserve_mib=512, target_mib=None, log=None,
+                    owner="plain", vram_budget_mib=None):
     """The smallest CPU layer set that makes the GPU side fit, or ``()`` when no split is needed.
 
     Gated-delta layers go first, ascending: they cost no device K/V and little per-token CPU time, so
     they free VRAM at the lowest rate price (see ``gdn_first``). Attention layers are the last resort,
-    because a CPU attention layer's cost grows with the context. The estimate is the plain engine's
-    actual allocation (selected weights + the f32 file + the head + fp16 K/V of the attention layers the
-    GPU keeps) plus a measured scratch allowance; on the 27B at 24K it predicts 7,778 MiB against a
-    measured 7,783 MiB plan-engine peak.
+    because a CPU attention layer's cost grows with the context. The estimate is the GPU owner's actual
+    allocation (see ``gpu_estimate``) plus a measured scratch allowance; with the plain owner on the 27B
+    at 24K it predicts 7,778 MiB against a measured 7,783 MiB peak.
+
+    The fit budget is ``vram_budget_bytes(free_bytes, reserve_mib, vram_budget_mib)``. The explicit
+    budget is what makes a split happen on a card with plenty of free memory but a lower usable
+    ceiling, such as a display card that must leave room for the desktop.
     """
     log = log or (lambda *a: None)
     NL = int(dims["layers"])
     interval = max(1, int(dims["full_attention_interval"]))
-    budget = int(free_bytes) - int(reserve_mib) * 2 ** 20
+    budget = vram_budget_bytes(free_bytes, reserve_mib, vram_budget_mib)
     free_target = None if target_mib is None else int(target_mib) * 2 ** 20
-    full = gpu_estimate(dims, sizes, ctx, ())
+    full = gpu_estimate(dims, sizes, ctx, (), owner=owner)
 
     order = [il for il in range(NL) if (il + 1) % interval] + [il for il in range(NL)
                                                               if (il + 1) % interval == 0]
     cpu = []
     while True:
-        est = gpu_estimate(dims, sizes, ctx, cpu)
+        est = gpu_estimate(dims, sizes, ctx, cpu, owner=owner)
         over = est > budget
         short = free_target is not None and (full - est) < free_target
         if not over and not short:
             break
         if len(cpu) + 1 >= NL:
-            raise SystemExit("kindi: tandem auto cannot fit this model at %d tokens on the free GPU memory "
-                             "(needs about %d MiB more); reduce --ctx"
-                             % (int(ctx), max(est - budget, 0) // 2 ** 20))
+            raise SystemExit("kindi: tandem auto cannot fit this model at %d tokens on the usable GPU "
+                             "budget of %d MiB (needs about %d MiB more); reduce --ctx, the reserve "
+                             "or the ceiling"
+                             % (int(ctx), budget // 2 ** 20, max(est - budget, 0) // 2 ** 20))
         cpu.append(order[len(cpu)])
     if not cpu:
         return ()
     cpu = tuple(sorted(cpu))
-    est = gpu_estimate(dims, sizes, ctx, cpu)
-    log("tandem auto: %d CPU layer%s (%s) takes the GPU side to ~%d MiB (%d MiB freed; %d MiB budget)"
-        % (len(cpu), "" if len(cpu) == 1 else "s", ",".join(str(x) for x in cpu),
-           est // 2 ** 20, (full - est) // 2 ** 20, budget // 2 ** 20))
+    est = gpu_estimate(dims, sizes, ctx, cpu, owner=owner)
+    ceiling = (" (budget %d MiB)" % int(vram_budget_mib) if vram_budget_mib else "")
+    log("tandem auto: %d CPU layer%s (%s) takes the %s GPU side to ~%d MiB "
+        "(%d MiB freed; %d MiB budget%s)"
+        % (len(cpu), "" if len(cpu) == 1 else "s", ",".join(str(x) for x in cpu), owner,
+           est // 2 ** 20, (full - est) // 2 ** 20, budget // 2 ** 20, ceiling))
     return cpu
 
 
@@ -248,10 +351,13 @@ class _TandemCacheView(object):
 class TandemEngine(object):
     """A dense layer split over the CPU engine and one GPU engine."""
 
-    def __init__(self, pack, ctx=4096, cpu_layers=None, mode="cpu-first", log=print):
+    def __init__(self, pack, ctx=4096, cpu_layers=None, mode="cpu-first", log=print, gpu=None,
+                 vram_budget_mib=None, reserve_mib=None):
         self.log = log or (lambda *a: None)
         manifest = os.path.join(pack, "kindi_pack.json")
         man = json.load(open(manifest))
+        self.gpu_kind = _pick_owner(gpu if gpu is not None else os.environ.get("KINDI_TANDEM_GPU", "auto"),
+                                    log=self.log)
         if man.get("backend") in ("kindi_gemma4", "kindi_nanbeige"):
             raise SystemExit("kindi: tandem currently supports the dense Bonsai packs only")
         dims = dict(man.get("dimensions") or {})
@@ -282,15 +388,28 @@ class TandemEngine(object):
                 raise SystemExit("kindi: tandem auto needs a CUDA/ROCm GPU to read the free memory")
             free = int(_cp.cuda.runtime.memGetInfo()[0])
             sizes = pack_bytes(pack, man)
-            need = gpu_estimate(dims, sizes, ctx) // 2 ** 20
-            if auto_target is None and need <= (free // 2 ** 20) - 512:
-                raise SystemExit("kindi: this model already fits at %d tokens (~%d MiB needed, %d MiB free); "
-                                 "a split would only make it slower - run without --tandem, or ask for a "
-                                 "target with --tandem-cpu-layers auto:<MiB>"
-                                 % (int(ctx), need, free // 2 ** 20))
-            cpu_layers = plan_cpu_layers(dims, sizes, ctx, free,
-                                         reserve_mib=int(os.environ.get("KINDI_TANDEM_RESERVE_MB", "512")),
-                                         target_mib=auto_target, log=self.log)
+            need = gpu_estimate(dims, sizes, ctx, owner=self.gpu_kind) // 2 ** 20
+            try:
+                if reserve_mib is None:
+                    reserve_mib = os.environ.get("KINDI_TANDEM_RESERVE_MB", "512")
+                if vram_budget_mib is None:
+                    vram_budget_mib = os.environ.get("KINDI_TANDEM_VRAM_MB", "0") or 0
+                reserve_mib = int(reserve_mib or 0)
+                vram_budget_mib = int(vram_budget_mib or 0) or None
+            except (TypeError, ValueError):
+                raise SystemExit("kindi: tandem VRAM reserve and budget must be integers in MiB") from None
+            budget = vram_budget_bytes(free, reserve_mib, vram_budget_mib)
+            if auto_target is None and need <= budget // 2 ** 20:
+                raise SystemExit("kindi: this model already fits at %d tokens (~%d MiB needed, %d MiB usable%s); "
+                                 "a split would only make it slower - run without --tandem, ask for a "
+                                 "target with --tandem-cpu-layers auto:<MiB>, or lower --vram-budget-mib"
+                                 % (int(ctx), need, budget // 2 ** 20,
+                                    " (%d MiB reserve)" % reserve_mib if reserve_mib else ""))
+            if cpu_layers == "auto":
+                cpu_layers = plan_cpu_layers(dims, sizes, ctx, free,
+                                             reserve_mib=reserve_mib, target_mib=auto_target,
+                                             log=self.log, owner=self.gpu_kind,
+                                             vram_budget_mib=vram_budget_mib)
         cpu_first = self.mode == "cpu-first"
         if isinstance(cpu_layers, (list, tuple)):
             explicit = tuple(int(x) for x in cpu_layers)
@@ -324,8 +443,15 @@ class TandemEngine(object):
         # cost ~365 s even when the CPU owned 16 of 64 layers.
         self.cpu = CPUEngine(pack, ctx=ctx, log=log, layers=self.cpu_range,
                              embed=0 in self.cpu_range, head=self.NL - 1 in self.cpu_range)
-        self.gpu = GPUEngine(pack, ctx=ctx, log=log, layers=self.gpu_range,
-                             embed=0 in self.gpu_range, head=self._gpu_head)
+        if self.gpu_kind == "plan":
+            # the plan engine loads only the GPU-owned tensors and allocates q8_0 K/V for the owned
+            # attention layers only: an offloaded layer frees its weights and its K/V, not just its time
+            Plan = plan_engine_class()
+            self.gpu = Plan(pack, ctx=ctx, log=log, layers=self.gpu_range,
+                            embed=0 in self.gpu_range, head=self._gpu_head)
+        else:
+            self.gpu = GPUEngine(pack, ctx=ctx, log=log, layers=self.gpu_range,
+                                 embed=0 in self.gpu_range, head=self._gpu_head)
         self.ctx = min(int(self.cpu.ctx), int(self.gpu.ctx))
         self.D = int(self.cpu.D)
         if int(self.gpu.D) != self.D:
@@ -341,13 +467,23 @@ class TandemEngine(object):
         def _rng(rng):
             full = rng == tuple(range(rng[0], rng[-1] + 1))
             return "%d..%d" % (rng[0], rng[-1]) if full else ",".join(str(x) for x in rng)
-        self.log("tandem %s: CPU layers %s, GPU layers %s, %d-token context, %s head"
-                 % (self.mode, _rng(self.cpu_range), _rng(self.gpu_range),
+        self.log("tandem %s: CPU layers %s, %s engine on layers %s, %d-token context, %s head"
+                 % (self.mode, _rng(self.cpu_range), self.gpu_kind, _rng(self.gpu_range),
                     self.ctx, "GPU" if self._gpu_head else "CPU"))
 
     def _sync_logits(self):
         owner = self.gpu if self._gpu_head else self.cpu
         self.ylog, self.ylog_n, self.ylog_map = owner.ylog, owner.ylog_n, owner.ylog_map
+
+    def cache_fingerprint(self):
+        """The split and the CPU arithmetic environment, for a saved opening's fingerprint."""
+        return {"mode": self.mode, "cpu_layers": self.cpu_layers,
+                "cpu_range": list(self.cpu_range), "gpu_range": list(self.gpu_range),
+                "gpu_owner": self.gpu_kind, "gpu_kv": getattr(self.gpu, "kv", None) or "f16",
+                "cpu_isa": getattr(self.cpu, "isa", None),
+                "cpu_threads": getattr(self.cpu, "threads", None),
+                "cpu_ctx": int(self.cpu.ctx), "gpu_ctx": int(self.gpu.ctx),
+                "code": hashlib.sha256(open(__file__, "rb").read()).hexdigest()[:12]}
 
     def _check_pos(self, pos):
         pos = int(pos)
