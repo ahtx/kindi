@@ -1216,7 +1216,10 @@ def spec_begin(self, greedy, temperature=0.0, top_p=1.0, top_k=0, rng=None, min_
     if _mtp.DUMP is not None:
         mode = "0"
     self.spec_mode = mode
-    self.spec_k = int(os.environ.get("KINDI_SPEC_K", "4")) if mode in ("ngram", "draft2b", "both", "mtp") else 0
+    # mode A's measured best on the 2B is k=1 (1.12-1.13x at 512/24K; k=4 was 0.66-0.89x), so the
+    # head's default follows that row. An explicit KINDI_SPEC_K still wins; the other modes keep 4.
+    self.spec_k = int(os.environ.get("KINDI_SPEC_K", "1" if mode == "mtp" else "4")) \
+        if mode in ("ngram", "draft2b", "both", "mtp") else 0
     if self.spec_auto and mode == "draft2b":
         self.spec_k = 3
     if mode == "dspine":                         # a whole block: the current token + BLOCK - 1 drafts (KINDI_SPEC_K is the 2B's)
