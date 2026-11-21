@@ -77,6 +77,12 @@ def _response_format_grammar(response_format, req=None):
     return grammar_from_schema(_response_format_schema(response_format))
 
 
+def _oai_check(req, can_force):
+    """oai.check without its response_format refusal: this server constrains that field itself."""
+    from . import oai
+    return oai.check({k: v for k, v in req.items() if k != "response_format"}, can_force=can_force)
+
+
 def _validate_response_format(req):
     """Validate the request-level response_format contract before the engine runs.
 
@@ -353,10 +359,12 @@ class Kindi(object):
         from . import gemma4_tools
         cfg=self.cfg; messages=gemma4_tools.prepare_messages(req.get("messages") or [])
         from . import oai
-        tools,_=oai.check(req,can_force=False)       # #38: a forced call or a JSON schema gets a 400, not free text
+        tools,_=_oai_check(req,can_force=False)       # #38: a forced call or a JSON schema gets a 400, not free text
         kw=dict(req.get("chat_template_kwargs") or {})
         kw["enable_thinking"]=bool(kw.get("enable_thinking",req.get("enable_thinking",False)))
         kw["conversational_mode"]=bool(kw.get("conversational_mode",False))
+        if is_structured(req.get("response_format") or {}):
+            kw["enable_thinking"]=False       # a structured reply is the whole reply
         prompt=render_gemma(self.model_path,messages,tools,kw,True)
         jgrammar=jstate=None
         rf=req.get("response_format") or {}
@@ -599,11 +607,13 @@ class Kindi(object):
         cfg = self.cfg
         messages = req.get("messages") or []
         from . import oai
-        tools, force = oai.check(req, can_force=True)   # #38: tool_choice and response_format are honoured or refused
+        tools, force = _oai_check(req, can_force=True)   # #38: tool_choice and response_format are honoured or refused
         think = bool((req.get("chat_template_kwargs") or {}).get("enable_thinking", req.get("enable_thinking", False)))
         if force is not None:
             think = False                                # a forced call is the whole reply: no thinking block first
         forced = oai.forced_call_prefix(force) if force is not None else ""
+        if grammar is not None:
+            think = False                                # a structured reply is the whole reply
         budget = req.get("thinking_budget_tokens") or req.get("thinking_budget") or cfg.get("thinking_budget") or 0
         budget = int(budget) if think else 0
         g = lambda k, d: d if req.get(k) is None else req.get(k)  # noqa: E731
