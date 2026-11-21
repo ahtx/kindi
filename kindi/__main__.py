@@ -121,6 +121,17 @@ def cmd_chat(cfg, a):
         msgs.append({"role": "assistant", "content": reply})
 
 
+def cmd_caps(cfg, a):
+    from . import caps as _caps
+    report = _caps.probe()
+    if getattr(a, "json", False):
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    for line in _caps.render(report):
+        print(line)
+    return 0
+
+
 def cmd_head(cfg, a):
     os.makedirs(cfg["state_dir"], exist_ok=True)
     if a.mode == "fast" and not os.path.exists(os.path.join(cfg["pack"], "head_clusters.npz")):
@@ -248,6 +259,8 @@ def main(argv=None):
     s = sub.add_parser("head", help="exact or fast output head for a running server")
     s.add_argument("mode", choices=("exact", "fast"))
     sub.add_parser("info", help="show configuration, pack and GPU")
+    s = sub.add_parser("caps", help="what each card and this CPU can do, and which Kindi paths that enables")
+    s.add_argument("--json", action="store_true", help="machine-readable report")
     s = sub.add_parser("models", help="list the models and what fits this machine")
     s.add_argument("--json", action="store_true", help="one JSON list (id, what, size_gb, fits, downloaded)")
     s = sub.add_parser("cards", help="list every GPU: VRAM, free memory, PCIe link, bandwidth, supported or not")
@@ -272,7 +285,7 @@ def main(argv=None):
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
-            "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route}[a.cmd](cfg, a)
+            "caps": cmd_caps, "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route}[a.cmd](cfg, a)
 
 
 if __name__ == "__main__":
