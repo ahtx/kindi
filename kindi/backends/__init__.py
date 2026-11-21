@@ -20,12 +20,14 @@ from .registry import (
     unregister_backend,
 )
 from .fake import FakeBackend
+from .bonsai import BonsaiBackend
 
 __all__ = [
     "Backend",
     "BackendCapabilities",
     "BackendNotFound",
     "BackendUnavailable",
+    "BonsaiBackend",
     "CancelToken",
     "FakeBackend",
     "GenerationEvent",
