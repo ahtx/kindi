@@ -18,6 +18,7 @@ DEFAULTS = {
     "port": "8093",
     "api_key": "",                      # if set, clients must send Authorization: Bearer <api_key>
     "model_name": "auto",              # infer the reported id from the selected pack
+    "max_body_mb": "16",                # largest accepted JSON request body
     # engine
     "ctx": "24576",                     # requested context; each backend clamps it to available device memory
     "head": "exact",                    # exact | fast (shortlist head, ~15% faster, approximate)
@@ -47,7 +48,7 @@ DEFAULTS = {
     "repeat_last_n": "64",              # the tokens that repeat_penalty looks at (-1: the whole context)
 }
 
-INT_KEYS = {"repeat_stop", "lookup", "port", "ctx", "fast_clusters", "checkpoint_every", "checkpoint_budget_mb", "prefix_max", "prefix_min", "park_max",
+INT_KEYS = {"repeat_stop", "lookup", "port", "max_body_mb", "ctx", "fast_clusters", "checkpoint_every", "checkpoint_budget_mb", "prefix_max", "prefix_min", "park_max",
             "turn_save", "turn_keep", "turn_disk_mb", "turn_min",
             "max_tokens", "top_k", "repeat_last_n"}
 FLOAT_KEYS = {"temperature", "top_p", "min_p", "repeat_penalty"}
