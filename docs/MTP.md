@@ -24,6 +24,10 @@ Kindi has one head: `kindi-mtp-2b-v1.npz` (61 MB), for Ternary-Bonsai-2-2B. It i
 | B2 | B0 and `KINDI_SPEC_DRAFT_HEAD=<file>` | The 2B does one step; then the 2B's head drafts the other k - 1 tokens. |
 | auto | `KINDI_SPEC=auto` | Kindi selects the mode for each step (see below). |
 
+For explicit mode A, `KINDI_SPEC_K` now defaults to **1**; the model drafter modes keep the
+previous default of 4. An explicit `KINDI_SPEC_K` still wins. The depth run below is why: k=1
+measured 1.12-1.13x at 512/24K and 1.01x at 8K, while the old k=4 default measured 0.66-0.89x.
+
 ## Which cards
 
 MTP runs only on the tensor-core path: NVIDIA sm_80 and later, with `KINDI_TC=1`.
