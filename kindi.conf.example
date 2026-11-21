@@ -12,6 +12,7 @@ host = 127.0.0.1
 port = 8093
 # api_key = choose-a-long-random-string
 model_name = auto
+# max_body_mb = 16       # largest accepted JSON body
 
 # --- engine
 ctx = 24576

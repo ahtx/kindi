@@ -1,4 +1,6 @@
-"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model and its real context (context_length, max_model_len, meta.n_ctx)\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls;\n                               dry_run=true -> the exact prompt_tokens, no generation\n  POST /v1/tokenize            {"content": text} or {"messages": [...], "tools": [...]} -> count, tokens\n  POST /v1/detokenize          {"tokens": [...]} -> text\n\nA prompt that does not fit is an HTTP 400 (code context_length_exceeded, OpenAI's wording) before the request waits\nfor the engine. A stream gets an SSE comment ": kindi progress {...}" every KINDI_KEEPALIVE_S (10) seconds while\nnothing else goes out; kindi_keepalive=true gives a non-streaming request spaces before its JSON. After each answer\nthe end-of-turn state is saved to disk in the background (turn_save, see cache.Turns).\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking); a stream then carries the thinking as\ndelta.reasoning_content. thinking_budget_tokens (or thinking_budget) caps it: at the budget the server closes the\nthinking itself and the model goes on to answer. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
+"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model and its real context (context_length, max_model_len, meta.n_ctx)\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls;\n                               dry_run=true -> the exact prompt_tokens, no generation\n  POST /v1/tokenize            {"content": text} or {"messages": [...], "tools": [...]} -> count, tokens\n  POST /v1/detokenize          {"tokens": [...]} -> text
+  POST /v1/responses           OpenAI Responses API over the same chat path (stateless; streaming supported)
+\n\nA prompt that does not fit is an HTTP 400 (code context_length_exceeded, OpenAI's wording) before the request waits\nfor the engine. A stream gets an SSE comment ": kindi progress {...}" every KINDI_KEEPALIVE_S (10) seconds while\nnothing else goes out; kindi_keepalive=true gives a non-streaming request spaces before its JSON. After each answer\nthe end-of-turn state is saved to disk in the background (turn_save, see cache.Turns).\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking); a stream then carries the thinking as\ndelta.reasoning_content. thinking_budget_tokens (or thinking_budget) caps it: at the budget the server closes the\nthinking itself and the model goes on to answer. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
 import asyncio
 import codecs
 import concurrent.futures
@@ -11,6 +13,8 @@ import uuid
 import numpy as np
 
 from . import COMMIT, __version__, chat
+from .api import responses as responses_api
+from .api.body import RequestTooLarge, read_json_body
 from .cache import Cancelled, Runner
 from .engine import EOS
 from .sampling import Sampler
@@ -690,6 +694,7 @@ def create_app(cfg, log=print):
 
     K = GPU_THREAD.submit(_make_engine, cfg, log).result()
     model_id = cfg["model_name"]
+    body_limit = max(1, int(cfg.get("max_body_mb", 16))) << 20  # adapter route; admission extends this to chat/tokenize
     app = FastAPI(title="Kindi", version=__version__)
 
     def _err(code, msg, typ="invalid_request_error"):
@@ -971,6 +976,142 @@ def create_app(cfg, log=print):
         # the save of the turn's end state runs on the engine thread after this answer is sent, before the next request
         SCHED.submit(K.after_turn, PRIO_TURN)
         return answer(info)
+
+    @app.post("/v1/responses")
+    async def responses(request: Request):
+        """OpenAI Responses API: stateless translation over the chat path."""
+        if not _auth(request):
+            return _err(401, "invalid API key", "authentication_error")
+        try:
+            body = await read_json_body(request, body_limit)
+        except RequestTooLarge as e:
+            return _err(413, str(e), "request_too_large")
+        except ValueError as e:
+            return _err(400, str(e))
+        try:
+            req = responses_api.to_chat(body)
+        except ValueError as e:
+            return _err(400, str(e))
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, K.check_prompt, req)
+        except ContextOverflow as e:
+            return _overflow(e)
+        except ValueError as e:
+            return _err(400, str(e))
+
+        cancel = threading.Event()
+        prio = priority_of(req, request.headers)
+        response_id = responses_api.new_id("resp_")
+        created = int(time.time())
+        text_id = responses_api.new_id("msg_")
+
+        def run():
+            with K.lock:
+                info = None
+                for kind, val in run_generate(K, req, cancel, prio):
+                    if kind == "done":
+                        info = val
+                return info
+
+        if body.get("stream"):
+            def events():
+                started = responses_api.in_progress(response_id, model_id, created, req)
+                yield responses_api.event("response.created", {"response": started})
+                yield responses_api.event("response.in_progress", {"response": started})
+                text_open = False
+                info = None
+                try:
+                    with K.lock:
+                        for kind, val in run_generate(K, req, cancel, prio):
+                            if kind == "text":
+                                if not text_open:
+                                    text_open = True
+                                    item = {"id": text_id, "type": "message", "role": "assistant",
+                                            "status": "in_progress", "content": []}
+                                    yield responses_api.event("response.output_item.added",
+                                                              {"output_index": 0, "item": item})
+                                    yield responses_api.event("response.content_part.added", {
+                                        "item_id": text_id, "output_index": 0, "content_index": 0,
+                                        "part": {"type": "output_text", "text": "", "annotations": []}})
+                                yield responses_api.event("response.output_text.delta", {
+                                    "item_id": text_id, "output_index": 0, "content_index": 0, "delta": val})
+                            elif kind == "done":
+                                info = val
+                    if info is None:
+                        failed = responses_api.in_progress(response_id, model_id, created, req)
+                        failed.update(status="failed", error={"code": "cancelled", "message": "request cancelled"})
+                        yield responses_api.event("response.failed", {"response": failed})
+                        return
+                    obj = responses_api.response_object(info, model_id, response_id, created, req)
+                    if text_open:
+                        text = (info.get("content") or "")
+                        yield responses_api.event("response.output_text.done", {
+                            "item_id": text_id, "output_index": 0, "content_index": 0, "text": text})
+                        yield responses_api.event("response.content_part.done", {
+                            "item_id": text_id, "output_index": 0, "content_index": 0,
+                            "part": {"type": "output_text", "text": text, "annotations": []}})
+                        yield responses_api.event("response.output_item.done",
+                                                  {"output_index": 0, "item": obj["output"][0]})
+                    start = 1 if text_open else 0
+                    for i, item in enumerate(obj["output"][start:], start):
+                        yield responses_api.event("response.output_item.added",
+                                                  {"output_index": i, "item": item})
+                        yield responses_api.event("response.output_item.done",
+                                                  {"output_index": i, "item": item})
+                    yield responses_api.event("response.completed", {"response": obj})
+                except Exception as e:  # noqa: BLE001
+                    _after_engine_error(K, e)
+                    failed = responses_api.in_progress(response_id, model_id, created, req)
+                    failed.update(status="failed", error={"code": "server_error",
+                                                          "message": "kindi: %s" % e})
+                    yield responses_api.event("response.failed", {"response": failed})
+                finally:
+                    if not cancel.is_set():
+                        K.after_turn(locked=True)
+
+            async def relay():
+                loop = asyncio.get_event_loop()
+                q = asyncio.Queue()
+                END = object()
+
+                def pump():
+                    try:
+                        for item in events():
+                            loop.call_soon_threadsafe(q.put_nowait, item)
+                    finally:
+                        loop.call_soon_threadsafe(q.put_nowait, END)
+
+                fut = asyncio.wrap_future(SCHED.submit(pump, prio))
+                try:
+                    while True:
+                        item = await q.get()
+                        if item is END:
+                            break
+                        yield item
+                finally:
+                    cancel.set()
+                    await asyncio.wait([fut], timeout=30)
+
+            return StreamingResponse(relay(), media_type="text/event-stream")
+
+        try:
+            fut = asyncio.wrap_future(SCHED.submit(run, prio))
+            while not fut.done():
+                done, _ = await asyncio.wait([fut], timeout=1.0)
+                if not done and await request.is_disconnected():
+                    cancel.set()
+            info = fut.result()
+            if info is None:
+                return _err(499, "request cancelled", "cancelled")
+        except ContextOverflow as e:
+            return _overflow(e)
+        except ValueError as e:
+            return _err(400, str(e))
+        except Exception as e:  # noqa: BLE001 - an engine failure, not a bad request
+            _after_engine_error(K, e)
+            return _err(500, "kindi: %s" % e, "server_error")
+        SCHED.submit(K.after_turn, PRIO_TURN)
+        return responses_api.response_object(info, model_id, response_id, created, req)
 
     return app
 
