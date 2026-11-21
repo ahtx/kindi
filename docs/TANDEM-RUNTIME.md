@@ -14,8 +14,22 @@ synchronisation is needed inside a token.
 | `cpu-first` | CPU | CPU prefix `0..n-1`, GPU suffix `n..NL-1` | GPU |
 | `gpu-first` | GPU | GPU prefix `0..NL-n-1`, CPU suffix `NL-n..NL-1` | CPU |
 
-`--tandem-cpu-layers` takes a count (`6`) or an explicit sorted layer set (`0,1,2,4,5,6` or
-`0-2,4-6`). The default is a quarter of the layers. A split needs at least one layer on each side.
+`--tandem-cpu-layers` takes a count (`6`), an explicit sorted layer set (`0,1,2,4,5,6` or
+`0-2,4-6`), `gdn:N`, or `auto[:MiB]`. The default is a quarter of the layers. A split needs at least
+one layer on each side.
+
+## Choose the layers, not just the count
+
+A CPU attention layer is the worst case: its per-token cost grows with context and its K/V is the
+memory the split is trying to free. A gated-delta (GDN) layer is O(1) per token and has only a small
+device state. `gdn:N` therefore moves the first `N` GDN layers and leaves every attention layer on the
+GPU. An explicit layer set allows the same choice by hand.
+
+`auto` computes the smallest `gdn:`-style set that makes the requested context fit. It uses the
+pack's tensor sizes, the fp16 K/V of the attention layers the GPU keeps, the head, the f32 file and a
+scratch allowance. It refuses instead of splitting when the model already fits, and reports the
+missing amount when no split can fit. `auto:MiB` additionally asks the split to free that much
+headroom. `KINDI_TANDEM_RESERVE_MB` sets the free-memory reserve (default 512 MiB).
 
 ## Loading only the owned slice
 
