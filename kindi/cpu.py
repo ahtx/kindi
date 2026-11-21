@@ -4,8 +4,16 @@ The whole forward pass of a token runs in C (kcpu.c, one OpenMP parallel region 
 kindi.engine.Engine: reset(), feed(tok, pos), step(tok, pos) -> greedy token, generate(ids, n), logits in
 self.ylog[:self.ylog_n]. Loads a Kindi pack (kindi convert) and repacks the ternary weights into pair codes
 ("perm8": per 8-row block and 128-column group, 64 words of 32 bits; one vpermps gives 8 rows x 2 columns).
-kcpu.c is built on first use with gcc (-O3 -march=native -fopenmp) into KINDI_CPU_CACHE (default ~/.cache/kindi).
-Threads: OMP_NUM_THREADS (with OMP_PROC_BIND=close; on a two-socket host, the cores of one socket)."""
+kcpu.c is built on first use (-O3 -march=native -fopenmp) into KINDI_CPU_CACHE (default ~/.cache/kindi): gcc on
+Linux, and on Windows clang with the MSVC headers and libomp that its driver finds (KINDI_CC, KINDI_LLVM override).
+Threads: OMP_NUM_THREADS, or one per physical core of this process's CPUs by default (OMP_PROC_BIND=close,
+OMP_PLACES=cores). The physical-core default is the portable choice; 8 threads (two SMT pairs) can be
+faster under WSL2/libgomp on the 2B/9B, but 10/12 and native Windows 8 are slower. See
+docs/CPU-SUPPORT.md for the sweep and _configure_threads for the default.
+
+Tandem entry point: begin(tok) embeds a token, layer(il, pos) runs exactly one block, and head()
+returns the greedy token from the residual left by the last layer. The whole-model step() remains the
+single-region path; the per-layer calls are for handing one block to or from another backend."""
 import ctypes
 import json
 import os
@@ -62,6 +70,11 @@ def _lib():
     lib.kc_init()
     lib.kc_step.argtypes = [ctypes.POINTER(Model), ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.kc_step.restype = ctypes.c_int
+    lib.kc_embed.argtypes = [ctypes.POINTER(Model), ctypes.c_int]
+    lib.kc_layer.argtypes = [ctypes.POINTER(Model), ctypes.c_int, ctypes.c_int]
+    lib.kc_layer.restype = ctypes.c_int
+    lib.kc_head.argtypes = [ctypes.POINTER(Model)]
+    lib.kc_head.restype = ctypes.c_int
     assert lib.kc_sizeof_model() == ctypes.sizeof(Model) and lib.kc_sizeof_layer() == ctypes.sizeof(Layer)
     return lib
 
@@ -93,7 +106,7 @@ def _p(a, t=PF):
 
 
 class Engine(object):
-    def __init__(self, pack, ctx=4096, clusters=None, log=print, threads=None):
+    def __init__(self, pack, ctx=4096, clusters=None, log=print, threads=None, layers=None, embed=True, head=True):
         t0 = time.time()
         if threads:
             os.environ["OMP_NUM_THREADS"] = str(threads)
@@ -104,6 +117,7 @@ class Engine(object):
         self.HB = int(man.get("hadamard_block", 512))
         self.head_name = man.get("head", "token_embd.weight")
         D, NL, NFF = d["width"], d["layers"], d["ffn"]
+        self.D, self.NL = D, NL
         NH, NHKV, HD = d["heads"], d["kv_heads"], d["head_dim"]
         NK, HK = d["groups"], d["state_size"]
         NV = d["gdn_inner"] // HK
@@ -118,8 +132,24 @@ class Engine(object):
         def keep(a):
             self.keep.append(a)
             return a
+        def _wanted(name):
+            if self.layers is None:
+                return True
+            if name == "token_embd.weight":
+                return self.need_embed or (self.need_head and name == self.head_name)
+            if name == self.head_name:
+                return self.need_head
+            if name.startswith("blk."):
+                try:
+                    return int(name.split(".")[1]) in self.layers_set
+                except (IndexError, ValueError):
+                    return False
+            return False
+
         mats = {}
         for name, rec in bi.items():
+            if not _wanted(name):
+                continue
             R, C = rec["rows"], rec["ne0"]
             ns, G = C // 4, C // 128
             o, q = rec["bc_off"], rec["dpm_off"] // 2
@@ -137,6 +167,8 @@ class Engine(object):
         Ls = (Layer * NL)()
         self.M, self.conv, self.Kc, self.Vc = [], [], [], []
         for il in range(NL):
+            if self.layers is not None and il not in self.layers_set:
+                continue                    # unowned layer: zero Layer, never called on this backend
             p = "blk.%d." % il
             L = Ls[il]
             L.is_attn = int((il + 1) % interval == 0)
@@ -167,7 +199,9 @@ class Engine(object):
                      ("ctx", self.ctx), ("vocab", VOCAB)):
             setattr(m, k, v)
         m.L = ctypes.cast(Ls, ctypes.POINTER(Layer))
-        m.emb, m.head = mats["token_embd.weight"], mats[self.head_name]
+        _zero = Mat()
+        m.emb = mats["token_embd.weight"] if self.need_embed and "token_embd.weight" in mats else _zero
+        m.head = mats[self.head_name] if self.need_head and self.head_name in mats else _zero
         m.out_norm = f("output_norm.weight")
         m.sD, m.sV, m.sA, m.sF = (_p(sg(D)), _p(sg(NV * HK)), _p(sg(NH * HD)), _p(sg(NFF)))
         rh = d["rope_dim"] // 2
@@ -178,7 +212,8 @@ class Engine(object):
         sizes = {"h": D, "xn": D, "xp": W, "y": D, "qkv": CC, "zv": NV * HK, "cs": CC, "qk": 2 * NK * HK,
                  "gout": NV * HK, "outn": NV * HK, "m": W, "qn": NH * 2 * HD, "kr": NHKV * HD, "vv": NHKV * HD,
                  "qr": NH * HD, "kro": NHKV * HD, "sc": NH * self.ctx, "att": NH * HD, "ffg": NFF, "ffu": NFF,
-                 "T": W // 2 * 8, "logits": max(VOCAB, mats[self.head_name].R), "gb": NV, "gg": NV}
+                 "T": W // 2 * 8, "logits": max(VOCAB, mats[self.head_name].R if self.need_head and self.head_name in mats else VOCAB),
+                 "gb": NV, "gg": NV}
         for k in _SCR:
             a = z(sizes[k])
             setattr(m, k, _p(a))
@@ -186,6 +221,7 @@ class Engine(object):
                 self.logits = a
         m.red = _p(z(256, np.float64), ctypes.POINTER(ctypes.c_double))
         self.ylog, self.ylog_n, self.ylog_map = self.logits, VOCAB, None
+        self.hidden = np.ctypeslib.as_array(m.h, shape=(D,))   # in-place residual for a tandem handoff
         self.hsl, self.shortlist = None, 0
         self.shortlist = 0
         self.vocab = json.load(open(os.path.join(pack, "vocab.json")))
@@ -196,6 +232,32 @@ class Engine(object):
         for a in self.M + self.conv + self.Kc + self.Vc:
             a.fill(0)
 
+    def begin(self, tok):
+        """Embed one token into self.hidden; the next layer() call starts layer 0."""
+        self.lib.kc_embed(ctypes.byref(self.m), int(tok))
+
+    def layer(self, il, pos):
+        """Run exactly one block on self.hidden (the complete residual entering the layer)."""
+        il, pos = int(il), int(pos)
+        if not 0 <= il < self.NL:
+            raise IndexError("layer %d is outside 0..%d" % (il, self.NL - 1))
+        if not 0 <= pos < self.ctx:
+            raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
+        if self.lib.kc_layer(ctypes.byref(self.m), il, pos):
+            raise ValueError("kindi: the CPU layer entry point rejected layer %d" % il)
+
+    def feed_layers(self, tok, pos):
+        """The per-layer equivalent of feed(): embed then run every block."""
+        if pos >= self.ctx:
+            raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
+        self.begin(tok)
+        for il in range(self.NL):
+            self.layer(il, pos)
+
+    def head(self):
+        """Greedy token from the residual left by the last layer (or by begin() plus layers)."""
+        return int(self.lib.kc_head(ctypes.byref(self.m)))
+
     def feed(self, tok, pos):
         if pos >= self.ctx:
             raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
@@ -205,6 +267,22 @@ class Engine(object):
         if pos >= self.ctx:
             raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
         return self.lib.kc_step(ctypes.byref(self.m), int(tok), int(pos), 1)
+
+    def step_layers(self, tok, pos):
+        """The per-layer equivalent of step(): embed, every block, then the exact head."""
+        self.feed_layers(tok, pos)
+        return self.head()
+
+    def set_hidden(self, values):
+        """Copy a residual from another backend into the CPU layer input."""
+        x = np.asarray(values, dtype=F32)
+        if x.shape != (self.D,):
+            raise ValueError("hidden state has shape %r, expected (%d,)" % (x.shape, self.D))
+        np.copyto(self.hidden, x)
+
+    def get_hidden(self):
+        """A copy of the residual left by the last layer/head."""
+        return self.hidden.copy()
 
     def generate(self, ids, n):
         self.reset()
