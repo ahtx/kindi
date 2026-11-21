@@ -1,4 +1,5 @@
-"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model and its real context (context_length, max_model_len, meta.n_ctx)\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls;\n                               dry_run=true -> the exact prompt_tokens, no generation\n  POST /v1/tokenize            {"content": text} or {"messages": [...], "tools": [...]} -> count, tokens\n  POST /v1/detokenize          {"tokens": [...]} -> text\n\nA prompt that does not fit is an HTTP 400 (code context_length_exceeded, OpenAI's wording) before the request waits\nfor the engine. A stream gets an SSE comment ": kindi progress {...}" every KINDI_KEEPALIVE_S (10) seconds while\nnothing else goes out; kindi_keepalive=true gives a non-streaming request spaces before its JSON. After each answer\nthe end-of-turn state is saved to disk in the background (turn_save, see cache.Turns).\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking); a stream then carries the thinking as\ndelta.reasoning_content. thinking_budget_tokens (or thinking_budget) caps it: at the budget the server closes the\nthinking itself and the model goes on to answer. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
+"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model and its real context (context_length, max_model_len, meta.n_ctx)\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls;\n                               dry_run=true -> the exact prompt_tokens, no generation\n  POST /v1/tokenize            {"content": text} or {"messages": [...], "tools": [...]} -> count, tokens\n  POST /v1/detokenize          {"tokens": [...]} -> text
+  POST /v1/messages            Anthropic Messages API over the same chat path (stateless; streaming supported)\n\nA prompt that does not fit is an HTTP 400 (code context_length_exceeded, OpenAI's wording) before the request waits\nfor the engine. A stream gets an SSE comment ": kindi progress {...}" every KINDI_KEEPALIVE_S (10) seconds while\nnothing else goes out; kindi_keepalive=true gives a non-streaming request spaces before its JSON. After each answer\nthe end-of-turn state is saved to disk in the background (turn_save, see cache.Turns).\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking); a stream then carries the thinking as\ndelta.reasoning_content. thinking_budget_tokens (or thinking_budget) caps it: at the budget the server closes the\nthinking itself and the model goes on to answer. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
 import asyncio
 import codecs
 import concurrent.futures
@@ -11,6 +12,8 @@ import uuid
 import numpy as np
 
 from . import COMMIT, __version__, chat
+from .api import messages as messages_api
+from .api.body import RequestTooLarge, read_json_body
 from .cache import Cancelled, Runner
 from .engine import EOS
 from .sampling import Sampler
@@ -821,6 +824,7 @@ def create_app(cfg, log=print):
         globals()["GPU_THREAD"] = concurrent.futures.ThreadPoolExecutor(max_workers=len(K.slot_views) + 1,
                                                                         thread_name_prefix="kindi-slot")
     model_id = cfg["model_name"]
+    body_limit = max(1, int(cfg.get("max_body_mb", 16))) << 20  # adapter route; admission extends this to chat/tokenize
     app = FastAPI(title="Kindi", version=__version__)
 
     def _err(code, msg, typ="invalid_request_error"):
@@ -1162,6 +1166,161 @@ def create_app(cfg, log=print):
         # the save of the turn's end state runs on the engine thread after this answer is sent, before the next request
         SCHED.submit(K.after_turn, PRIO_TURN)
         return answer(info)
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(request: Request):
+        """Anthropic Messages API: stateless translation over the chat path."""
+        key = cfg["api_key"]
+        if key and not (_auth(request) or request.headers.get("x-api-key", "") == key):
+            return JSONResponse({"type": "error", "error": {
+                "type": "authentication_error", "message": "invalid API key"}}, status_code=401)
+        try:
+            body = await read_json_body(request, body_limit)
+        except RequestTooLarge as e:
+            return JSONResponse({"type": "error", "error": {
+                "type": "request_too_large", "message": str(e)}}, status_code=413)
+        except ValueError as e:
+            return JSONResponse({"type": "error", "error": {
+                "type": "invalid_request_error", "message": str(e)}}, status_code=400)
+        try:
+            req = messages_api.to_chat(body)
+        except ValueError as e:
+            return JSONResponse({"type": "error", "error": {
+                "type": "invalid_request_error", "message": str(e)}}, status_code=400)
+        try:
+            ids = await asyncio.get_event_loop().run_in_executor(None, K.check_prompt, req)
+        except ContextOverflow as e:
+            return JSONResponse({"type": "error", "error": {
+                "type": "invalid_request_error", "message": str(e)}}, status_code=400)
+        except ValueError as e:
+            return JSONResponse({"type": "error", "error": {
+                "type": "invalid_request_error", "message": str(e)}}, status_code=400)
+
+        cancel = threading.Event()
+        prio = priority_of(req, request.headers)
+        message_id = messages_api._message_id()
+
+        def run():
+            with K.lock:
+                info = None
+                for kind, val in run_generate(K, req, cancel, prio):
+                    if kind == "done":
+                        info = val
+                return info
+
+        if body.get("stream"):
+            def _sse():
+                start = {"id": message_id, "type": "message", "role": "assistant", "model": model_id,
+                         "content": [], "stop_reason": None, "stop_sequence": None,
+                         "usage": {"input_tokens": len(ids or []), "output_tokens": 0,
+                                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+                yield messages_api.event("message_start", {"type": "message_start", "message": start})
+                text_open = False
+                info = None
+                try:
+                    with K.lock:
+                        for kind, val in run_generate(K, req, cancel, prio):
+                            if kind == "text":
+                                if not text_open:
+                                    text_open = True
+                                    yield messages_api.event("content_block_start", {
+                                        "type": "content_block_start", "index": 0,
+                                        "content_block": {"type": "text", "text": ""}})
+                                yield messages_api.event("content_block_delta", {
+                                    "type": "content_block_delta", "index": 0,
+                                    "delta": {"type": "text_delta", "text": val}})
+                            elif kind == "done":
+                                info = val
+                    if info is None:
+                        yield messages_api.event("error", {"type": "error", "error": {
+                            "type": "api_error", "message": "request cancelled"}})
+                        return
+                    final = messages_api.message_object(info, model_id, message_id)
+                    blocks = final["content"]
+                    if text_open:
+                        yield messages_api.event("content_block_stop", {"type": "content_block_stop", "index": 0})
+                        start_index = 1
+                    else:
+                        start_index = 0
+                        if blocks and blocks[0]["type"] == "text":
+                            yield messages_api.event("content_block_start", {
+                                "type": "content_block_start", "index": 0,
+                                "content_block": {"type": "text", "text": ""}})
+                            yield messages_api.event("content_block_stop", {
+                                "type": "content_block_stop", "index": 0})
+                            start_index = 1
+                    for i, block in enumerate(blocks[start_index:], start_index):
+                        if block["type"] == "tool_use":
+                            yield messages_api.event("content_block_start", {
+                                "type": "content_block_start", "index": i,
+                                "content_block": {"type": "tool_use", "id": block["id"],
+                                                  "name": block["name"], "input": {}}})
+                            yield messages_api.event("content_block_delta", {
+                                "type": "content_block_delta", "index": i,
+                                "delta": {"type": "input_json_delta",
+                                          "partial_json": json.dumps(block["input"], ensure_ascii=False)}})
+                            yield messages_api.event("content_block_stop", {
+                                "type": "content_block_stop", "index": i})
+                    yield messages_api.event("message_delta", {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": final["stop_reason"], "stop_sequence": None},
+                        "usage": {"output_tokens": final["usage"]["output_tokens"]}})
+                    yield messages_api.event("message_stop", {"type": "message_stop"})
+                except Exception as e:  # noqa: BLE001
+                    _after_engine_error(K, e)
+                    yield messages_api.event("error", {"type": "error", "error": {
+                        "type": "api_error", "message": "kindi: %s" % e}})
+                finally:
+                    if not cancel.is_set():
+                        K.after_turn(locked=True)
+
+            async def relay():
+                loop = asyncio.get_event_loop()
+                q = asyncio.Queue()
+                END = object()
+
+                def pump():
+                    try:
+                        for item in _sse():
+                            loop.call_soon_threadsafe(q.put_nowait, item)
+                    finally:
+                        loop.call_soon_threadsafe(q.put_nowait, END)
+
+                fut = asyncio.wrap_future(SCHED.submit(pump, prio))
+                try:
+                    while True:
+                        item = await q.get()
+                        if item is END:
+                            break
+                        yield item
+                finally:
+                    cancel.set()
+                    await asyncio.wait([fut], timeout=30)
+
+            return StreamingResponse(relay(), media_type="text/event-stream")
+
+        try:
+            fut = asyncio.wrap_future(SCHED.submit(run, prio))
+            while not fut.done():
+                done, _ = await asyncio.wait([fut], timeout=1.0)
+                if not done and await request.is_disconnected():
+                    cancel.set()
+            info = fut.result()
+            if info is None:
+                return JSONResponse({"type": "error", "error": {
+                    "type": "api_error", "message": "request cancelled"}}, status_code=499)
+        except ContextOverflow as e:
+            return JSONResponse({"type": "error", "error": {
+                "type": "invalid_request_error", "message": str(e)}}, status_code=400)
+        except ValueError as e:
+            return JSONResponse({"type": "error", "error": {
+                "type": "invalid_request_error", "message": str(e)}}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            _after_engine_error(K, e)
+            return JSONResponse({"type": "error", "error": {
+                "type": "api_error", "message": "kindi: %s" % e}}, status_code=500)
+        SCHED.submit(K.after_turn, PRIO_TURN)
+        return messages_api.message_object(info, model_id, message_id)
 
     return app
 

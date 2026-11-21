@@ -28,6 +28,7 @@ Kindi reads its settings in this order - later sources win:
 | `port` | `8093` | |
 | `api_key` | (empty) | if set, every `/v1` request needs `Authorization: Bearer <api_key>`; `/health` stays open |
 | `model_name` | `auto` | the model id `/v1/models` reports; `auto` takes it from the pack (bonsai2-2b, bonsai2-4b or bonsai2-9b); clients may send any model name |
+| `max_body_mb` | `16` | largest JSON body accepted by `/v1/messages`; a larger body returns `413` before the engine is touched. The admission PR extends the same cap to chat and tokenize |
 
 ### Engine
 
@@ -67,6 +68,7 @@ Notes:
 | `POST /v1/tokenize` (also `/tokenize`) | `{"content": text}` counts plain text. `{"messages": [...], "tools": [...]}` counts the whole chat prompt, as the chat endpoint builds it. The answer is `count`, `tokens`, `max_model_len` and `fits` |
 | `POST /v1/detokenize` (also `/detokenize`) | `{"tokens": [...]}` gives the text (`prompt` and `content`) |
 | `POST /v1/chat/completions` with `"dry_run": true` | the exact `usage.prompt_tokens` and `fits`, without generation |
+| `POST /v1/messages` | Anthropic Messages shape (text, tool_use/tool_result, `x-api-key`) over the same chat path, including `stream: true` |
 
 A prompt that does not fit gets HTTP 400 at once, also while another request uses the engine. The body is
 `{"error": {"code": "context_length_exceeded", "type": "invalid_request_error", "message": "This model's maximum
