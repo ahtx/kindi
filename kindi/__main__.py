@@ -9,7 +9,9 @@
   kindi head exact|fast         choose the output head of a running server (next request, no restart)
   kindi info                    show the configuration, the pack and the GPU
 Global options: --config FILE, --pack DIR, --state-dir DIR, --ctx N.
-Tandem: verify/bench/serve/chat accept --tandem cpu-first|gpu-first --tandem-cpu-layers N."""
+Tandem: verify/bench/serve/chat accept --tandem cpu-first|gpu-first --tandem-cpu-layers N|LIST|gdn:N,
+where LIST is an explicit layer set (0,1,2,4 or 0-2,4-6) and gdn:N moves the first N gated-delta
+(non-attention) layers to the CPU, which keeps decode flat with context."""
 import argparse
 import json
 import os
@@ -187,8 +189,12 @@ def _tandem_args(s):
     """The dense CPU+GPU split flags, available on the commands that build an engine."""
     s.add_argument("--tandem", choices=("off", "cpu-first", "gpu-first"), default=None,
                    help="split the Bonsai layers between the CPU and one GPU (default: off)")
-    s.add_argument("--tandem-cpu-layers", type=int, default=None,
-                   help="layers the CPU owns in a tandem split (default: a quarter of the model)")
+    s.add_argument("--tandem-cpu-layers", default=None,
+                   help="layers the CPU owns in a tandem split: a count (cpu-first prefix / "
+                        "gpu-first suffix), an explicit list such as 0,1,2,4,5,6 / 0-2,4-6, "
+                        "gdn:N (the first N non-attention layers) or auto[:MiB] (the smallest "
+                        "set that makes the context fit, or refuse when no split is needed) "
+                        "(default: a quarter of the model)")
 
 
 def main(argv=None):

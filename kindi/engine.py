@@ -259,7 +259,11 @@ class Engine(object):
             _chunk1.reserve(self)                  # the chunked prompt path's buffers, before the context fit
         else:
             self.batch_max = 1                     # a tandem engine feeds one token per backend call
-        per_pos = (self.NATT * 2 * self.NHKV * self.HD * 2 + self.NH * 4 + (self.NH * self.HD * 4) // 256
+        # Only the attention layers this engine owns hold K/V here. A tandem's GPU owner loads a subset, so
+        # charging it for every layer of the model reduced the context more than the memory actually allowed
+        # (the 27B at 24,576 with 8 CPU layers was cut to 17,664 tokens that way).
+        owned_attn = self.NATT if self._full_layers else sum(1 for il in self.layers if il in self._kvi)
+        per_pos = (owned_attn * 2 * self.NHKV * self.HD * 2 + self.NH * 4 + (self.NH * self.HD * 4) // 256
                    + self.dims["rope_dim"] * 4)
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         budget = free - int(os.environ.get("KINDI_MEM_RESERVE_MB", "96")) * 2 ** 20
