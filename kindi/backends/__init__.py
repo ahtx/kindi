@@ -20,6 +20,7 @@ from .registry import (
     unregister_backend,
 )
 from .fake import FakeBackend
+from .gemma4 import Gemma4Backend
 
 __all__ = [
     "Backend",
@@ -27,6 +28,7 @@ __all__ = [
     "BackendNotFound",
     "BackendUnavailable",
     "CancelToken",
+    "Gemma4Backend",
     "FakeBackend",
     "GenerationEvent",
     "SamplingParams",
