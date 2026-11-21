@@ -286,6 +286,8 @@ class Kindi(object):
         kw=dict(req.get("chat_template_kwargs") or {})
         kw["enable_thinking"]=bool(kw.get("enable_thinking",req.get("enable_thinking",False)))
         kw["conversational_mode"]=bool(kw.get("conversational_mode",False))
+        if is_structured(req.get("response_format") or {}):
+            kw["enable_thinking"]=False       # a structured reply is the whole reply
         prompt=render_gemma(self.model_path,messages,tools,kw,True)
         jgrammar=jstate=None
         rf=req.get("response_format") or {}
@@ -513,6 +515,8 @@ class Kindi(object):
         if req.get("tool_choice") == "none":
             tools = None
         think = bool((req.get("chat_template_kwargs") or {}).get("enable_thinking", req.get("enable_thinking", False)))
+        if grammar is not None:
+            think = False                                          # a structured reply is the whole reply
         budget = req.get("thinking_budget_tokens") or req.get("thinking_budget") or cfg.get("thinking_budget") or 0
         budget = int(budget) if think else 0
         g = lambda k, d: d if req.get(k) is None else req.get(k)  # noqa: E731

@@ -347,6 +347,22 @@ def test_sampler_empty_allowed_intersection_is_a_loud_error():
         Sampler(_ConstrainedHostEngine())(0, 0.0, 1.0, 0, None, allowed=[])
 
 
+def test_structured_output_does_not_enter_the_thinking_channel(app_client):
+    client, K = app_client
+    schema = {"type": "object", "properties": {"a": {"type": "string"}},
+              "required": ["a"]}
+    doc = '{"a": "ok"}'
+    K.generate = _constrained_kindi([ord(c) for c in doc] + [248046]).generate
+    r = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64, "temperature": 0.0, "top_p": 1.0, "top_k": 0,
+        "enable_thinking": True,
+        "response_format": {"type": "json_schema", "json_schema": {"schema": schema}},
+    })
+    assert r.status_code == 200, r.text
+    assert json.loads(r.json()["choices"][0]["message"]["content"]) == {"a": "ok"}
+
+
 def test_gemma_json_schema_is_constrained(monkeypatch):
     # The top logit is always on '<' (never grammar-legal); the pick must skip it.
     from kindi import gemma4_chat
