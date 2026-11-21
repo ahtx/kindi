@@ -12,6 +12,7 @@ import numpy as np
 
 from . import COMMIT, __version__, chat
 from .cache import Cancelled, Runner
+from .constrained import STRUCTURED_TYPES, is_structured
 from .engine import EOS
 from .sampling import Sampler
 
@@ -33,6 +34,96 @@ class ContextOverflow(OverflowError):
         OverflowError.__init__(self, "This model's maximum context length is %d tokens. However, your messages "
                                "resulted in %d tokens (%d are needed for the reply to start). Please reduce the length "
                                "of the messages." % (self.ctx, self.n, self.n + reserve))
+
+
+class RequestError(ValueError):
+    """A malformed client request: a 400 whose envelope names the request field at fault."""
+
+    def __init__(self, msg, param=None):
+        ValueError.__init__(self, msg)
+        self.param = param
+
+
+def _response_format_schema(response_format):
+    """The JSON schema inside a json_schema response_format, or None.
+
+    Accepts the OpenAI wrapper {"type": "json_schema", "json_schema": {"name": ...,
+    "schema": {...}}} and the bare {"schema": {...}} shape; a json_schema payload
+    whose keys are not the wrapper is taken as the schema itself.
+    """
+    js = response_format.get("json_schema")
+    if not isinstance(js, dict):
+        return None
+    if isinstance(js.get("schema"), dict):
+        return js["schema"]
+    if set(js) <= {"schema", "name", "strict"}:
+        return None
+    return js
+
+
+def _response_format_grammar(response_format, req=None):
+    """Build the decode grammar for a response_format (validation compiled it already)."""
+    parked = req.get("_grammar") if isinstance(req, dict) else None
+    if parked is not None:
+        return parked
+    from .jsongrammar import grammar_from_schema, json_object_grammar
+
+    if response_format.get("type") == "json_object":
+        return json_object_grammar()
+    if response_format.get("type") == "grammar":
+        from .gbnf import Grammar
+
+        return Grammar.from_string(response_format.get("grammar") or "")
+    return grammar_from_schema(_response_format_schema(response_format))
+
+
+def _validate_response_format(req):
+    """Validate the request-level response_format contract before the engine runs.
+
+    The grammar is compiled here and parked on the request, so generation reuses the
+    automaton instead of paying for the same compilation twice. A refusal is a 400
+    naming response_format; it never reaches the prompt cache.
+    """
+    response_format = req.get("response_format")
+    if response_format is None:
+        return
+    if not isinstance(response_format, dict):
+        raise RequestError("response_format must be an object", param="response_format")
+    rtype = response_format.get("type")
+    if not isinstance(rtype, str):
+        raise RequestError("response_format.type must be a string", param="response_format")
+    if rtype == "text":
+        return
+    if rtype not in STRUCTURED_TYPES:
+        raise RequestError(
+            "structured output (response_format type %r) is not supported; use text, "
+            "json_object, json_schema or grammar" % rtype, param="response_format")
+    if req.get("tools"):
+        raise RequestError("tools are not supported together with structured output",
+                           param="response_format")
+    if rtype == "grammar":
+        grammar_text = response_format.get("grammar")
+        if not isinstance(grammar_text, str) or not grammar_text.strip():
+            raise RequestError(
+                "a grammar response_format needs a non-empty \"grammar\" string (GBNF)",
+                param="response_format")
+        from .gbnf import Grammar
+
+        try:
+            req["_grammar"] = Grammar.from_string(grammar_text)
+        except ValueError as e:
+            raise RequestError("invalid grammar: %s" % e, param="response_format")
+    elif rtype == "json_schema":
+        schema = _response_format_schema(response_format)
+        if schema is None:
+            raise RequestError("json_schema must be an object with a \"schema\" object",
+                               param="response_format")
+        from .jsongrammar import grammar_from_schema
+
+        try:
+            req["_grammar"] = grammar_from_schema(schema)
+        except ValueError as e:
+            raise RequestError("invalid JSON schema: %s" % e, param="response_format")
 
 
 def _looping(gen, min_span=240):
@@ -119,6 +210,10 @@ class Kindi(object):
             self.tok = Tok(self.eng.vocab, os.path.join(pack, "merges.txt"))
             self.runner = Runner(self.eng, cfg, self.pack_id, log, progress=self.busy)
             self.sample = Sampler(self.eng)
+        # The dense and Gemma 4 paths implement constrained sampling. Lightning and Nanbeige
+        # still need a token filter in their backend adapters; until then the route refuses
+        # structured output for them instead of silently returning unconstrained text.
+        self.supports_json_grammar = self.variant in ("qwen35", "bonsai27", "gemma4")
         self.lock = threading.RLock()        # reentrant: a background request runs waiting chat requests inside its own turn
         self.stats = {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
         self.t0 = time.time()
@@ -140,13 +235,13 @@ class Kindi(object):
             return "exact"
         return m
 
-    def _pick(self, nxt, temperature, top_p, top_k, rng, min_p=0.0, penalty=None):
+    def _pick(self, nxt, temperature, top_p, top_k, rng, min_p=0.0, penalty=None, allowed=None):
         """the next token: already drawn by speculative sampling, or sampled now"""
         ps = getattr(self.eng, "spec_presampled", None)
         if ps is not None:
             self.eng.spec_presampled = None
             return ps
-        return self.sample(nxt, temperature, top_p, top_k, rng, min_p, penalty)
+        return self.sample(nxt, temperature, top_p, top_k, rng, min_p, penalty, allowed=allowed)
 
     def _g4_text(self,token):
         return self.tok.decode_bytes(token).decode("utf-8","replace")
@@ -167,6 +262,21 @@ class Kindi(object):
                 return Sampler._pick(cand,sc,temperature,top_p,top_k,rng)
         return int(self.cp.argmax(logits).item())
 
+    def _g4_json_token(self,logits,grammar,gstate,temperature,top_p,top_k,rng):
+        """The next token inside a structured-output reply: the best grammar-legal one,
+        from the full vocabulary, so the finished reply parses against the schema by
+        construction (the same allowed-set rule as the dense path)."""
+        if not hasattr(self,"_grammar_texts"):
+            self._grammar_texts=[self.tok.decode_bytes(i).decode("utf-8","replace") for i in range(len(self.tok.tokens))]
+        allowed=grammar.vocab_allowed(gstate,self._grammar_texts)
+        if grammar.done(gstate):
+            allowed=np.concatenate([allowed,np.array(sorted(self.tok.stop_ids),dtype=np.int64)])
+        if allowed.size==0:
+            raise RuntimeError("structured-output grammar allowed no token")
+        scores=self.cp.asnumpy(logits)[allowed]
+        if temperature<=0: return int(allowed[int(np.argmax(scores))])
+        return Sampler._pick(allowed,scores.astype(np.float64),temperature,top_p,top_k,rng)
+
     def _generate_gemma(self,req,cancel=None):
         from .gemma4_chat import render as render_gemma
         from . import gemma4_tools
@@ -177,7 +287,13 @@ class Kindi(object):
         kw["enable_thinking"]=bool(kw.get("enable_thinking",req.get("enable_thinking",False)))
         kw["conversational_mode"]=bool(kw.get("conversational_mode",False))
         prompt=render_gemma(self.model_path,messages,tools,kw,True)
-        thinking_open=prompt.endswith(gemma4_tools.THINK_OPEN+"thought\n")   # after a tool response, thinking on
+        jgrammar=jstate=None
+        rf=req.get("response_format") or {}
+        if is_structured(rf):
+            jgrammar=_response_format_grammar(rf, req); jstate=jgrammar.start()
+            thinking_open=False     # a structured reply is the whole reply: it never enters a thought channel
+        else:
+            thinking_open=prompt.endswith(gemma4_tools.THINK_OPEN+"thought\n")   # after a tool response, thinking on
         sorter=gemma4_tools.Stream(thinking_open)
         ids=self.tok.encode(prompt)
         if not ids: raise ValueError("Gemma 4 chat template produced an empty prompt")
@@ -233,7 +349,9 @@ class Kindi(object):
             for n in range(max_new):
                 if cancel is not None and cancel.is_set():
                     finish="stop"; break
-                if gst is not None:
+                if jgrammar is not None:
+                    token=self._g4_json_token(logits,jgrammar,jstate,temperature,top_p,top_k,rng)
+                elif gst is not None:
                     token=self._g4_call_token(logits,grammar,gst,temperature,top_p,top_k,rng)
                 elif temperature<=0:
                     token=int(self.cp.argmax(logits).item())
@@ -262,6 +380,11 @@ class Kindi(object):
                     logits=self.eng.forward(token,len(ids)+n); self.g4cache.append(token)
                 piece=decoder.decode(self.tok.decode_bytes(token))
                 text+=piece
+                if jgrammar is not None:
+                    advanced=jgrammar.advance(jstate,self._g4_text(token))
+                    if advanced is None:
+                        raise RuntimeError("structured-output grammar rejected a token it had allowed")
+                    jstate=advanced
                 hit=next((x for x in stop if x and x in text),None)
                 if hit:
                     text=text[:text.index(hit)]; finish="stop"; break
@@ -375,6 +498,15 @@ class Kindi(object):
             return (yield from self.nanbeige.generate(self, req, cancel))
         if self.native:
             return (yield from self._generate_gemma(req, cancel))
+        grammar = None
+        gstate = None
+        rf = req.get("response_format")
+        if is_structured(rf):
+            grammar = _response_format_grammar(rf, req)
+            gstate = grammar.start()
+            if not hasattr(self, "_grammar_texts"):
+                self._grammar_texts = [self.tok.decode_bytes(i).decode("utf-8", "replace")
+                                        for i in range(len(self.tok.vocab))]
         cfg = self.cfg
         messages = req.get("messages") or []
         tools = req.get("tools") or None
@@ -434,7 +566,7 @@ class Kindi(object):
         self.busy["phase"] = "generating"
         pen = rp != 1.0 and rlast != 0
         if hasattr(self.eng, "spec_begin"):
-            if pen:                                            # the speculative paths do not apply it: no drafts
+            if pen or grammar is not None:                     # the speculative paths do not apply these: no drafts
                 self.eng.spec_begin(False)
             else:                                              # speculative decoding (KINDI_SPEC), min-p included
                 self.eng.spec_begin(temperature <= 0, temperature, top_p, top_k, rng, min_p)
@@ -467,7 +599,12 @@ class Kindi(object):
 
         # repeat_penalty: over the last repeat_last_n tokens of the prompt and the reply (-1: all of them)
         recent = lambda: (rp, set((T + gen)[-rlast:] if rlast > 0 else T + gen)) if pen else None  # noqa: E731
-        tok = self.sample(nxt, temperature, top_p, top_k, rng, min_p, recent())
+        allowed = None
+        if grammar is not None:
+            allowed = grammar.vocab_allowed(gstate, self._grammar_texts)
+            if grammar.done(gstate):
+                allowed = np.concatenate([allowed, np.array(EOS, dtype=np.int64)])
+        tok = self.sample(nxt, temperature, top_p, top_k, rng, min_p, recent(), allowed=allowed)
         try:
             while True:
                 if cancel is not None and cancel.is_set():
@@ -480,6 +617,12 @@ class Kindi(object):
                 self.busy["generated"] = len(gen)
                 piece = dec.decode(self.tok.decode_bytes(tok))
                 text += piece
+                if grammar is not None:
+                    advanced = grammar.advance(gstate, piece)
+                    if advanced is None:
+                        raise RuntimeError(
+                            "constrained grammar rejected token %r it had allowed" % piece)
+                    gstate = advanced
                 hit = None if st["think"] else next((s for s in stops if s and s in text), None)
                 if hit:
                     text = text[:text.index(hit)]
@@ -508,7 +651,12 @@ class Kindi(object):
                         for item in route(piece):
                             yield item
                         nxt = self.runner.step(ft)
-                tok = self._pick(nxt, temperature, top_p, top_k, rng, min_p, recent())
+                allowed = None
+                if grammar is not None:
+                    allowed = grammar.vocab_allowed(gstate, self._grammar_texts)
+                    if grammar.done(gstate):
+                        allowed = np.concatenate([allowed, np.array(EOS, dtype=np.int64)])
+                tok = self._pick(nxt, temperature, top_p, top_k, rng, min_p, recent(), allowed=allowed)
         finally:
             sp = self.eng.spec_end() if hasattr(self.eng, "spec_end") else None
             self.busy["active"] = False
@@ -692,8 +840,11 @@ def create_app(cfg, log=print):
     model_id = cfg["model_name"]
     app = FastAPI(title="Kindi", version=__version__)
 
-    def _err(code, msg, typ="invalid_request_error"):
-        return JSONResponse({"error": {"message": msg, "type": typ, "code": typ}}, status_code=code)
+    def _err(code, msg, typ="invalid_request_error", param=None):
+        error = {"message": msg, "type": typ, "code": typ}
+        if param is not None:
+            error["param"] = param
+        return JSONResponse({"error": error}, status_code=code)
 
     def _auth(request):
         key = cfg["api_key"]
@@ -778,6 +929,13 @@ def create_app(cfg, log=print):
             req = await request.json()
         except Exception:  # noqa: BLE001
             return _err(400, "the body is not JSON")
+        try:
+            _validate_response_format(req)
+        except RequestError as e:
+            return _err(400, str(e), param=e.param)
+        if is_structured(req.get("response_format") or {}) and not getattr(K, "supports_json_grammar", False):
+            return _err(400, "structured output (response_format) is not supported by the %s backend"
+                        % getattr(K, "variant", ""), param="response_format")
         cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
         # every request is counted before it waits for the engine: a prompt that does not fit gets its HTTP 400 at
         # once (a queued request used to wait for the request ahead of it, then fail), and a dry run ends here
