@@ -18,6 +18,20 @@ deterministic fake backend and `kindi backends`. The existing engine families
 
 are ported in follow-up adapter PRs.
 
+## Built-in adapters
+
+The five family adapters are stacked PRs on this contract; the contract alone
+registers only `FakeBackend`. Their status here is CPU-test verification only:
+none of the adapter PRs ran a GPU gate, and no verify/bench parity is claimed.
+
+| adapter | model id | GPU-gate status |
+|---|---|---|
+| Bonsai (`kindi/backends/bonsai.py`) | `bonsai2-*` | Not run for the adapter; CPU tests only. The legacy engine's earlier evidence is not an adapter gate. |
+| Gemma 4 (`kindi/backends/gemma4.py`) | `gemma4-e4b` | Blocked: no Gemma 4 pack on the host. CPU tests only; no GPU run. |
+| Nemotron Lightning (`kindi/backends/lightning.py`) | `nemotron-lightning-30b` | Not run in the adapter PR. CPU tests only; no verify/bench parity. |
+| Nanbeige (`kindi/backends/nanbeige.py`) | `nanbeige-33b` | Blocked: the catalog GGUF is corrupt. CPU tests only; no GPU run. |
+| DeepSeek V4.1 (`kindi/backends/dsv41.py`) | `deepseek-v41-flash` | Blocked: no V4.1 weights. CPU tests only; no GPU run. |
+
 
 
 ## The contract
