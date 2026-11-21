@@ -1,0 +1,91 @@
+{
+  "mismatch_count": 0,
+  "ok": true,
+  "rows": [
+    {
+      "first_difference": null,
+      "model": "2b",
+      "position": 100,
+      "result": "exact",
+      "side": "stock"
+    },
+    {
+      "first_difference": null,
+      "model": "2b",
+      "position": 2000,
+      "result": "exact",
+      "side": "stock"
+    },
+    {
+      "first_difference": null,
+      "model": "2b",
+      "position": 8000,
+      "result": "exact",
+      "side": "stock"
+    },
+    {
+      "first_difference": null,
+      "model": "2b",
+      "position": 100,
+      "result": "exact",
+      "side": "fork"
+    },
+    {
+      "first_difference": null,
+      "model": "2b",
+      "position": 2000,
+      "result": "exact",
+      "side": "fork"
+    },
+    {
+      "first_difference": null,
+      "model": "2b",
+      "position": 8000,
+      "result": "exact",
+      "side": "fork"
+    },
+    {
+      "first_difference": null,
+      "model": "9b",
+      "position": 100,
+      "result": "exact",
+      "side": "stock"
+    },
+    {
+      "first_difference": null,
+      "model": "9b",
+      "position": 2000,
+      "result": "exact",
+      "side": "stock"
+    },
+    {
+      "first_difference": null,
+      "model": "9b",
+      "position": 8000,
+      "result": "exact",
+      "side": "stock"
+    },
+    {
+      "first_difference": null,
+      "model": "9b",
+      "position": 100,
+      "result": "exact",
+      "side": "fork"
+    },
+    {
+      "first_difference": null,
+      "model": "9b",
+      "position": 2000,
+      "result": "exact",
+      "side": "fork"
+    },
+    {
+      "first_difference": null,
+      "model": "9b",
+      "position": 8000,
+      "result": "exact",
+      "side": "fork"
+    }
+  ],
+  "rows_exact": 12
+}
