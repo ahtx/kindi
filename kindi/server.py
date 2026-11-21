@@ -11,6 +11,7 @@ import uuid
 import numpy as np
 
 from . import COMMIT, __version__, chat
+from .admission import Gate, QueueFull, RateLimiter, RequestTooLarge
 from .cache import Cancelled, Runner
 from .engine import EOS
 from .sampling import Sampler
@@ -33,6 +34,28 @@ class ContextOverflow(OverflowError):
         OverflowError.__init__(self, "This model's maximum context length is %d tokens. However, your messages "
                                "resulted in %d tokens (%d are needed for the reply to start). Please reduce the length "
                                "of the messages." % (self.ctx, self.n, self.n + reserve))
+
+
+async def _read_json_body(request, limit):
+    """Read a JSON body without ever buffering more than ``limit`` bytes."""
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            if int(declared) > limit:
+                raise RequestTooLarge("the request body exceeds %d bytes" % limit)
+        except ValueError:
+            raise RequestTooLarge("the request has an invalid Content-Length")
+    chunks = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise RequestTooLarge("the request body exceeds %d bytes" % limit)
+        chunks.append(chunk)
+    try:
+        return json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError("the body is not JSON")
 
 
 def _looping(gen, min_span=240):
@@ -821,6 +844,9 @@ def create_app(cfg, log=print):
         globals()["GPU_THREAD"] = concurrent.futures.ThreadPoolExecutor(max_workers=len(K.slot_views) + 1,
                                                                         thread_name_prefix="kindi-slot")
     model_id = cfg["model_name"]
+    gate = Gate(cfg.get("queue_max", 8))
+    limiter = RateLimiter(cfg.get("rate_limit_per_min", 0))
+    body_limit = max(1, int(cfg.get("max_body_mb", 16))) << 20
     app = FastAPI(title="Kindi", version=__version__)
 
     def _err(code, msg, typ="invalid_request_error"):
@@ -859,6 +885,16 @@ def create_app(cfg, log=print):
                 "prompt_read": "%d/%d" % (b["read"], b["prompt_tokens"] - b["cached"]), "generated": b["generated"]}
 
     mem = [0.0, 0, 0]   # (time, free, total): memGetInfo at most once a second, however often /health is asked
+    def _client(request):
+        return request.client.host if getattr(request, "client", None) else "unknown"
+
+    def _rate_limited(request):
+        retry = limiter.check(_client(request))
+        if not retry:
+            return None
+        return JSONResponse({"error": {"message": "too many requests; retry in %d s" % retry,
+                                       "type": "rate_limit_exceeded", "code": "rate_limit_exceeded"}},
+                            status_code=429, headers={"Retry-After": str(retry)})
 
     @app.get("/health")
     def health():
@@ -874,7 +910,10 @@ def create_app(cfg, log=print):
         busy = next((e for e in each if e), None)
         return dict({"ok": True, "kindi": __version__, "commit": COMMIT, "model": model_id, "ctx": K.eng.ctx,
                      "head": K.head_active(), "uptime_s": round(time.time() - K.t0), "busy": busy, "stats": K.stats,
-                     "drafting": K.drafting(), "queue": dict(SCHED.counts(), yields=getattr(K, "yields", 0)),
+                     "drafting": K.drafting(), "queue": dict(SCHED.counts(), yields=getattr(K, "yields", 0),
+                                                                    waiting=gate.waiting, max=gate.max_queue,
+                                                                    rejected=gate.rejected),
+                     "rate_limit_per_min": limiter.per_minute,
                      "slots": {"n": len(views), "busy": sum(1 for e in each if e),
                                "each": [e or {"phase": "idle"} for e in each]},
                      "last": dict(LAST) or None,
@@ -909,10 +948,15 @@ def create_app(cfg, log=print):
     async def _tokenize(request: Request):
         if not _auth(request):
             return _err(401, "invalid API key", "authentication_error")
+        limited = _rate_limited(request)
+        if limited is not None:
+            return limited
         try:
-            req = await request.json()
-        except Exception:  # noqa: BLE001
-            return _err(400, "the body is not JSON")
+            req = await _read_json_body(request, body_limit)
+        except RequestTooLarge as e:
+            return _err(413, str(e), "request_too_large")
+        except ValueError as e:
+            return _err(400, str(e))
         ctx = K.eng.ctx
         try:
             if req.get("messages") is not None:   # a chat request: the whole prompt, as the chat endpoint builds it
@@ -934,9 +978,14 @@ def create_app(cfg, log=print):
     async def _detokenize(request: Request):
         if not _auth(request):
             return _err(401, "invalid API key", "authentication_error")
+        limited = _rate_limited(request)
+        if limited is not None:
+            return limited
         try:
-            req = await request.json()
+            req = await _read_json_body(request, body_limit)
             ids = [int(i) for i in req.get("tokens") or []]
+        except RequestTooLarge as e:
+            return _err(413, str(e), "request_too_large")
         except Exception:  # noqa: BLE001
             return _err(400, "send tokens: a list of token ids")
         text = K.decode_ids(ids)
@@ -951,10 +1000,21 @@ def create_app(cfg, log=print):
     async def completions(request: Request):
         if not _auth(request):
             return _err(401, "invalid API key", "authentication_error")
+        limited = _rate_limited(request)
+        if limited is not None:
+            return limited
         try:
-            req = await request.json()
-        except Exception:  # noqa: BLE001
-            return _err(400, "the body is not JSON")
+            req = await _read_json_body(request, body_limit)
+        except RequestTooLarge as e:
+            return _err(413, str(e), "request_too_large")
+        except ValueError as e:
+            return _err(400, str(e))
+        try:
+            gate.enter()
+        except QueueFull as e:
+            return JSONResponse({"error": {"message": str(e), "type": "server_busy",
+                                           "code": "server_busy"}},
+                                status_code=429, headers={"Retry-After": "1"})
         cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
         # every request is counted before it waits for the engine: a prompt that does not fit gets its HTTP 400 at
         # once (a queued request used to wait for the request ahead of it, then fail), and a dry run ends here
@@ -962,15 +1022,18 @@ def create_app(cfg, log=print):
         try:
             ids = await asyncio.get_event_loop().run_in_executor(None, K.check_prompt, req)
         except ContextOverflow as e:
+            gate.release()
             if dry:
                 return {"object": "kindi.prompt_count", "model": model_id, "fits": False, "max_model_len": K.eng.ctx,
                         "usage": {"prompt_tokens": e.n, "completion_tokens": 0, "total_tokens": e.n}}
             return _overflow(e)
         except ValueError as e:
+            gate.release()
             return _bad(e)
         except Exception:  # noqa: BLE001 - anything else: the request itself reports it
             ids = None
         if dry:
+            gate.release()
             n = len(ids or [])
             return {"object": "kindi.prompt_count", "model": model_id, "fits": n + 1 < K.eng.ctx,
                     "max_model_len": K.eng.ctx, "usage": {"prompt_tokens": n, "completion_tokens": 0,
@@ -1002,6 +1065,7 @@ def create_app(cfg, log=print):
                         yield item
                 finally:
                     K.release(V)
+                    gate.release()
 
             def _sse(V):
                 with V.lock:
@@ -1146,6 +1210,7 @@ def create_app(cfg, log=print):
                         SCHED.submit(K.after_turn, PRIO_TURN)
                 finally:
                     cancel.set()
+                    gate.release()
             return StreamingResponse(body(), media_type="application/json")
         try:
             fut = asyncio.wrap_future(SCHED.submit(run, prio))
@@ -1156,12 +1221,14 @@ def create_app(cfg, log=print):
             info = fut.result()
             if info is None:
                 return _err(499, "request cancelled", "cancelled")
+            # the save of the turn's end state runs on the engine thread after this answer is sent, before the next
+            SCHED.submit(K.after_turn, PRIO_TURN)
+            return answer(info)
         except Exception as e:  # noqa: BLE001
             code, out = failed(e)
             return JSONResponse(out, status_code=code)
-        # the save of the turn's end state runs on the engine thread after this answer is sent, before the next request
-        SCHED.submit(K.after_turn, PRIO_TURN)
-        return answer(info)
+        finally:
+            gate.release()
 
     return app
 

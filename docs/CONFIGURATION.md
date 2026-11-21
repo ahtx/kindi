@@ -28,6 +28,9 @@ Kindi reads its settings in this order - later sources win:
 | `port` | `8093` | |
 | `api_key` | (empty) | if set, every `/v1` request needs `Authorization: Bearer <api_key>`; `/health` stays open |
 | `model_name` | `auto` | the model id `/v1/models` reports; `auto` takes it from the pack (bonsai2-2b, bonsai2-4b or bonsai2-9b); clients may send any model name |
+| `queue_max` | `8` | requests allowed to wait behind the one active generation; a full queue returns `429` with `Retry-After: 1` |
+| `max_body_mb` | `16` | largest JSON request body; a larger body returns `413` before the engine is touched |
+| `rate_limit_per_min` | `0` | per-client request budget over a rolling minute; `0` disables it, and a refusal returns `429` with `Retry-After` |
 
 ### Engine
 

@@ -12,6 +12,9 @@ host = 127.0.0.1
 port = 8093
 # api_key = choose-a-long-random-string
 model_name = auto
+# queue_max = 8          # requests allowed to wait behind the active one
+# max_body_mb = 16       # largest accepted JSON body
+# rate_limit_per_min = 0 # per-client budget; 0 disables it
 
 # --- engine
 ctx = 24576
