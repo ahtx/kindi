@@ -147,6 +147,37 @@ def spec_accept(dists, d, rng, qdists=None):
     idx, p = dists(len(d))
     out.append(int(rng.choice(idx, p=p)))
     return out
+def pick_from_logits(z, temperature, top_p, top_k, rng, min_p=0.0, allowed=None, band=None):
+    """The next token from one position's whole logits vector, for the backend adapters.
+
+    The reduced form of ``Sampler._penalized``: the top-k candidates (or the
+    whole vocabulary when ``top_k`` is 0, or everything within ``band``
+    temperatures of the best when ``band`` is given) go through
+    ``distribution``/``Sampler._pick``, so the adapter backends and the server
+    share one definition of the sampler chain. ``allowed`` (a set of ids) masks
+    before the candidates are chosen, and temperature 0 argmaxes over the
+    allowed ids alone when masked. Returns None only when the mask empties the
+    vocabulary, which leaves the caller's greedy token.
+    """
+    z = np.asarray(z, dtype=np.float64)
+    if allowed is not None:
+        keep = np.zeros(z.size, dtype=bool)
+        ids = np.fromiter((int(t) for t in allowed), dtype=np.int64, count=len(allowed))
+        ids = ids[(ids >= 0) & (ids < z.size)]
+        if not ids.size:
+            return None
+        keep[ids] = True
+        z = np.where(keep, z, -np.inf)
+    if temperature <= 0:
+        return int(np.argmax(z))
+    k = int(top_k or 0)
+    if band is not None:
+        cand = np.flatnonzero(z >= z.max() - float(band) * temperature).astype(np.int64)
+    elif 0 < k < z.size:
+        cand = np.argpartition(-z, k - 1)[:k].astype(np.int64)
+    else:
+        cand = np.arange(z.size, dtype=np.int64)
+    return Sampler._pick(cand, z[cand], temperature, top_p, k, rng, min_p)
 
 
 def penalize(cand, z, rp, recent):
