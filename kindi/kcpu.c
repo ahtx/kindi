@@ -9,6 +9,22 @@
 #include <omp.h>
 #include <immintrin.h>
 
+/* The engine requires AVX.  Five tiers are buildable: AVX2/FMA/F16C, AVX2/F16C without FMA,
+   AVX2/FMA without F16C, AVX2, and AVX-only.  kindi/cpu.py builds the tier the host supports
+   and loads that library; kc_isa()/kc_isa_name() below report which tier was compiled, so a
+   stale cache entry cannot run instructions the CPU lacks.  FMA is optional (separate
+   multiply/add without it), and a build without F16C uses the software fp16 conversion.  Fail
+   at compile time with an actionable message instead of a target-mismatch error. */
+#if !defined(__AVX__)
+#error "kindi CPU engine requires AVX; build with -mavx (docs/CPU-SUPPORT.md)"
+#endif
+
+#ifdef _WIN32
+#define KC_API __declspec(dllexport)      /* the ctypes loader needs the names in the DLL export table */
+#else
+#define KC_API
+#endif
+
 typedef struct { const uint8_t* W; const float* S; int R, C; } Mat;   /* W [R/8][C/128][64] u32 pair codes, S [R/8][C/128][8] */
 
 typedef struct {
@@ -46,8 +62,59 @@ static inline void span(long long n, int* a, int* b){
   const int nt = omp_get_num_threads(), id = omp_get_thread_num();
   *a = (int)(n * id / nt); *b = (int)(n * (id + 1) / nt);
 }
+#if defined(__F16C__)
 static inline float h2f(uint16_t h){ return _cvtsh_ss(h); }
 static inline uint16_t f2h(float f){ return _cvtss_sh(f, 0); }
+#else
+/* IEEE binary16 conversions for AVX-only hosts.  f2h is round-to-nearest-even, matching
+   _cvtss_sh(f, 0); h2f is exact for every finite, infinite and NaN input. */
+static inline float h2f(uint16_t h){
+  const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1fu, mant = h & 0x3ffu, bits;
+  if(exp == 0){
+    if(mant == 0) bits = sign;
+    else {
+      int e = -1;
+      do { mant <<= 1; e++; } while(!(mant & 0x400u));
+      mant &= 0x3ffu;
+      bits = sign | ((uint32_t)(127 - 15 - e) << 23) | (mant << 13);
+    }
+  } else if(exp == 31) bits = sign | 0x7f800000u | (mant << 13);
+  else bits = sign | ((exp + 112u) << 23) | (mant << 13);
+  union { uint32_t u; float f; } v; v.u = bits; return v.f;
+}
+static inline uint16_t f2h(float f){
+  union { float f; uint32_t u; } v; v.f = f;
+  const uint32_t sign = (v.u >> 16) & 0x8000u;
+  const uint32_t abs = v.u & 0x7fffffffu;
+  if(abs >= 0x7f800000u){
+    if(abs > 0x7f800000u) return (uint16_t)(sign | 0x7e00u | ((abs >> 13) & 0x3ffu));
+    return (uint16_t)(sign | 0x7c00u);
+  }
+  if(abs >= 0x477ff000u) return (uint16_t)(sign | 0x7c00u);   /* 65520 rounds to infinity */
+  int exp = (int)(abs >> 23) - 127;
+  const uint32_t mant = abs & 0x7fffffu;
+  if(exp >= -14){
+    uint32_t q = (mant | 0x800000u) >> 13;
+    const uint32_t rem = (mant | 0x800000u) & 0x1fffu;
+    if(rem > 0x1000u || (rem == 0x1000u && (q & 1u))) q++;
+    if(q == 0x800u){ q = 0x400u; exp++; }
+    const uint32_t e = (uint32_t)(exp + 15);
+    if(e >= 31u) return (uint16_t)(sign | 0x7c00u);
+    return (uint16_t)(sign | (e << 10) | (q & 0x3ffu));
+  }
+  if(exp >= -25){
+    const uint32_t sig = mant | 0x800000u;
+    const int shift = -exp - 1;
+    uint32_t q = sig >> shift;
+    const uint32_t rem = sig & ((1u << shift) - 1u);
+    const uint32_t half = 1u << (shift - 1);
+    if(rem > half || (rem == half && (q & 1u))) q++;
+    return (uint16_t)(sign | q);
+  }
+  return (uint16_t)sign;
+}
+#endif
 static inline float silu(float x){ return x / (1.0f + expf(-x)); }
 static inline float sigm(float x){ return 1.0f / (1.0f + expf(-x)); }
 
@@ -75,7 +142,7 @@ static void fold(const Model* m, const float* v, const float* sg, float* out, in
    Per call, a table of the 8 nonzero pair sums for every column pair (m->T, C/2 x 8 floats); then one vpermps per
    8 rows x 2 columns. Per-group sums are scaled (the 8 rows' scales are contiguous) into a vector accumulator, so a
    row's result needs no horizontal sum. Every pair sum is formed once in fp32; no activation quantisation. */
-void kc_init(void){}
+KC_API void kc_init(void){}
 static void pair_tables(const float* x, float* T, int p0, int p1){
   for(int p = p0; p < p1; ++p){
     const float x0 = x[2 * p], x1 = x[2 * p + 1];
@@ -84,6 +151,7 @@ static void pair_tables(const float* x, float* T, int p0, int p1){
     t[4] = x0; t[5] = -x0 + x1; t[6] = x1; t[7] = x0 + x1;
   }
 }
+#if defined(__AVX2__)
 static void rows8(const Mat* A, float* y, const float* T, int b0, int b1){
   const int G = A->C / 128;
   const __m256i sh = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
@@ -105,11 +173,63 @@ static void rows8(const Mat* A, float* y, const float* T, int b0, int b1){
         s0 = _mm256_add_ps(s0, _mm256_andnot_ps(z0, v0));
         s1 = _mm256_add_ps(s1, _mm256_andnot_ps(z1, v1));
       }
+#if defined(__FMA__)
       acc = _mm256_fmadd_ps(_mm256_add_ps(s0, s1), _mm256_loadu_ps(A->S + ((size_t)rb * G + g) * 8), acc);
+#else
+      /* AVX2/F16C hosts without FMA: keep the AVX2 table/permute path and round the product
+         before the add.  This is not bit-identical to FMA, but it is the documented fallback. */
+      acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_add_ps(s0, s1),
+                                             _mm256_loadu_ps(A->S + ((size_t)rb * G + g) * 8)));
+#endif
     }
     _mm256_storeu_ps(y + rb * 8, acc);
   }
 }
+#else
+static void rows8(const Mat* A, float* y, const float* T, int b0, int b1){
+  const int G = A->C / 128;
+  const __m256 vfour = _mm256_set1_ps(4.0f), veight = _mm256_set1_ps(8.0f);
+  for(int rb = b0; rb < b1; ++rb){
+    __m256 acc = _mm256_setzero_ps();
+    for(int g = 0; g < G; ++g){
+      const uint32_t* pw = (const uint32_t*)A->W + ((size_t)rb * G + g) * 64;
+      const float* pt = T + (size_t)g * 64 * 8;
+      __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+      for(int p = 0; p < 64; p += 2){
+        const uint32_t w0 = pw[p], w1 = pw[p + 1];
+        float c0[8], c1[8];
+        int i0[8], i1[8];
+        for(int l = 0; l < 8; ++l){
+          const int a = (int)((w0 >> (4 * l)) & 15u);
+          const int b = (int)((w1 >> (4 * l)) & 15u);
+          c0[l] = (float)a; i0[l] = a & 3;
+          c1[l] = (float)b; i1[l] = b & 3;
+        }
+        const __m256 f0 = _mm256_loadu_ps(c0), f1 = _mm256_loadu_ps(c1);
+        const __m256i x0 = _mm256_loadu_si256((const __m256i*)i0);
+        const __m256i x1 = _mm256_loadu_si256((const __m256i*)i1);
+        const __m256 t0l = _mm256_broadcast_ps((const __m128*)(pt + 8 * p));
+        const __m256 t0h = _mm256_broadcast_ps((const __m128*)(pt + 8 * p + 4));
+        const __m256 t1l = _mm256_broadcast_ps((const __m128*)(pt + 8 * p + 8));
+        const __m256 t1h = _mm256_broadcast_ps((const __m128*)(pt + 8 * p + 12));
+        __m256 v0 = _mm256_blendv_ps(_mm256_permutevar_ps(t0l, x0),
+                                     _mm256_permutevar_ps(t0h, x0),
+                                     _mm256_cmp_ps(f0, vfour, _CMP_GE_OQ));
+        __m256 v1 = _mm256_blendv_ps(_mm256_permutevar_ps(t1l, x1),
+                                     _mm256_permutevar_ps(t1h, x1),
+                                     _mm256_cmp_ps(f1, vfour, _CMP_GE_OQ));
+        v0 = _mm256_andnot_ps(_mm256_cmp_ps(f0, veight, _CMP_EQ_OQ), v0);
+        v1 = _mm256_andnot_ps(_mm256_cmp_ps(f1, veight, _CMP_EQ_OQ), v1);
+        s0 = _mm256_add_ps(s0, v0);
+        s1 = _mm256_add_ps(s1, v1);
+      }
+      acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_add_ps(s0, s1),
+                                             _mm256_loadu_ps(A->S + ((size_t)rb * G + g) * 8)));
+    }
+    _mm256_storeu_ps(y + rb * 8, acc);
+  }
+}
+#endif
 
 /* inside the parallel region: up to 3 matrices with the same input; the threads build the pair tables, then split
    the concatenated rows in 8-row blocks; ends in a barrier */
@@ -301,14 +421,40 @@ static void attn(Model* m, Layer* L, int pos, int add){
   gemv1(m, &L->o, m->y, m->xp);
 }
 
-static void ffn(Model* m, Layer* L){
+static void ffn_input(Model* m, Layer* L){
   TS(5);
   rmsfold(m, L->post_norm, 1);
   { const Mat* a[2] = {&L->ffg, &L->ffu}; float* yy[2] = {m->ffg, m->ffu}; gemv(m, 2, a, yy, m->xp); }
   #pragma omp for schedule(static)
   for(int e = 0; e < m->NFF; ++e) m->m[e] = silu(m->ffg[e]) * m->ffu[e];
   fold(m, m->m, m->sF, m->xp, m->NFF);
+}
+
+static void ffn_down(Model* m, Layer* L){
   gemv1(m, &L->ffd, m->y, m->xp);
+}
+
+static void ffn(Model* m, Layer* L){
+  ffn_input(m, L);
+  ffn_down(m, L);
+}
+
+static void layer_body(Model* m, int il, int pos, int add){
+  Layer* L = m->L + il;
+  if(L->is_attn) attn(m, L, pos, add); else gdn(m, L, add);
+  ffn(m, L);
+}
+
+static void head_body(Model* m, int add, int* best){
+  TS(6);
+  rmsfold(m, m->out_norm, add);
+  gemv1(m, &m->head, m->logits, m->xp);
+  #pragma omp single
+  {
+    int bi = 0; float bv = m->logits[0];
+    for(int i = 1; i < m->head.R; ++i) if(m->logits[i] > bv){ bv = m->logits[i]; bi = i; }
+    *best = bi;
+  }
 }
 
 static void embed(Model* m, int tok){
@@ -333,28 +479,15 @@ static void embed(Model* m, int tok){
 }
 
 /* one token; head != 0: also the output head (logits in m->logits); returns the greedy token or -1 */
-int kc_step(Model* m, int tok, int pos, int head){
+KC_API int kc_step(Model* m, int tok, int pos, int head){
   int best = -1;
   t_last = omp_get_wtime(); t_cur = 0;
   #pragma omp parallel
   {
     embed(m, tok);
-    for(int il = 0; il < m->NL; ++il){
-      Layer* L = m->L + il;
-      if(L->is_attn) attn(m, L, pos, il > 0); else gdn(m, L, il > 0);
-      ffn(m, L);
-    }
-    if(head){
-      TS(6);
-      rmsfold(m, m->out_norm, 1);
-      gemv1(m, &m->head, m->logits, m->xp);
-      #pragma omp single
-      {
-        int bi = 0; float bv = m->logits[0];
-        for(int i = 1; i < m->head.R; ++i) if(m->logits[i] > bv){ bv = m->logits[i]; bi = i; }
-        best = bi;
-      }
-    } else {
+    for(int il = 0; il < m->NL; ++il) layer_body(m, il, pos, il > 0);
+    if(head) head_body(m, 1, &best);
+    else {
       #pragma omp single
       { for(int e = 0; e < m->D; ++e) m->h[e] += m->y[e]; }   /* keep h = the residual after the last block */
     }
@@ -363,5 +496,105 @@ int kc_step(Model* m, int tok, int pos, int head){
   return best;
 }
 
-int kc_sizeof_model(void){ return (int)sizeof(Model); }
-int kc_sizeof_layer(void){ return (int)sizeof(Layer); }
+/* Per-layer entry point for a CPU/GPU layer split (tandem).  kc_embed() puts the token vector in
+   m->h; each kc_layer() call treats m->h as the complete residual entering il and leaves the
+   complete residual leaving il in m->h.  The first block's residual is added to h by ffn(), and
+   the FFN output is added explicitly at the end, so m->y is never carried between calls.  The
+   whole-model kc_step() above stays a single OpenMP region; these calls open one region per part
+   and are for handing a layer to or from another backend. */
+KC_API void kc_embed(Model* m, int tok){
+  t_last = omp_get_wtime(); t_cur = 0;
+  #pragma omp parallel
+  { embed(m, tok); }
+  kc_times[t_cur] += omp_get_wtime() - t_last;
+}
+
+KC_API int kc_layer(Model* m, int il, int pos){
+  if(il < 0 || il >= m->NL || pos < 0 || pos >= m->ctx) return -1;
+  t_last = omp_get_wtime(); t_cur = 0;
+  #pragma omp parallel
+  {
+    #pragma omp single
+    { for(int e = 0; e < m->D; ++e) m->y[e] = 0.0f; }
+    #pragma omp barrier
+    layer_body(m, il, pos, 0);
+    #pragma omp single
+    { for(int e = 0; e < m->D; ++e) m->h[e] += m->y[e]; }
+  }
+  kc_times[t_cur] += omp_get_wtime() - t_last;
+  return 0;
+}
+
+/* The same layer without its FFN-down GEMV.  m->xp is left holding the folded FFN input;
+   m->y is zero so a caller can fill the down rows from one or more backends. */
+KC_API int kc_layer_ffn_input(Model* m, int il, int pos){
+  if(il < 0 || il >= m->NL || pos < 0 || pos >= m->ctx) return -1;
+  t_last = omp_get_wtime(); t_cur = 0;
+  #pragma omp parallel
+  {
+    #pragma omp single
+    { for(int e = 0; e < m->D; ++e) m->y[e] = 0.0f; }
+    #pragma omp barrier
+    Layer* L = m->L + il;
+    if(L->is_attn) attn(m, L, pos, 0); else gdn(m, L, 0);
+    ffn_input(m, L);
+    #pragma omp single
+    { for(int e = 0; e < m->D; ++e) m->y[e] = 0.0f; }
+  }
+  kc_times[t_cur] += omp_get_wtime() - t_last;
+  return 0;
+}
+
+/* One ternary matrix over an explicit row range, for a CPU/GPU row split.  The caller supplies
+   the packed rows and the complete input vector; this entry point does not touch the layer
+   schedule or the residual stream. */
+KC_API int kc_gemv(Model* m, const Mat* A, const float* x, float* y){
+  if(!m || !A || !x || !y) return -1;
+  t_last = omp_get_wtime(); t_cur = 0;
+  #pragma omp parallel
+  { gemv1(m, A, y, x); }
+  kc_times[t_cur] += omp_get_wtime() - t_last;
+  return 0;
+}
+
+KC_API int kc_head(Model* m){
+  int best = -1;
+  t_last = omp_get_wtime(); t_cur = 0;
+  #pragma omp parallel
+  { head_body(m, 0, &best); }
+  kc_times[t_cur] += omp_get_wtime() - t_last;
+  return best;
+}
+
+/* The compiled tier. The numbers and names match kindi/cpu.py:ISA_ORDER; the loader compares
+   kc_isa_name() with the tier it selected before the first model call. */
+KC_API int kc_isa(void){
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+  return 4;
+#elif defined(__AVX2__) && defined(__F16C__)
+  return 3;
+#elif defined(__AVX2__) && defined(__FMA__)
+  return 2;
+#elif defined(__AVX2__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+KC_API const char* kc_isa_name(void){
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+  return "avx2-fma-f16c";
+#elif defined(__AVX2__) && defined(__F16C__)
+  return "avx2-f16c-no-fma";
+#elif defined(__AVX2__) && defined(__FMA__)
+  return "avx2-fma";
+#elif defined(__AVX2__)
+  return "avx2";
+#else
+  return "avx-only";
+#endif
+}
+
+KC_API int kc_sizeof_model(void){ return (int)sizeof(Model); }
+KC_API int kc_sizeof_layer(void){ return (int)sizeof(Layer); }
