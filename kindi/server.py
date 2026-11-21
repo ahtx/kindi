@@ -118,7 +118,8 @@ class Kindi(object):
                 if os.path.exists(cl_path):
                     clusters = dict(np.load(cl_path))
             self.eng = make_engine(pack, ctx=cfg["ctx"], clusters=clusters, log=log, tandem=tandem,
-                                   cpu_layers=cfg.get("tandem_cpu_layers"))
+                                   cpu_layers=cfg.get("tandem_cpu_layers"),
+                                   gpu=cfg.get("tandem_gpu"))
             self.tok = Tok(self.eng.vocab, os.path.join(pack, "merges.txt"))
             if tandem != "off":
                 from .tandem import TandemRunner

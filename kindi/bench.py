@@ -34,19 +34,7 @@ def run(cfg, log=print):
         from .lightning_cli import bench
         return bench(cfg, man, log=log)
     cl = os.path.join(pack, "head_clusters.npz")
-    eng = make_engine(pack, ctx=cfg["ctx"], clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log,
-                       tandem=cfg.get("tandem", "off"), cpu_layers=cfg.get("tandem_cpu_layers"))
-    if vram is not None:
-        vram.mark("loaded")
-    # eng.ctx is the *actual* context (the loader reduces it to fit); the requested one is
-    # recorded separately so a reduced run is never mistaken for the requested context.
-    result = {"pack": pack, "model": man.get("model"), "ctx": eng.ctx,
-              "ctx_reduced": cfg["ctx"] > eng.ctx + 47, "ctx_requested": cfg["ctx"],
-              "tandem": cfg.get("tandem", "off"), "cpu_layers": cfg.get("tandem_cpu_layers"),
-              "device": "gpu" if cp is not None else "cpu", "read_tok_s": None, "gen_tok_s": {}}
-    if hasattr(eng, "cpu_range"):
-        result["cpu_range"] = list(eng.cpu_range)
-        result["gpu_range"] = list(eng.gpu_range)
+    eng = make_engine(pack, ctx=cfg["ctx"], clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log)
     if cp is not None:
         free, total = cp.cuda.runtime.memGetInfo()
         log("GPU memory: %.0f MiB free of %.0f with a %d-token context" % (free / 2 ** 20, total / 2 ** 20, eng.ctx))

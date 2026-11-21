@@ -41,12 +41,39 @@ reduce peak VRAM instead of loading the whole model and ignoring part of it.
 The CPU side uses the AVX2/FMA/F16C backend and its existing fallbacks. The handoff surface is
 `begin(tok)`, `layer(il, pos)`, `flush()`, `get_hidden()`, `set_hidden(values)` and `finish()`.
 
+## GPU owner: plan or plain
+
+`--tandem-gpu auto|plan|plain` selects the engine that runs the GPU half (`KINDI_TANDEM_GPU` sets
+a default). `auto` picks the plan engine on a single card unless `KINDI_TP=0`.
+
+- `plain` is the existing GPU engine with fp16 K/V. It uploads the whole f32 file, so an offloaded
+  layer frees less than its weights.
+- `plan` uses `TPEngine(layers=...)`. It reads only the owned layers' tensors, keeps q8_0 K/V for the
+  attention layers it owns, and steps one prebuilt plan per block. It is a single-card owner.
+
+Both owners expose `begin`/`layer`/`flush`/`get_hidden`/`set_hidden`/`finish`, so the CPU side does
+not depend on which one is selected.
+
+## Per-card VRAM ceiling and reserve
+
+The planner uses `min(free - reserve, ceiling)`:
+
+- `--vram-budget-mib N` (config `tandem_vram_mb`, environment `KINDI_TANDEM_VRAM_MB`) caps the GPU
+  side. `0` means no ceiling. This is for a 6 GiB P106-100 or a display card that must keep a lower
+  barrier than its nominal capacity.
+- `--vram-reserve-mib N` (config `tandem_reserve_mb`, environment `KINDI_TANDEM_RESERVE_MB`) is the
+  headroom left for the display, driver and allocation noise. The default is 512 MiB.
+
+The ceiling applies to `auto` planning and is reported in the chosen split's log line. `auto:MiB`
+keeps its old meaning: it is the extra headroom the split should free, not the card ceiling.
+
 ## Usage
 
 ```sh
 kindi --pack ~/.kindi/packs/bonsai-2b verify --tandem cpu-first --tandem-cpu-layers 6
 kindi --pack ~/.kindi/packs/bonsai-2b bench  --tandem gpu-first --tandem-cpu-layers 6
 kindi --pack ~/.kindi/packs/bonsai-2b serve  --tandem cpu-first --tandem-cpu-layers 6
+kindi --pack ~/.kindi/packs/bonsai-2b serve  --tandem cpu-first --tandem-cpu-layers auto       --tandem-gpu plan --vram-budget-mib 7168 --vram-reserve-mib 512
 ```
 
 The CPU library needs `gcc` with OpenMP (or clang with libomp on Windows). A tandem run needs a
@@ -55,7 +82,7 @@ CUDA/ROCm GPU; `KINDI_DEVICE=cpu` is rejected.
 ## Limits
 
 - Dense Bonsai packs only; the MoE backends keep their own expert-tier paths.
-- One GPU. The two-card tensor-parallel engine is not a tandem owner in this PR.
+- One GPU. The two-card tensor-parallel engine is not a tandem owner.
 - Exact head only; no fast head, speculative decoding or batched prompt path.
 - `TandemRunner` deliberately does not use the normal prompt cache.
 - The routing tests use fake backends. A real CPU per-layer test skips when no pack is installed.
