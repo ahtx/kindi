@@ -95,8 +95,9 @@ def _lcp(a, b):
 
 
 # the files whose code decides the arithmetic of the state (a change of any of them changes the saved states)
-_ARITH = ("kindi.cu", "chunk.cu", "chunk1.cu", "tc.cu", "tcp.cu", "tcf.cu", "tca.cu", "spec.cu", "kcpu.c", "engine.py", "tp.py",
-          "chunk.py", "chunk1.py", "tc.py", "spec.py", "cpu.py", "layout.py")
+_ARITH = ("kindi.cu", "chunk.cu", "chunk1.cu", "tc.cu", "tc_turing.cu", "tcp.cu", "tcf.cu", "tca.cu", "tca_turing.cu",
+          "spec.cu", "kcpu.c", "engine.py", "tp.py", "chunk.py", "chunk1.py", "tc.py", "tc_turing.py", "spec.py", "cpu.py",
+          "layout.py")
 
 
 def engine_fingerprint(eng, cfg):
@@ -126,7 +127,7 @@ def engine_fingerprint(eng, cfg):
         "d1": env.get("KINDI_D1", "0"),               # the one-pass RMS fold
         "fd_ch": env.get("KINDI_FD_CH", "512"),       # positions per flash-decode block
         "kexpf": env.get("KINDI_KEXPF", "1"),         # kindi.cu's kexpf in the tc kernels (0: NVRTC's expf)
-        "att_tc": env.get("KINDI_ATT_TC", "0"),       # tensor-core prompt attention (tca.cu)
+        "att_tc": env.get("KINDI_ATT_TC", "0"),       # tensor-core prompt attention (tca.cu / tca_turing.cu)
         "spec": env.get("KINDI_SPEC", "0"),
         "head": cfg.get("head", "exact"),
         "code": {},

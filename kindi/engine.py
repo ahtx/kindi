@@ -452,6 +452,29 @@ class Engine(object):
 PLAN_SMALL_HIP = ("gfx1151",)      # the AMD GPUs where the 2B / 4B / 9B take the plan engine (measured)
 
 
+def tc_hp_for(man):
+    """The activation precision the plan engine should use for this pack: "1", or None to leave the
+    environment alone.
+
+    A pack folded with Hadamard block 4096 (the 9B here) passes the tensor-core verify 4/4 only with the
+    high-precision activations (about 14 bits instead of 8, same weight traffic); with the default ones one
+    borderline prompt flips at token 36 (3/4), which is why `kindi/spec.py` refuses HB 4096 without them.
+    Measured on the RTX 4060 Ti: 9B 4/4 at 122.6 tok/s against 74.6-80.0 on the plain engine. So for those
+    packs the exact setting is the default rather than a flag every user has to find. An explicit
+    `KINDI_TC_HP` always wins, including `0` (which then stops with the measured explanation).
+
+    It is read once, when `kindi.spec` is imported, and caps the verify pass at T = 4, so a process that
+    loads an HB-4096 pack first keeps that cap for any later pack.
+    """
+    if os.environ.get("KINDI_TC", "0") != "1" or "KINDI_TC_HP" in os.environ:
+        return None
+    try:
+        hb = int(man.get("hadamard_block", 512))
+    except (TypeError, ValueError):
+        return None
+    return "1" if hb == 4096 else None
+
+
 def make_engine(pack, ctx=4096, clusters=None, log=print):
     """Engine on one GPU, or the two-card tensor parallel engine (kindi.tp) when the weights do not fit one card and
     two GPUs are present. KINDI_TP=1 / 0 forces the choice."""
@@ -477,6 +500,11 @@ def make_engine(pack, ctx=4096, clusters=None, log=print):
         arch = (arch.decode() if isinstance(arch, bytes) else str(arch)).split(":")[0]
         plan_model = plan_model or arch in PLAN_SMALL_HIP
     if force == "1" or (force != "0" and (plan_model or (two and weights > 0.9 * cp.cuda.runtime.memGetInfo()[1]))):
+        hp = tc_hp_for(man)
+        if hp is not None:
+            os.environ["KINDI_TC_HP"] = hp         # before kindi.spec is imported: it reads this once
+            log("Hadamard block 4096: high-precision activations on (measured 4/4 at 122 tok/s; "
+                "KINDI_TC_HP=0 asks for the default activations, measured 3/4)")
         from .tp import TPEngine
         from . import spec
         spec.install(log)                       # KINDI_TC=1: tensor-core plans (one sm_80+ card); no-op otherwise
