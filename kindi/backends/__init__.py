@@ -20,6 +20,7 @@ from .registry import (
     unregister_backend,
 )
 from .fake import FakeBackend
+from .nanbeige import NanbeigeBackend
 
 __all__ = [
     "Backend",
@@ -29,6 +30,7 @@ __all__ = [
     "CancelToken",
     "FakeBackend",
     "GenerationEvent",
+    "NanbeigeBackend",
     "SamplingParams",
     "backend_classes",
     "get_registration",
