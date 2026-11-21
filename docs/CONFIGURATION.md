@@ -65,6 +65,10 @@ Notes:
 | `GET /v1/models` | the model and its real context: `context_length`, `max_model_len`, `max_context_length` and `meta.n_ctx` |
 | `POST /v1/tokenize` (also `/tokenize`) | `{"content": text}` counts plain text. `{"messages": [...], "tools": [...]}` counts the whole chat prompt, as the chat endpoint builds it. The answer is `count`, `tokens`, `max_model_len` and `fits` |
 | `POST /v1/detokenize` (also `/detokenize`) | `{"tokens": [...]}` gives the text (`prompt` and `content`) |
+| `GET /sessions?status=&tag=` | summaries of the host-only chat sessions in `state_dir/sessions`, newest first |
+| `POST /sessions` | create a session from `{"title", "messages": [{"role", "content"}], "tags", "status", "protected"}`; returns the full record (`201`) |
+| `GET /sessions/<id>` | the full session record, messages included; `GET /sessions/<id>/export` is raw markdown |
+| `POST /sessions/<id>/status`, `/tags`, `/read` | triage status, add a tag, or clear unread; all return the updated summary |
 | `POST /v1/chat/completions` with `"dry_run": true` | the exact `usage.prompt_tokens` and `fits`, without generation |
 
 A prompt that does not fit gets HTTP 400 at once, also while another request uses the engine. The body is
