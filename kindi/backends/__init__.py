@@ -20,6 +20,7 @@ from .registry import (
     unregister_backend,
 )
 from .fake import FakeBackend
+from .dsv41 import DeepseekV41Backend
 
 __all__ = [
     "Backend",
@@ -27,6 +28,7 @@ __all__ = [
     "BackendNotFound",
     "BackendUnavailable",
     "CancelToken",
+    "DeepseekV41Backend",
     "FakeBackend",
     "GenerationEvent",
     "SamplingParams",
