@@ -476,6 +476,29 @@ def tc_hp_for(man):
     return "1" if hb == 4096 else None
 
 
+def tc_hp_for(man):
+    """The activation precision the plan engine should use for this pack: "1", or None to leave the
+    environment alone.
+
+    A pack folded with Hadamard block 4096 (the 9B here) passes the tensor-core verify 4/4 only with the
+    high-precision activations (about 14 bits instead of 8, same weight traffic); with the default ones one
+    borderline prompt flips at token 36 (3/4), which is why `kindi/spec.py` refuses HB 4096 without them.
+    Measured on the RTX 4060 Ti: 9B 4/4 at 122.6 tok/s against 74.6-80.0 on the plain engine. So for those
+    packs the exact setting is the default rather than a flag every user has to find. An explicit
+    `KINDI_TC_HP` always wins, including `0` (which then stops with the measured explanation).
+
+    It is read once, when `kindi.spec` is imported, and caps the verify pass at T = 4, so a process that
+    loads an HB-4096 pack first keeps that cap for any later pack.
+    """
+    if os.environ.get("KINDI_TC", "0") != "1" or "KINDI_TC_HP" in os.environ:
+        return None
+    try:
+        hb = int(man.get("hadamard_block", 512))
+    except (TypeError, ValueError):
+        return None
+    return "1" if hb == 4096 else None
+
+
 def make_engine(pack, ctx=4096, clusters=None, log=print):
     """Engine on one GPU, or the two-card tensor parallel engine (kindi.tp) when the weights do not fit one card and
     two GPUs are present. KINDI_TP=1 / 0 forces the choice."""

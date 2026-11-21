@@ -1773,6 +1773,15 @@ def install(log=print):
         return tern, flt
 
     def _bplans(self):
+        if self.HB == 4096 and not HP:
+            # measured on the 4060 Ti: the 9B passes the tc verify only with KINDI_TC_HP=1 (4/4, 122 tok/s);
+            # with the default int8 activations one borderline prompt flips at token 36 (3/4)
+            raise SystemExit("kindi: the tensor-core plan engine refuses Hadamard blocks of 4096 unless "
+                             "KINDI_TC_HP=1 (measured: 4/4 at 122 tok/s, 3/4 with the default activations); "
+                             "use the plain engine (KINDI_TP=0)")
+        if self.HB not in (512, 1024, 4096):
+            raise SystemExit("kindi: the tensor-core plan engine supports Hadamard blocks of 512, 1024 and 4096 "
+                             "(this pack has %d); use the plain engine (KINDI_TP=0)" % self.HB)
         if getattr(self, "tc_layout", False):          # the tensor-core plans replace them (any Hadamard block)
             drv = _tp._drv()
             cp.cuda.Device(self.card).synchronize()
@@ -1791,6 +1800,10 @@ def install(log=print):
 
     def _load(self):
         backend = _tc_backend(self.card)
+        if self.HB == 4096 and not HP:          # measured on the 4060 Ti: refuse before the repack, not after
+            raise SystemExit("kindi: the tensor-core plan engine refuses Hadamard blocks of 4096 unless "
+                             "KINDI_TC_HP=1 (measured: 4/4 at 122 tok/s, 3/4 with the default activations); "
+                             "use the plain engine (KINDI_TP=0)")
         w_ok = self.tp.W == 1 if backend is _tc_turing else self.tp.W in (1, 2)
         if not (w_ok and self.g5l and backend is not None and load_stream(self)):
             o_load(self)
