@@ -9,6 +9,8 @@
 #include <omp.h>
 #include <immintrin.h>
 
+#define KC_API
+
 typedef struct { const uint8_t* W; const float* S; int R, C; } Mat;   /* W [R/8][C/128][64] u32 pair codes, S [R/8][C/128][8] */
 
 typedef struct {
@@ -311,6 +313,24 @@ static void ffn(Model* m, Layer* L){
   gemv1(m, &L->ffd, m->y, m->xp);
 }
 
+static void layer_body(Model* m, int il, int pos, int add){
+  Layer* L = m->L + il;
+  if(L->is_attn) attn(m, L, pos, add); else gdn(m, L, add);
+  ffn(m, L);
+}
+
+static void head_body(Model* m, int add, int* best){
+  TS(6);
+  rmsfold(m, m->out_norm, add);
+  gemv1(m, &m->head, m->logits, m->xp);
+  #pragma omp single
+  {
+    int bi = 0; float bv = m->logits[0];
+    for(int i = 1; i < m->head.R; ++i) if(m->logits[i] > bv){ bv = m->logits[i]; bi = i; }
+    *best = bi;
+  }
+}
+
 static void embed(Model* m, int tok){
   const int C = m->emb.C, R = m->emb.R;
   #pragma omp for schedule(static)
@@ -339,22 +359,9 @@ int kc_step(Model* m, int tok, int pos, int head){
   #pragma omp parallel
   {
     embed(m, tok);
-    for(int il = 0; il < m->NL; ++il){
-      Layer* L = m->L + il;
-      if(L->is_attn) attn(m, L, pos, il > 0); else gdn(m, L, il > 0);
-      ffn(m, L);
-    }
-    if(head){
-      TS(6);
-      rmsfold(m, m->out_norm, 1);
-      gemv1(m, &m->head, m->logits, m->xp);
-      #pragma omp single
-      {
-        int bi = 0; float bv = m->logits[0];
-        for(int i = 1; i < m->head.R; ++i) if(m->logits[i] > bv){ bv = m->logits[i]; bi = i; }
-        best = bi;
-      }
-    } else {
+    for(int il = 0; il < m->NL; ++il) layer_body(m, il, pos, il > 0);
+    if(head) head_body(m, 1, &best);
+    else {
       #pragma omp single
       { for(int e = 0; e < m->D; ++e) m->h[e] += m->y[e]; }   /* keep h = the residual after the last block */
     }
@@ -363,5 +370,43 @@ int kc_step(Model* m, int tok, int pos, int head){
   return best;
 }
 
-int kc_sizeof_model(void){ return (int)sizeof(Model); }
-int kc_sizeof_layer(void){ return (int)sizeof(Layer); }
+/* Per-layer entry point for a CPU/GPU layer split (tandem).  kc_embed() puts the token vector in
+   m->h; each kc_layer() call treats m->h as the complete residual entering il and leaves the
+   complete residual leaving il in m->h.  The first block's residual is added to h by ffn(), and
+   the FFN output is added explicitly at the end, so m->y is never carried between calls.  The
+   whole-model kc_step() above stays a single OpenMP region; these calls open one region per part
+   and are for handing a layer to or from another backend. */
+KC_API void kc_embed(Model* m, int tok){
+  t_last = omp_get_wtime(); t_cur = 0;
+  #pragma omp parallel
+  { embed(m, tok); }
+  kc_times[t_cur] += omp_get_wtime() - t_last;
+}
+
+KC_API int kc_layer(Model* m, int il, int pos){
+  if(il < 0 || il >= m->NL || pos < 0 || pos >= m->ctx) return -1;
+  t_last = omp_get_wtime(); t_cur = 0;
+  #pragma omp parallel
+  {
+    #pragma omp single
+    { for(int e = 0; e < m->D; ++e) m->y[e] = 0.0f; }
+    #pragma omp barrier
+    layer_body(m, il, pos, 0);
+    #pragma omp single
+    { for(int e = 0; e < m->D; ++e) m->h[e] += m->y[e]; }
+  }
+  kc_times[t_cur] += omp_get_wtime() - t_last;
+  return 0;
+}
+
+KC_API int kc_head(Model* m){
+  int best = -1;
+  t_last = omp_get_wtime(); t_cur = 0;
+  #pragma omp parallel
+  { head_body(m, 0, &best); }
+  kc_times[t_cur] += omp_get_wtime() - t_last;
+  return best;
+}
+
+KC_API int kc_sizeof_model(void){ return (int)sizeof(Model); }
+KC_API int kc_sizeof_layer(void){ return (int)sizeof(Layer); }

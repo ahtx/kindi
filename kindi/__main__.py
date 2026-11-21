@@ -8,7 +8,8 @@
   kindi chat                    chat in the terminal (no server needed)
   kindi head exact|fast         choose the output head of a running server (next request, no restart)
   kindi info                    show the configuration, the pack and the GPU
-Global options: --config FILE, --pack DIR, --state-dir DIR, --ctx N."""
+Global options: --config FILE, --pack DIR, --state-dir DIR, --ctx N.
+Tandem: verify/bench/serve/chat accept --tandem cpu-first|gpu-first --tandem-cpu-layers N."""
 import argparse
 import json
 import os
@@ -182,6 +183,14 @@ def _malloc_tuning():
         pass                                               # not glibc: nothing to tune
 
 
+def _tandem_args(s):
+    """The dense CPU+GPU split flags, available on the commands that build an engine."""
+    s.add_argument("--tandem", choices=("off", "cpu-first", "gpu-first"), default=None,
+                   help="split the Bonsai layers between the CPU and one GPU (default: off)")
+    s.add_argument("--tandem-cpu-layers", type=int, default=None,
+                   help="layers the CPU owns in a tandem split (default: a quarter of the model)")
+
+
 def main(argv=None):
     _malloc_tuning()
     p = argparse.ArgumentParser(prog="kindi", description="Kindi %s - native CUDA inference for ternary models and Gemma 4" % __version__)
@@ -198,17 +207,21 @@ def main(argv=None):
     s = sub.add_parser("fast-head", help="build the fast-head cluster file")
     s.add_argument("--clusters", type=int, default=1024)
     s.add_argument("--iters", type=int, default=12)
-    sub.add_parser("verify", help="check against llama.cpp's reference output")
-    sub.add_parser("bench", help="measure speed")
+    s = sub.add_parser("verify", help="check against llama.cpp's reference output")
+    _tandem_args(s)
+    s = sub.add_parser("bench", help="measure speed")
+    _tandem_args(s)
     s = sub.add_parser("serve", help="run the OpenAI-compatible server")
     s.add_argument("--host")
     s.add_argument("--port", type=int)
     s.add_argument("--api-key", dest="api_key")
     s.add_argument("--head", choices=("exact", "fast"))
+    _tandem_args(s)
     s = sub.add_parser("chat", help="chat in the terminal")
     s.add_argument("--system", default="")
     s.add_argument("--temperature", type=float, default=0.7)
     s.add_argument("--max-tokens", dest="max_tokens", type=int, default=1024)
+    _tandem_args(s)
     s = sub.add_parser("head", help="exact or fast output head for a running server")
     s.add_argument("mode", choices=("exact", "fast"))
     sub.add_parser("info", help="show configuration, pack and GPU")
@@ -222,6 +235,10 @@ def main(argv=None):
         return 1
     ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head")}
     cfg = C.load(a.config, ov)
+    if getattr(a, "tandem", None) is not None:
+        cfg["tandem"] = a.tandem
+    if getattr(a, "tandem_cpu_layers", None) is not None:
+        cfg["tandem_cpu_layers"] = a.tandem_cpu_layers
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
             "models": cmd_models, "use": cmd_use}[a.cmd](cfg, a)
