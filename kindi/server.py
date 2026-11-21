@@ -11,6 +11,7 @@ import uuid
 import numpy as np
 
 from . import COMMIT, __version__, chat
+from .api import errors as api_errors
 from .cache import Cancelled, Runner
 from .engine import EOS
 from .sampling import Sampler
@@ -692,8 +693,8 @@ def create_app(cfg, log=print):
     model_id = cfg["model_name"]
     app = FastAPI(title="Kindi", version=__version__)
 
-    def _err(code, msg, typ="invalid_request_error"):
-        return JSONResponse({"error": {"message": msg, "type": typ, "code": typ}}, status_code=code)
+    def _err(code, msg, typ="invalid_request_error", param=None):
+        return JSONResponse(api_errors.error_body(msg, error_type=typ, param=param), status_code=code)
 
     def _auth(request):
         key = cfg["api_key"]
@@ -716,8 +717,9 @@ def create_app(cfg, log=print):
                 "gpu_free_mib": round(free / 1048576.0), "gpu_total_mib": round(total / 1048576.0)}
 
     def _overflow(e):
-        return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error", "param": "messages",
-                                       "code": "context_length_exceeded"}}, status_code=400)
+        return JSONResponse(api_errors.error_body(str(e), error_type="invalid_request_error",
+                                                  code="context_length_exceeded", param="messages"),
+                            status_code=400)
 
     @app.get("/v1/models")
     def models(request: Request):
