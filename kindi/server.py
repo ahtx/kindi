@@ -111,13 +111,21 @@ class Kindi(object):
             self.sample = None
         else:
             self.variant = chat.template_variant(pack)      # qwen35 (2B/4B/9B) or bonsai27 (the 27B template)
+            tandem = str(cfg.get("tandem", "off") or "off").strip().lower().replace("_", "-")
             clusters = None
-            cl_path = os.path.join(pack, "head_clusters.npz")
-            if os.path.exists(cl_path):
-                clusters = dict(np.load(cl_path))
-            self.eng = make_engine(pack, ctx=cfg["ctx"], clusters=clusters, log=log)
+            if tandem == "off":
+                cl_path = os.path.join(pack, "head_clusters.npz")
+                if os.path.exists(cl_path):
+                    clusters = dict(np.load(cl_path))
+            self.eng = make_engine(pack, ctx=cfg["ctx"], clusters=clusters, log=log, tandem=tandem,
+                                   cpu_layers=cfg.get("tandem_cpu_layers"),
+                                   gpu=cfg.get("tandem_gpu"))
             self.tok = Tok(self.eng.vocab, os.path.join(pack, "merges.txt"))
-            self.runner = Runner(self.eng, cfg, self.pack_id, log, progress=self.busy)
+            if tandem != "off":
+                from .tandem import TandemRunner
+                self.runner = TandemRunner(self.eng, log=log, progress=self.busy)
+            else:
+                self.runner = Runner(self.eng, cfg, self.pack_id, log, progress=self.busy)
             self.sample = Sampler(self.eng)
         self.lock = threading.RLock()        # reentrant: a background request runs waiting chat requests inside its own turn
         self.stats = {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}

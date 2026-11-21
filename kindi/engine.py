@@ -51,7 +51,7 @@ FIRST_SPECIAL = 248044                 # Qwen3.5 vocabulary: ids 248044.. are th
 CU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kindi.cu")
 KERNELS = ("k_g4", "k_g4l", "k_fold_fwht", "k_rmsfold", "k_smfold", "k_l2w", "k_rmsw", "k_gdn_gates",
            "k_gdn_conv", "k_gdn_delta", "k_rope", "k_deq_emb3", "k_attn_s4w", "k_softmax_rows", "k_attn_v4p",
-           "k_attn_comb", "k_argmax", "k_sumparts", "k_fwht_hi", "k_expand", "k_mask_neg", "k_band", "k_topk",
+           "k_attn_comb", "k_argmax", "k_sumparts", "k_padd", "k_fwht_hi", "k_expand", "k_mask_neg", "k_band", "k_topk",
            "k_attn_sg", "k_attn_vg", "k_xchg",
            "k_xchg2", "k_attn_vgn", "k_attn_combn", "k_store_h", "k_cpq", "k_xchg3",
            "k_xrms", "k_gdn_pre", "k_gdn_deltan", "k_rmsw_s", "k_rope2", "k_store_q8", "k_q8row",
@@ -114,7 +114,7 @@ class Engine(object):
     """One sequence at a time. step(tok, pos) -> next token (greedy) with the logits left in self.ylog;
     feed(tok, pos) processes a prompt token without the output head."""
 
-    def __init__(self, pack, ctx=4096, clusters=None, log=print):
+    def __init__(self, pack, ctx=4096, clusters=None, log=print, layers=None, embed=True, head=True):
         t0 = time.time()
         self.log = log
         self.ctx = int(ctx)
@@ -132,6 +132,34 @@ class Engine(object):
         self.NATT = self.NL // self.dims["full_attention_interval"]
         if self.NV % self.NK or self.NH != self.NHKV * 4:
             raise SystemExit("kindi: unsupported grouped head dimensions")
+        # A tandem split loads only the layers it runs on this backend: the other layers' tensors never reach
+        # the card, so the GPU side needs less VRAM. The full-path arrays (M, conv, Kc, Vc) stay indexed by the
+        # original layer number and have None entries for the layers another backend owns.
+        if layers is None:
+            self.layers = tuple(range(self.NL))
+            self._full_layers = True
+        else:
+            raw = tuple(int(x) for x in layers)
+            if not raw or len(set(raw)) != len(raw) or raw != tuple(sorted(raw)):
+                raise SystemExit("kindi: a layer range must be a non-empty, sorted list of distinct layer numbers")
+            if raw[0] < 0 or raw[-1] >= self.NL:
+                raise SystemExit("kindi: layer range %r is outside 0..%d" % (raw, self.NL - 1))
+            self.layers = raw
+            self._full_layers = raw == tuple(range(self.NL))
+        if not self._full_layers and clusters is not None:
+            raise SystemExit("kindi: a partial layer range cannot use the fast head")
+        self._layer_set = frozenset(self.layers)
+        self.need_embed, self.need_head = bool(embed), bool(head)
+        if self.need_embed and 0 not in self._layer_set:
+            raise SystemExit("kindi: embedding needs layer 0 in the layer range")
+        if self.need_head and self.NL - 1 not in self._layer_set:
+            raise SystemExit("kindi: the output head needs the last layer in the layer range")
+        self._kvi = {}
+        kvi = 0
+        for il in range(self.NL):
+            if (il + 1) % self.dims["full_attention_interval"] == 0:
+                self._kvi[il] = kvi
+                kvi += 1
         self.inv_freq = np.float64(self.dims["rope_base"]) ** (-2.0 * np.arange(self.dims["rope_dim"] // 2) / self.dims["rope_dim"])
         self.k = Kernels()
         self._f32 = {}
@@ -147,6 +175,9 @@ class Engine(object):
                                                    prop["totalGlobalMem"] // 2 ** 20))
         self.idx = json.load(open(os.path.join(pack, "index.json")))
         self.bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
+        self._all_bi = self.bi
+        if layers is not None:
+            self.bi = self._select_layers(self.bi, self.layers, self.need_embed, self.need_head, self.head_name)
         self.hsl = None
         self.hs_force = None
         if clusters is not None:
@@ -169,15 +200,34 @@ class Engine(object):
             # holds one tensor, not the weights (a 2 GiB container runs the 9B)
             bcm = np.memmap(os.path.join(pack, "bcodes.bin"), dtype=np.uint8, mode="r")
             dpm = np.memmap(os.path.join(pack, "dpm.bin"), dtype=np.uint16, mode="r")
-            self.bc, self.dp = cp.zeros(bcm.size, dtype=cp.uint8), cp.zeros(dpm.size, dtype=cp.uint16)
             dims = {}
-            for name, rec in self.bi.items():
-                ns, P = rec["ne0"] // 4, rec["ne0"] // 128
-                o, d = rec["bc_off"], rec["dpm_off"] // 2
-                b, q = np.array(bcm[o:o + ns * rec["rows"]]), np.array(dpm[d:d + P * rec["rows"]])
-                dims.update(layout.repack({name: dict(rec, bc_off=0, dpm_off=0)}, b, q))
-                self.bc[o:o + b.size].set(b)
-                self.dp[d:d + q.size].set(q)
+            if self._full_layers:
+                self.bc, self.dp = cp.zeros(bcm.size, dtype=cp.uint8), cp.zeros(dpm.size, dtype=cp.uint16)
+                for name, rec in self.bi.items():
+                    ns, P = rec["ne0"] // 4, rec["ne0"] // 128
+                    o, d = rec["bc_off"], rec["dpm_off"] // 2
+                    b, q = np.array(bcm[o:o + ns * rec["rows"]]), np.array(dpm[d:d + P * rec["rows"]])
+                    dims.update(layout.repack({name: dict(rec, bc_off=0, dpm_off=0)}, b, q))
+                    self.bc[o:o + b.size].set(b)
+                    self.dp[d:d + q.size].set(q)
+            else:
+                # Compact arrays: only the selected tensors are uploaded, and the local offsets below are
+                # what self.w indexes. This is the VRAM saving of a tandem split, not a view of the full pack.
+                total_b = sum((rec["ne0"] // 4) * rec["rows"] for rec in self.bi.values())
+                total_d = sum((rec["ne0"] // 128) * rec["rows"] for rec in self.bi.values())
+                self.bc, self.dp = cp.zeros(total_b, dtype=cp.uint8), cp.zeros(total_d, dtype=cp.uint16)
+                local, ob, od = {}, 0, 0
+                for name, rec in self.bi.items():
+                    ns, P = rec["ne0"] // 4, rec["ne0"] // 128
+                    o, d = rec["bc_off"], rec["dpm_off"] // 2
+                    b, q = np.array(bcm[o:o + ns * rec["rows"]]), np.array(dpm[d:d + P * rec["rows"]])
+                    dims.update(layout.repack({name: dict(rec, bc_off=0, dpm_off=0)}, b, q))
+                    self.bc[ob:ob + b.size].set(b)
+                    self.dp[od:od + q.size].set(q)
+                    local[name] = dict(rec, bc_off=ob, dpm_off=od * 2)
+                    ob += b.size
+                    od += q.size
+                self.bi = local
             del bcm, dpm
         self.w = {n: (self.bc[self.bi[n]["bc_off"]:], self.dp[self.bi[n]["dpm_off"] // 2:], np.int32(R), np.int32(C))
                   for n, (R, C) in dims.items()}
@@ -205,8 +255,15 @@ class Engine(object):
         # fit the context into the memory that is left (a 9B on a 4 GB card, a 2B on a 1 GB card): bytes per position
         # = K/V cache (fp16) + attention scores + attention partials + RoPE tables
         from . import chunk1 as _chunk1
-        _chunk1.reserve(self)                      # the chunked prompt path's buffers, before the context fit
-        per_pos = (self.NATT * 2 * self.NHKV * self.HD * 2 + self.NH * 4 + (self.NH * self.HD * 4) // 256
+        if self._full_layers:
+            _chunk1.reserve(self)                  # the chunked prompt path's buffers, before the context fit
+        else:
+            self.batch_max = 1                     # a tandem engine feeds one token per backend call
+        # Only the attention layers this engine owns hold K/V here. A tandem's GPU owner loads a subset, so
+        # charging it for every layer of the model reduced the context more than the memory actually allowed
+        # (the 27B at 24,576 with 8 CPU layers was cut to 17,664 tokens that way).
+        owned_attn = self.NATT if self._full_layers else sum(1 for il in self.layers if il in self._kvi)
+        per_pos = (owned_attn * 2 * self.NHKV * self.HD * 2 + self.NH * 4 + (self.NH * self.HD * 4) // 256
                    + self.dims["rope_dim"] * 4)
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         budget = free - int(os.environ.get("KINDI_MEM_RESERVE_MB", "96")) * 2 ** 20
@@ -225,11 +282,17 @@ class Engine(object):
         self.sin_t = cp.asarray(np.sin(th).astype(np.float32))
         # recurrent (GDN) state for the 18 GDN layers; fp16 K/V cache for the 6 attention layers
         interval = self.dims["full_attention_interval"]
-        self.M = [cp.zeros((self.NV, self.HK, self.HK) if (il + 1) % interval else (1,), dtype=cp.float32)
-                  for il in range(self.NL)]
-        self.conv = [z(3 * self.CONV_CH) for _ in range(self.NL)]
-        self.Kc = [cp.zeros((self.ctx, self.NHKV, self.HD), dtype=cp.float16) for _ in range(self.NATT)]
-        self.Vc = [cp.zeros((self.ctx, self.NHKV, self.HD), dtype=cp.float16) for _ in range(self.NATT)]
+        self.M = [None] * self.NL
+        self.conv = [None] * self.NL
+        for il in self.layers:
+            self.M[il] = cp.zeros((self.NV, self.HK, self.HK) if (il + 1) % interval else (1,), dtype=cp.float32)
+            self.conv[il] = z(3 * self.CONV_CH)
+        self.Kc = [None] * self.NATT
+        self.Vc = [None] * self.NATT
+        for il in self.layers:
+            if il in self._kvi:
+                self.Kc[self._kvi[il]] = cp.zeros((self.ctx, self.NHKV, self.HD), dtype=cp.float16)
+                self.Vc[self._kvi[il]] = cp.zeros((self.ctx, self.NHKV, self.HD), dtype=cp.float16)
         self.shortlist = 0                 # > 0: fast head over this many clusters
         if self.hsl is not None:
             m = self.hsl
@@ -303,11 +366,29 @@ class Engine(object):
         self.k.k_rmsw(((rows + 7) // 8,), (256,), (x, self.f32(wname), out, np.int32(n), np.int32(rows)))
         return out
 
+    @staticmethod
+    def _select_layers(bi, layers, embed, head, head_name):
+        """The tensor records this backend needs, for a partial layer range."""
+        prefixes = tuple("blk.%d." % il for il in layers)
+        out = {name: rec for name, rec in bi.items() if name.startswith(prefixes)}
+        if embed:
+            out["token_embd.weight"] = bi["token_embd.weight"]
+        if head:
+            out[head_name] = bi[head_name]
+        return out
+
     def reset(self):
         for a in self.M + self.conv + self.Kc + self.Vc:
-            a.fill(0)
+            if a is not None:
+                a.fill(0)
+
+    def _require_full_layers(self, what):
+        if not self._full_layers:
+            raise RuntimeError("kindi: %s needs the full layer set; use begin/layer/finish" % what)
 
     def embed(self, tok):
+        if not self.need_embed:
+            raise RuntimeError("kindi: this engine does not own the embedding")
         a = self.w["token_embd.weight"]
         # the embedding rows are in cluster order only when the head is the tied embedding
         row = int(self.hs_permpos[tok]) if self.hsl is not None and self.head_name == "token_embd.weight" else int(tok)
@@ -374,6 +455,7 @@ class Engine(object):
         return h
 
     def body(self, tok, pos):
+        self._require_full_layers("body")
         if pos >= self.ctx:
             raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
         h = self.embed(tok)
@@ -402,10 +484,63 @@ class Engine(object):
         self.rmsfold(h, "output_norm.weight")
         return self.head()
 
+    # ------------------------------------------------------------------------------------------- tandem handoff
+    def begin(self, tok):
+        """Embed one token into self.h; the layer() calls that follow run a partial layer range."""
+        if not self.need_embed:
+            raise RuntimeError("kindi: this engine does not own the embedding")
+        self.h = self.embed(tok)
+        self.pending = 0
+
+    def layer(self, il, pos):
+        """Run one complete block on self.h, which holds the full residual entering the block."""
+        il = int(il)
+        if il not in self._layer_set:
+            raise IndexError("layer %d is not owned by this engine" % il)
+        if not 0 <= pos < self.ctx:
+            raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
+        if il in self._kvi:
+            self.attn(il, self.h, pos, self._kvi[il])
+        else:
+            self.gdn(il, self.h)
+        self.ffn(il, self.h)
+
+    def flush(self):
+        """Materialize the residual add left in self.y by the last GDN/attention/FFN output."""
+        if self.pending:
+            if self.pending > 1:
+                self.k.k_sumparts(((self.D + 255) // 256,), (256,), (self.part, self.y, np.int32(self.D),
+                                                                         np.int32(self.pending)))
+            self.h += self.y[:self.D]
+            self.pending = 0
+
+    def finish(self):
+        """Apply the output norm and exact head to the residual after a partial layer range."""
+        if not self.need_head:
+            raise RuntimeError("kindi: this engine does not own the output head")
+        self.flush()
+        self.rmsfold(self.h, "output_norm.weight")
+        return self.head()
+
+    def get_hidden(self):
+        """Copy the residual after the last layer to a NumPy array for the other backend."""
+        self.flush()
+        return cp.asnumpy(self.h).copy()
+
+    def set_hidden(self, values):
+        """Accept the other backend's residual into this backend's layer input."""
+        x = np.asarray(values, dtype=np.float32)
+        if x.shape != (self.D,):
+            raise ValueError("hidden state has shape %r, expected (%d,)" % (x.shape, self.D))
+        self.h[:] = cp.asarray(x)
+        self.pending = 0
+
     # ------------------------------------------------------------------------------------------- output head
     def head(self):
         """-> greedy next token id. Leaves the logits in self.ylog[:self.ylog_n], their argmax slot in self.aout and
         (reordered head) each slot's token id in self.ylog_map."""
+        if not self.need_head:
+            raise RuntimeError("kindi: this engine does not own the output head")
         a = self.w[self.head_name]
         if self.hsl is None:
             self.gemv([self.head_name], self.xp, [self.y])
@@ -452,9 +587,18 @@ class Engine(object):
 PLAN_SMALL_HIP = ("gfx1151",)      # the AMD GPUs where the 2B / 4B / 9B take the plan engine (measured)
 
 
-def make_engine(pack, ctx=4096, clusters=None, log=print):
+def make_engine(pack, ctx=4096, clusters=None, log=print, tandem="off", cpu_layers=None, gpu=None):
     """Engine on one GPU, or the two-card tensor parallel engine (kindi.tp) when the weights do not fit one card and
-    two GPUs are present. KINDI_TP=1 / 0 forces the choice."""
+    two GPUs are present. KINDI_TP=1 / 0 forces the choice. tandem="cpu-first" or "gpu-first" splits the dense model
+    between the CPU engine and one GPU engine."""
+    mode = str(tandem or "off").strip().lower().replace("_", "-")
+    if mode != "off":
+        if os.environ.get("KINDI_DEVICE", "gpu") == "cpu" or cp is None:
+            raise SystemExit("kindi: tandem needs a CUDA/ROCm GPU; KINDI_DEVICE=cpu is set or CuPy is missing")
+        from .tandem import TandemEngine
+        if clusters is not None:
+            log("the fast head is not available in tandem mode: exact head")
+        return TandemEngine(pack, ctx=ctx, cpu_layers=cpu_layers, mode=mode, log=log, gpu=gpu)
     if os.environ.get("KINDI_DEVICE", "gpu") == "cpu" or cp is None:
         from .cpu import Engine as CPUEngine
         if clusters is not None:

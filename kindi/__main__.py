@@ -8,7 +8,11 @@
   kindi chat                    chat in the terminal (no server needed)
   kindi head exact|fast         choose the output head of a running server (next request, no restart)
   kindi info                    show the configuration, the pack and the GPU
-Global options: --config FILE, --pack DIR, --state-dir DIR, --ctx N."""
+Global options: --config FILE, --pack DIR, --state-dir DIR, --ctx N.
+Tandem: verify/bench/serve/chat accept --tandem cpu-first|gpu-first --tandem-cpu-layers N|LIST|gdn:N
+        and --tandem-gpu auto|plan|plain (the plan engine owner frees the offloaded layers' VRAM),
+where LIST is an explicit layer set (0,1,2,4 or 0-2,4-6) and gdn:N moves the first N gated-delta
+(non-attention) layers to the CPU, which keeps decode flat with context."""
 import argparse
 import json
 import os
@@ -33,6 +37,11 @@ def _setup_gpu_env(cfg):
     os.environ.setdefault("CUPY_CACHE_DIR", kdir)
     os.environ.setdefault("CUDA_CACHE_PATH", jdir)
     os.environ.setdefault("CUDA_CACHE_MAXSIZE", str(512 * 1024 * 1024))
+    # The tandem engine reads these before it builds the GPU owner. The config loader has already
+    # applied file < environment < CLI precedence; writing them here makes that one decision the
+    # value every backend sees, including a direct TandemEngine construction.
+    os.environ["KINDI_TANDEM_VRAM_MB"] = str(int(cfg.get("tandem_vram_mb", 0) or 0))
+    os.environ["KINDI_TANDEM_RESERVE_MB"] = str(int(cfg.get("tandem_reserve_mb", 512) or 0))
 
 
 def cmd_convert(cfg, a):
@@ -182,6 +191,44 @@ def _malloc_tuning():
         pass                                               # not glibc: nothing to tune
 
 
+def _mib_arg(text):
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be an integer number of MiB") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return value
+
+
+def _vram_args(s):
+    """A per-card ceiling and free-memory reserve for the dense tandem planner."""
+    s.add_argument("--vram-budget-mib", type=_mib_arg, default=None, metavar="N",
+                   help="ceiling in MiB for the tandem GPU side (0: no ceiling); the planner uses "
+                        "min(free - reserve, this budget), so a 6 GiB P106 can be capped at 6144 "
+                        "and a display card can keep a lower barrier")
+    s.add_argument("--vram-reserve-mib", type=_mib_arg, default=None, metavar="N",
+                   help="free card memory the tandem planner leaves for the display/driver "
+                        "(default: 512; KINDI_TANDEM_RESERVE_MB)")
+
+
+def _tandem_args(s):
+    """The dense CPU+GPU split flags, available on the commands that build an engine."""
+    s.add_argument("--tandem", choices=("off", "cpu-first", "gpu-first"), default=None,
+                   help="split the Bonsai layers between the CPU and one GPU (default: off)")
+    s.add_argument("--tandem-cpu-layers", default=None,
+                   help="layers the CPU owns in a tandem split: a count (cpu-first prefix / "
+                        "gpu-first suffix), an explicit list such as 0,1,2,4,5,6 / 0-2,4-6, "
+                        "gdn:N (the first N non-attention layers) or auto[:MiB] (the smallest "
+                        "set that makes the context fit, or refuse when no split is needed) "
+                        "(default: a quarter of the model)")
+    s.add_argument("--tandem-gpu", choices=("auto", "plan", "plain"), default=None,
+                   help="engine that owns the GPU side of a tandem split: auto (the plan engine, "
+                        "which loads only the GPU-owned layers and uses q8_0 K/V), plan or plain "
+                        "(also q8_0 K/V; the only owner for a two-card split)")
+    _vram_args(s)
+
+
 def main(argv=None):
     _malloc_tuning()
     p = argparse.ArgumentParser(prog="kindi", description="Kindi %s - native CUDA inference for ternary models and Gemma 4" % __version__)
@@ -198,17 +245,21 @@ def main(argv=None):
     s = sub.add_parser("fast-head", help="build the fast-head cluster file")
     s.add_argument("--clusters", type=int, default=1024)
     s.add_argument("--iters", type=int, default=12)
-    sub.add_parser("verify", help="check against llama.cpp's reference output")
-    sub.add_parser("bench", help="measure speed")
+    s = sub.add_parser("verify", help="check against llama.cpp's reference output")
+    _tandem_args(s)
+    s = sub.add_parser("bench", help="measure speed")
+    _tandem_args(s)
     s = sub.add_parser("serve", help="run the OpenAI-compatible server")
     s.add_argument("--host")
     s.add_argument("--port", type=int)
     s.add_argument("--api-key", dest="api_key")
     s.add_argument("--head", choices=("exact", "fast"))
+    _tandem_args(s)
     s = sub.add_parser("chat", help="chat in the terminal")
     s.add_argument("--system", default="")
     s.add_argument("--temperature", type=float, default=0.7)
     s.add_argument("--max-tokens", dest="max_tokens", type=int, default=1024)
+    _tandem_args(s)
     s = sub.add_parser("head", help="exact or fast output head for a running server")
     s.add_argument("mode", choices=("exact", "fast"))
     sub.add_parser("info", help="show configuration, pack and GPU")
@@ -222,6 +273,16 @@ def main(argv=None):
         return 1
     ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head")}
     cfg = C.load(a.config, ov)
+    if getattr(a, "tandem", None) is not None:
+        cfg["tandem"] = a.tandem
+    if getattr(a, "tandem_cpu_layers", None) is not None:
+        cfg["tandem_cpu_layers"] = a.tandem_cpu_layers
+    if getattr(a, "tandem_gpu", None) is not None:
+        cfg["tandem_gpu"] = a.tandem_gpu
+    if getattr(a, "vram_budget_mib", None) is not None:
+        cfg["tandem_vram_mb"] = int(a.vram_budget_mib)
+    if getattr(a, "vram_reserve_mib", None) is not None:
+        cfg["tandem_reserve_mb"] = int(a.vram_reserve_mib)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
             "models": cmd_models, "use": cmd_use}[a.cmd](cfg, a)

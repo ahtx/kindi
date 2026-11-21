@@ -36,10 +36,13 @@ Kindi reads its settings in this order - later sources win:
 | `ctx` | `24576` | context length in tokens (prompt + answer). For GPU memory, see the notes below the table |
 | `head` | `exact` | `exact` = full output head (token-exact with llama.cpp); `fast` = shortlist head (needs `kindi fast-head`). `kindi head exact\|fast` overrides it at run time |
 | `fast_clusters` | `256` | clusters the fast head scores exactly (of 1,024). Fewer is faster and less exact (see the notes below the table) |
+| `tandem_vram_mb` | `0` | ceiling in MiB for the GPU side of a CPU+GPU tandem split; `0` = no explicit ceiling. The planner uses `min(free - reserve, tandem_vram_mb)`, so a 6 GiB P106-100 can use `6144` and a display card can keep a lower barrier (`KINDI_TANDEM_VRAM_MB` is the same setting) |
+| `tandem_reserve_mb` | `512` | free card memory the tandem planner leaves for the display, driver and allocation noise. `KINDI_TANDEM_RESERVE_MB` is the same setting; lower it only when the card is dedicated |
 | `kv_cache` | `auto` | AH-Nanbeige4.3-33B only: the K/V cache, `auto`, `f16` or `q8_0` (`KINDI_KV_CACHE=q8_0`). `q8_0` keeps K and V as int8 with an fp16 scale for each 32 values: half the memory (64K tokens: about 6.6 GiB instead of 13 GiB), so the 33B gets a 64K context on one 24 GB card. Needs compute capability 6.1 or later. `auto` uses `f16` when the model and its f16 cache fit on the cards at `ctx`, and `q8_0` when they do not. `kindi verify` checks `q8_0` against llama.cpp: the tokens that agree with the f16 reference must be at least as many as llama.cpp's own q8_0 cache keeps (on 2x RTX 3080: Kindi 475, llama.cpp 471, of 586) |
 
 Notes:
 
+- `tandem_vram_mb` / `tandem_reserve_mb`: the dense tandem planner's ceiling and headroom. `auto` and `rate` fit the CPU/GPU split to the resulting budget; a ceiling below the full model forces a split even when the card currently has more free memory. For example, `--ctx 24576 --vram-budget-mib 6144 --vram-reserve-mib 512` plans for a 6 GiB P106-100, while `--vram-budget-mib 7168` leaves 1 GiB of an 8 GiB display card unused. The command-line flags are `--vram-budget-mib` and `--vram-reserve-mib` on `plan`, `verify`, `bench`, `calibrate`, `serve`, `chat` and `autotune`; the two config keys are the persistent form. A card's live free figure still wins when it is lower than the ceiling.
 - `ctx`: GPU memory is ~12 KiB per token for the fp16 K/V cache, on top of ~570 MB for weights and buffers.
 - `ctx`: 24,576 leaves ~115 MB of the K420's 980 MB free. Lower it if something else needs the card.
 - `fast_clusters`: 128 clusters found the full head's top token 98.1 % of the time, 256 clusters 99.4 %.

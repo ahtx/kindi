@@ -735,6 +735,13 @@ extern "C" __global__ void k_expand(const int* __restrict__ sel, const int* __re
   for(int i = threadIdx.x; i < n; i += blockDim.x) glist[o + i] = s + i;
 }
 
+extern "C" __global__ void k_padd(float* __restrict__ a, const float* __restrict__ b, int n){
+  /* a += b: the tandem plan engine's per-block residual add. A tandem owner resolves every block's
+     down-projection inside its plan (a CuPy call per block would cost ~0.2 ms on a 34-SM card). */
+  for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    a[i] += b[i];
+}
+
 extern "C" __global__ void k_mask_neg(float* __restrict__ y, const int* __restrict__ tok, int n){
   for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
     if(tok[i] < 0) y[i] = -1e30f;
