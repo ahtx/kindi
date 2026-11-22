@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The config keeps the pre-adapter ``model_name`` fallback for foreign manifests.
+"""Pin both ``model_name: auto`` paths for real Gemma 4 and Lightning manifests.
 
-The backend registry resolves a pack's family when an adapter claims it. Until
-the Gemma 4 and Lightning adapters are present (or for a hand-edited manifest no
-adapter claims), ``model_name: auto`` must keep the fallback it had before the
-registry: the manifest's ``model_id``, else ``gemma4``, for those two families.
-Otherwise the Bonsai size inference would rename an existing pack.
+The claimed path resolves through the registered family adapter; the no-claim
+path keeps the pre-adapter fallback for a hand-edited manifest no adapter
+claims. In both, the manifest's ``model_id`` (else ``gemma4``) wins over the
+Bonsai size inference, so merging an adapter cannot rename an existing pack.
 """
 import json
 
@@ -29,11 +28,76 @@ def test_unclaimed_gemma4_and_lightning_manifests_keep_the_legacy_name(
     (tmp_path / "kindi.conf").write_text("[kindi]\n", encoding="utf-8")
     monkeypatch.setenv("KINDI_PACK", str(tmp_path))
     monkeypatch.setenv("KINDI_MODEL_NAME", "auto")
-    # The contract alone has no family adapters. Pin the no-claim branch explicitly so this test
-    # keeps its meaning once the Gemma 4 and Lightning adapters are applied on top.
+    # Force the no-claim branch explicitly: a hand-edited manifest that no adapter
+    # claims must keep the pre-registry fallback name.
     monkeypatch.setattr("kindi.modelids.adapter_model_id", lambda manifest: None)
 
     cfg = config.load(explicit=str(tmp_path / "kindi.conf"))
 
     assert cfg["model_name"] == want
     assert cfg["model_name"] != "bonsai2-9b"      # the size inference must not win here
+
+# The real manifest fields that decide adapter resolution and `model_name`:
+# `kindi/convert.py` writes `backend: kindi_gemma4` and `model_id: gemma4`;
+# `kindi/lightning_cli.py` writes `backend: kindi_lightning` and
+# `model_id: nemotron-lightning-30b`. The full manifests also carry paths,
+# hashes and dimensions, none of which either decision reads.
+REAL_GEMMA4 = {"backend": "kindi_gemma4", "model_id": "gemma4"}
+REAL_LIGHTNING = {"backend": "kindi_lightning", "model_id": "nemotron-lightning-30b"}
+
+CASES = [
+    (REAL_GEMMA4, "gemma4-e4b", "gemma4", "gemma4"),
+    (REAL_LIGHTNING, None, None, "nemotron-lightning-30b"),
+]
+
+
+@pytest.mark.parametrize("manifest, adapter_id, adapter_name, model_name", CASES)
+def test_real_manifests_pin_the_claimed_and_no_claim_paths(
+        tmp_path, monkeypatch, manifest, adapter_id, adapter_name, model_name):
+    """The live adapter claims its real manifest; the other family stays unclaimed.
+
+    The claimed row also drives `make_engine` through the adapter's manifest hook
+    and a recording registry. The no-claim row proves the other real family is
+    not claimed and the gateway refuses it rather than building a dense engine.
+    In both, the manifest's own `model_id` is the served `model_name`.
+    """
+    import kindi.backends as backends_package
+    from kindi import engine
+    from kindi.modelids import adapter_model_id
+
+    assert adapter_model_id(manifest) == adapter_id
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "kindi_pack.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (tmp_path / "kindi.conf").write_text("[kindi]" + chr(10), encoding="utf-8")
+    monkeypatch.setenv("KINDI_PACK", str(pack))
+    monkeypatch.setenv("KINDI_MODEL_NAME", "auto")
+    monkeypatch.delenv("KINDI_LEGACY_ENGINE_PATH", raising=False)
+
+    cfg = config.load(explicit=str(tmp_path / "kindi.conf"))
+    assert cfg["model_name"] == model_name
+    assert cfg["model_name"] != "bonsai2-2b"
+
+    if adapter_id is None:
+        with pytest.raises(SystemExit, match=manifest["backend"]):
+            engine.make_engine(str(pack), log=lambda line: None)
+        return
+
+    class _Backend(object):
+        class capabilities(object):
+            pass
+
+        engine = "the-engine"
+
+    _Backend.capabilities.name = adapter_name
+    seen = []
+
+    def fake_resolve(model_id, config=None):
+        seen.append(model_id)
+        return _Backend()
+
+    monkeypatch.setattr(backends_package, "resolve", fake_resolve)
+    logged = []
+    assert engine.make_engine(str(pack), log=logged.append) == "the-engine"
+    assert seen == [adapter_id]
+    assert any(adapter_id in line and adapter_name in line for line in logged)
