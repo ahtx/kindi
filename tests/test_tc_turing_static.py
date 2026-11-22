@@ -3,7 +3,8 @@
 
 The numerical kernels need a CUDA device (tests/test_tc_turing_reference.py). These tests exercise the
 decisions ``kindi.tc_turing`` takes before a kernel is launched, with a stand-in ``cupy`` so they run in CI:
-compute capability 7.5 is the only supported one, the module compiles for compute_75, and it exports the same
+compute capability 7.5 with a tensor-core Turing device name is the only supported one, the module compiles for
+compute_75, and it exports the same
 kernel names as the Ampere backend it replaces.
 """
 import contextlib
@@ -33,8 +34,8 @@ class _Module(object):
 
 
 @contextlib.contextmanager
-def _backend(major, minor, ptx=".version 6.0\n"):
-    """Import kindi.tc_turing against a fake cupy whose device reports (major, minor); restore on exit."""
+def _backend(major, minor, name="NVIDIA GeForce RTX 2080 Ti", ptx=".version 6.0\n"):
+    """Import kindi.tc_turing against a fake cupy whose device reports (major, minor, name); restore on exit."""
     names = ("cupy", "cupy.cuda", "cupy.cuda.runtime", "cupy.cuda.compiler", "cupy.cuda.function",
              "kindi.tc_turing")
     saved = {name: sys.modules.get(name) for name in names}
@@ -46,7 +47,7 @@ def _backend(major, minor, ptx=".version 6.0\n"):
     compiler = types.ModuleType("cupy.cuda.compiler")
     function = types.ModuleType("cupy.cuda.function")
     runtime = types.ModuleType("cupy.cuda.runtime")
-    runtime.getDeviceProperties = lambda card: {"major": major, "minor": minor}
+    runtime.getDeviceProperties = lambda card: {"major": major, "minor": minor, "name": name}
     compiler._NVRTCProgram = lambda src, name: _Compile(ptx)
     function.Module = _Module
     cp.cuda = cuda
@@ -81,6 +82,26 @@ def test_only_sm_75_is_supported():
         assert not tc.supported(0)                            # Ampere takes kindi.tc
     with _backend(8, 9) as tc:
         assert not tc.supported(0)
+
+
+def test_tu116_tu117_sm_75_devices_are_rejected():
+    """The name, not just sm_75, must select the Turing tensor-core backend.
+
+    TU116/TU117 report the same compute capability as TU102/TU104/TU106 but have no tensor cores; an mma
+    instruction traps on them.  The names below cover the GTX 16 series, the Quadro T400/T600/T1000/T2000,
+    the MX4xx/MX5xx parts and CMP 30HX; every one must stay on the plain engine.
+    """
+    yes = ("NVIDIA GeForce RTX 2060", "NVIDIA GeForce RTX 2080 Ti", "NVIDIA TITAN RTX",
+           "Quadro RTX 4000", "NVIDIA Tesla T4", "NVIDIA T4", "NVIDIA CMP 40HX")
+    no = ("NVIDIA GeForce GTX 1660 Ti", "NVIDIA GeForce GTX 1650", "NVIDIA GeForce GTX 1630",
+          "Quadro T400", "Quadro T600", "Quadro T1000", "Quadro T2000", "NVIDIA GeForce MX450",
+          "NVIDIA GeForce MX550", "NVIDIA CMP 30HX")
+    for name in yes:
+        with _backend(7, 5, name=name) as tc:
+            assert tc.supported(0), name
+    for name in no:
+        with _backend(7, 5, name=name) as tc:
+            assert not tc.supported(0), name
 
 
 def test_module_is_compiled_for_compute_75():

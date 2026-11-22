@@ -24,11 +24,26 @@ NAMES = ("k_tc_pack", "k_tc_q8", "k_tc_mv2", "k_tc_mv4", "k_tc_mv8", "k_tc_sum",
          "k_tc_mv3_2", "k_tc_mv3_4", "k_tc_mv3_8", "k_tc_mm2")
 
 
+# Turing parts with tensor cores: TU102, TU104 and TU106 (RTX 20, Titan RTX, Quadro RTX, Tesla T4, CMP 40HX).  The
+# other sm_75 parts - TU116/TU117 - have the same compute capability but no tensor cores (GTX 16 series, Quadro
+# T400/T600/T1000/T2000, MX4xx/MX5xx, CMP 30HX), and an mma instruction on them traps.  Compute capability cannot
+# tell the chips apart, so the device name decides; an unknown sm_75 name stays on the plain engine.
+_TENSOR = ("RTX 20", "TITAN RTX", "QUADRO RTX", "TESLA T4", " T4 ", "CMP 40HX")
+
+
+def tensor_cores(name):
+    """True for an sm_75 device name that belongs to a TU10x part (one with int8 tensor cores)"""
+    if isinstance(name, bytes):
+        name = name.decode("ascii", "replace")
+    return any(s in " " + name.upper().replace("-", " ") + " " for s in _TENSOR)
+
+
 def supported(card=None):
-    """Turing (compute capability 7.5) has the int8 IMMA m8n8k16 that tc_turing.cu uses.  Volta (7.0) and older do
-    not, and Ampere and later take the m16n8k32 path in kindi.tc."""
+    """Turing with tensor cores (compute capability 7.5, TU102/TU104/TU106) has the int8 IMMA m8n8k16 that
+    tc_turing.cu uses.  Volta (7.0) and older do not, Ampere and later take the m16n8k32 path in kindi.tc, and the
+    tensor-core-less sm_75 parts (GTX 16 series and the like) stay on the plain engine."""
     p = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id if card is None else card)
-    return p["major"] == 7 and p["minor"] == 5
+    return p["major"] == 7 and p["minor"] == 5 and tensor_cores(p["name"])
 
 
 def load_module(src):
