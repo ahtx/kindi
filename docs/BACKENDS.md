@@ -26,12 +26,36 @@ none of the adapter PRs ran a GPU gate, and no verify/bench parity is claimed.
 
 | adapter | model id | GPU-gate status |
 |---|---|---|
-| Bonsai (`kindi/backends/bonsai.py`) | `bonsai2-*` | Not run for the adapter; CPU tests only. The legacy engine's earlier evidence is not an adapter gate. |
+| Bonsai (`kindi/backends/bonsai.py`) | `bonsai2-*` | 2B gate measured natively on Windows 2026-11-22: verify 4/4 on both paths; both benches through 24K. 4B/9B/27B not run. |
 | Gemma 4 (`kindi/backends/gemma4.py`) | `gemma4-e4b` | Blocked: no Gemma 4 pack on the host. CPU tests only; no GPU run. |
 | Nemotron Lightning (`kindi/backends/lightning.py`) | `nemotron-lightning-30b` | Not run in the adapter PR. CPU tests only; no verify/bench parity. |
 | Nanbeige (`kindi/backends/nanbeige.py`) | `nanbeige-33b` | Blocked: the catalog GGUF is corrupt. CPU tests only; no GPU run. |
 | DeepSeek V4.1 (`kindi/backends/dsv41.py`) | `deepseek-v41-flash` | Blocked: no V4.1 weights. CPU tests only; no GPU run. |
 
+
+
+### Bonsai 2B GPU gate (2026-11-22)
+
+The local `bonsai-2b` pack (`source_file: Ternary-Bonsai-2B-PTQ1_0.gguf`, SHA-256
+`36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa`) was run natively
+on Windows on an RTX 4060 Ti (sm_89, 8188 MiB visible). `kindi verify` was token-exact
+on all four llama.cpp reference prompts through both paths: the adapter logged
+`-> the bonsai backend (bonsai2-2b)` and `KINDI_LEGACY_ENGINE_PATH=1` logged
+`-> the legacy dense engine builder, no backend adapter`; both were 4/4. The warm
+adapter run read 182.0 tok/s, the legacy run 186.1 tok/s.
+
+The adapter bench at `ctx 24576` read 162.4, 164.1, 189.8, 182.6 and 165.4 tok/s at
+positions 100, 2,000, 8,000, 16,000 and 24,000, with 225.4 tok/s prompt reading. The
+legacy row read 176.5, 173.6, 171.0, 178.5 and 155.9 tok/s, with 178.5 tok/s prompt
+reading. These are one reported run per path on a shared card; the bench spread is
+run-to-run variation, and no speed parity is claimed.
+
+The platform driver loader is PR #47's `gpudrv.driver_name()`: it selects
+`nvcuda.dll` on Windows and `libcuda.so.1` elsewhere, and `chunk1.py`, `sched.py`
+and `nanbeige.py` call `gpudrv.driver()` instead of loading `libcuda.so.1`
+directly. This branch carries that commit so the gate can run natively before #47
+lands. **PR #47 should merge first**; after it does, this copy is a no-op and can
+be dropped when #67 rebases.
 
 
 ## The contract
