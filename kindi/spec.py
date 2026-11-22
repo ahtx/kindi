@@ -1773,6 +1773,8 @@ def install(log=print):
         return tern, flt
 
     def _bplans(self):
+        if not getattr(self, "tc_layout", False):      # no tensor-core layout: the plain plans run
+            return o_bplans(self)
         if self.HB == 4096 and not HP:
             # measured on the 4060 Ti: the 9B passes the tc verify only with KINDI_TC_HP=1 (4/4, 122 tok/s);
             # with the default int8 activations one borderline prompt flips at token 36 (3/4)
@@ -1782,34 +1784,40 @@ def install(log=print):
         if self.HB not in (512, 1024, 4096):
             raise SystemExit("kindi: the tensor-core plan engine supports Hadamard blocks of 512, 1024 and 4096 "
                              "(this pack has %d); use the plain engine (KINDI_TP=0)" % self.HB)
-        if getattr(self, "tc_layout", False):          # the tensor-core plans replace them (any Hadamard block)
-            drv = _tp._drv()
-            cp.cuda.Device(self.card).synchronize()
-            if cp.cuda.runtime.is_hip:             # HIP: the device index (tp.py hipSetDevice(s.ctxh))
-                c = ctypes.c_int()
-                drv.hipGetDevice(ctypes.byref(c))
-                self.ctxh = c.value
-            else:                                  # CUDA: the current context
-                c = ctypes.c_void_p()
-                drv.cuCtxGetCurrent(ctypes.byref(c))
-                self.ctxh = c
-            return None
-        return o_bplans(self)
+        drv = _tp._drv()
+        cp.cuda.Device(self.card).synchronize()
+        if cp.cuda.runtime.is_hip:             # HIP: the device index (tp.py hipSetDevice(s.ctxh))
+            c = ctypes.c_int()
+            drv.hipGetDevice(ctypes.byref(c))
+            self.ctxh = c.value
+        else:                                  # CUDA: the current context
+            c = ctypes.c_void_p()
+            drv.cuCtxGetCurrent(ctypes.byref(c))
+            self.ctxh = c
+        return None
 
     _tp.Shard._slices, _tp.Shard.build_plans = _slices, _bplans
 
     def _load(self):
         backend = _tc_backend(self.card)
-        if self.HB == 4096 and not HP:          # measured on the 4060 Ti: refuse before the repack, not after
-            raise SystemExit("kindi: the tensor-core plan engine refuses Hadamard blocks of 4096 unless "
-                             "KINDI_TC_HP=1 (measured: 4/4 at 122 tok/s, 3/4 with the default activations); "
-                             "use the plain engine (KINDI_TP=0)")
         w_ok = self.tp.W == 1 if backend is _tc_turing else self.tp.W in (1, 2)
         if not (w_ok and self.g5l and backend is not None and load_stream(self)):
             o_load(self)
         if w_ok and self.g5l and backend is not None:
             self.sk = SpecKernels(backend=backend)
             repack(self, self.log)
+            tensor_core_layout = (getattr(self, "tc_layout", False)
+                                  and not getattr(self, "tc_lane", False)
+                                  and not _tc.pascal(self.card))
+            if self.HB == 4096 and not HP and tensor_core_layout:
+                # measured on the 4060 Ti: refuse only after the repack has confirmed the tensor-core
+                # layout; a declined layout keeps the plain-engine fallback
+                raise SystemExit("kindi: the tensor-core plan engine refuses Hadamard blocks of 4096 unless "
+                                 "KINDI_TC_HP=1 (measured: 4/4 at 122 tok/s, 3/4 with the default activations); "
+                                 "use the plain engine (KINDI_TP=0)")
+            if self.HB == 4096 and HP and tensor_core_layout:
+                self.log("card %d: 4096 Hadamard blocks run with high-precision activations (KINDI_TC_HP=1); "
+                         "that is the exact 9B tensor-core path (4/4, 122 tok/s; the default activations are 3/4)" % self.card)
 
     def _reserve(eng):
         o_reserve(eng)                          # the chunk buffers (chunk.py runs its GEMMs on the tc kernels)
