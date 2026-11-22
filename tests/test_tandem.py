@@ -463,3 +463,65 @@ def test_pack_bytes_splits_the_f32_file_per_layer(tmp_path):
     # 4 rows x 128 cols: 128 bcodes bytes + 4 dpm bytes, plus the layer's own f32 norm (16 bytes)
     assert sizes["layers"][0] == 4 * 32 + 4 * 2 + 16
     assert sizes["f32_layers"][0] == 16
+
+
+def test_plan_handoff_fills_every_block_start_buffer(monkeypatch):
+    """A partial plan alternates hA/hB; the handoff must fill both, not the cursor's last buffer.
+
+    The regression is the second token: after a block, ``_buf`` points at that block's output
+    buffer, while the next block reads its own start buffer.  Writing only ``_buf`` made the
+    GPU owner read the previous token's residual and the 9B split failed at token 0.
+    """
+    pytest.importorskip("cupy")
+    from kindi import tp
+
+    class Buf(object):
+        def __init__(self):
+            self.data = np.zeros(4, dtype=np.float32)
+
+        def __setitem__(self, key, value):
+            self.data[key] = value
+
+    class Card(object):
+        card = 0
+
+    hA, hB = Buf(), Buf()
+    card = Card()
+    card.plan_start = {1: hA, 2: hB}
+    card.plan_entry_buf = hA
+
+    class Device(object):
+        def __init__(self, number):
+            assert number == 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class FakeCP(object):
+        @staticmethod
+        def asarray(x):
+            return np.asarray(x, dtype=np.float32)
+
+        class cuda(object):
+            pass
+
+    FakeCP.cuda.Device = Device
+
+    class FakeEngine(object):
+        D = 4
+        cards = [card]
+        _pending = 0
+        _buf = hB                            # after the previous token's last block
+
+        def flush(self):
+            self._pending = 0
+
+    monkeypatch.setattr(tp, "cp", FakeCP)
+    fake = FakeEngine()
+    tp.TPEngine.set_hidden(fake, [1.0, 2.0, 3.0, 4.0])
+    np.testing.assert_array_equal(hA.data, [1.0, 2.0, 3.0, 4.0])
+    np.testing.assert_array_equal(hB.data, [1.0, 2.0, 3.0, 4.0])
+    assert fake._buf is hA

@@ -1,6 +1,6 @@
 # Tandem CPU+GPU runtime
 
-Status: **dense layer split implemented; CPU exactness tests pass, and the opt-in GPU memory gate was exercised on the 9B pack (memory fit passed, its 9B exactness child failed, so the gate returned 1); no 27B run is part of this PR.**
+Status: **dense layer split implemented; CPU exactness tests pass, and the opt-in GPU memory gate passes on the 9B pack (memory fit and token-exact verify); no 27B run is part of this PR.**
 
 A dense model needs every matrix on every token, so the unit of placement is a complete transformer
 block, not an expert. One backend runs a prefix or suffix of the blocks and hands the residual to the
@@ -100,11 +100,13 @@ The 27B claim still needs a 27B record from a host with the 27B pack. The gate i
 exercised on a 9B pack on 2026-11-22 (RTX 4060 Ti, sm_89, WSL2, gcc, ctx 4096, ceiling 2048 MiB,
 reserve 512 MiB, 2 tokens): it planned CPU layers `0,1,2,4,5`, kept the 4096-token context, and
 sampled a **1574.0 MiB** peak against the 2048 MiB budget (planner estimate 2004.9 MiB), so the
-memory check passed. With the exactness child enabled, `kindi verify` then failed at token 0 on
-all four 9B prompts (0/40, 0/40, 0/13 and 0/40 tokens), so the gate returned **1**; a fit alone
-is not reported as a pass. The failure is recorded as a 9B gate result and is not diagnosed here
-as a CPU, plan-owner or reference defect. That is a 9B check of the gate and the plan owner, not a
-27B measurement; the 9B records are local and not committed.
+memory check passed. With the exactness child enabled, `kindi verify` passed all four 9B prompts
+(40/40, 40/40, 13/13 and 40/40 tokens), so the gate returned **0**. The first run exposed a
+handoff bug: a partial plan alternates its residual buffers (hA/hB), and `set_hidden` wrote the
+cursor's last output buffer, which is not necessarily the next block's input. The handoff now
+fills every block-start buffer, and the same verify passes at both one and five CPU layers. That
+is a 9B check of the gate and the plan owner, not a 27B measurement; the 9B records are local and
+not committed.
 
 ## Limits
 
@@ -116,7 +118,7 @@ as a CPU, plan-owner or reference defect. That is a 9B check of the gate and the
   `KINDI_CPU_PACK` names a pack: `tests/test_cpu_layers.py` compares the per-layer sequence with
   the whole-model step, and `tests/test_tandem_cpu_e2e.py` compares both placements' greedy reply
   and handoff hidden state with the whole-model CPU engine. The tandem end-to-end test ran on the
-  2B pack (ctx 32, 2 threads, a 6-token reply): `cpu-first` and `gpu-first` were token-for-token
-  and bit-identical to the whole-model run. That run used the CPU engine as both owners. The
-  opt-in `tools/tandem_gate.py` passed its 9B memory check and failed its 9B exactness child as
-  described above; no 27B pack or 27B measurement is claimed.
+  9B pack (ctx 32, 2 threads, a 4-token prompt and a 6-token reply): `cpu-first` and `gpu-first`
+  were token-for-token and bit-identical to the whole-model run. That run used the CPU engine as both owners. The
+  opt-in `tools/tandem_gate.py` passed its 9B memory and exactness checks as described above; no
+  27B pack or 27B measurement is claimed.

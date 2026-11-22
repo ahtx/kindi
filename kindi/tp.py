@@ -12,69 +12,25 @@ give a partial sum of all D outputs. k_xrms swaps the two partials through mappe
 stream is bit-identical on the two cards. The embedding row is read from host memory by both cards.
 K/V cache: q8_0 (llama.cpp's -ctk q8_0 -ctv q8_0: blocks of 32 int8 with an fp16 scale); attention scores use
 llama.cpp's flash-attention arithmetic for that cache (the query in q8_0, integer block dot products).
-KINDI_KV=k8v4 (experimental, needs KINDI_KV_EXPERIMENTAL=1) keeps K at q8_0 and stores V as symmetric 4-bit
-blocks (16 packed bytes and an fp16 scale per 32 values). The V4 value kernels serve the per-token plan, the batched plan, the chunked prompt attention
-(k_att_flash4_T and k_att_pv4_T) and the tensor-core plans (k_attn_vq4w / k_attn_vq4w_m), so the cache format never
-changes which prompt path runs. The value kernels cover a head size of 256; the engine refuses k8v4 on any other
-geometry. q8_0 is the default, and its kernels, buffers and arithmetic are unchanged.
 
 A launch plan records one token's kernels once (function, grid, block, ctypes arguments) and replays them through
 cuLaunchKernel; only the token id and the position change between tokens (Dyn arguments). The exchange epochs are
 counted on the GPU."""
 import ctypes
-import hashlib
 import json
-import math
 import os
 import time
-from typing import Any
 
-import cupy as cp
 import numpy as np
+import cupy as cp
 
-from . import calib as _calib
-from . import hostram, layout
+from . import hostram
+from . import layout
 from . import slots as _slots
-from .engine import DEFAULT_DIMS, VOCAB, Kernels
-from .jsonio import load_json
+from .engine import Kernels, DEFAULT_DIMS, VOCAB
 
 rt = cp.cuda.runtime
 i32, f32t = np.int32, np.float32
-
-
-def kv_mode():
-    """The K/V cache format selected by KINDI_KV. q8_0 is the default and preserves the old cache.
-
-    k8v4 is experimental and lossy: its 4-bit V does not reproduce the fp16 K/V reference (2B `kindi verify`:
-    2 of 4 prompts, first difference at tokens 35-36; `kindi kld` measures its teacher-forced drift at
-    1.3e-04/2.3e-04 nats at 2K/8K, ~500-1000x q8_0's ~2e-7 and growing with context, so the quarantine
-    stands on the measurement), so it is refused unless KINDI_KV_EXPERIMENTAL=1.
-
-    fp8 (E4M3) is experimental and is decided by the KLD gate (REQ-0014): it is refused unless
-    KINDI_KV_EXPERIMENTAL=1, and its decode path is deliberately narrower than q8_0's (no
-    chunked prompt path, no tensor-core verify plans, no batch prompt path), so a lossy candidate
-    cannot silently become the default. The gate lives here because this is the only place the
-    format is selected, before any pack is read."""
-    value = os.environ.get("KINDI_KV", "q8_0").strip().lower()
-    if value in ("q8", "q8_0"):
-        return "q8_0"
-    if value in ("k8v4", "k8_v4"):
-        if os.environ.get("KINDI_KV_EXPERIMENTAL", "0") != "1":
-            raise SystemExit(
-                "kindi: KINDI_KV=k8v4 is an experimental, lossy cache (4-bit V): it is not token-exact with "
-                "the fp16 K/V reference (2B `kindi verify`: 2 of 4 prompts, first difference at tokens 35-36; "
-                "`kindi kld`: 1.3e-04/2.3e-04 nats at 2K/8K vs q8_0's ~2e-07). "
-                "Set KINDI_KV_EXPERIMENTAL=1 to use it; q8_0 is the supported default.")
-        return "k8v4"
-    if value in ("fp8", "f8_e4m3", "f8_e4m3fn"):
-        if os.environ.get("KINDI_KV_EXPERIMENTAL", "0") != "1":
-            raise SystemExit(
-                "kindi: KINDI_KV=fp8 is an experimental E4M3 cache whose quality is decided by the KLD gate "
-                "(REQ-0014): it must prove KLD no worse than q8_0 at 2K/8K, 4/4 exactness against the fp16 "
-                "reference at verify length on Ada, and a measured peak against q8_0 before it can be called "
-                "distribution-lossless. Set KINDI_KV_EXPERIMENTAL=1 to use it; q8_0 is the supported default.")
-        return "fp8"
-    raise SystemExit("kindi: KINDI_KV must be q8_0, k8v4 or fp8 (got %r)" % value)
 
 
 POW5 = np.array([1, 3, 9, 27, 81], dtype=np.uint16)
@@ -157,18 +113,6 @@ def _g5_pins(s):
     return s.g5pins
 
 
-def _calib_key(s):
-    """(gpu identity, pack source hash) for the calibration cache, or None when it cannot name them."""
-    try:
-        pack_sha = getattr(s.tp, "man", {}).get("source_sha256") if hasattr(s, "tp") else None
-        gpu = _calib.gpu_identity()
-        if pack_sha and gpu:
-            return gpu, str(pack_sha)
-    except Exception:
-        pass
-    return None
-
-
 def g5_tuned(s, name, R, NG, rowpar):
     """(threads, rows per thread, splits) for a 5-trit product of shape (R, 128 NG) on card s: timed once per shape."""
     pins = _g5_pins(s) if rt.is_hip and not s.g5l and os.environ.get("KINDI_G5_PIN", "1") == "1" else {}
@@ -186,13 +130,6 @@ def g5_tuned(s, name, R, NG, rowpar):
     cache = s.__dict__.setdefault("g5cfg", {})
     if key in cache:
         return cache[key]
-    ck = _calib_key(s)
-    if ck is not None:
-        hit = _calib.lookup_g5(ck[0], ck[1], bool(s.g5l), R, NG, rowpar)
-        if hit is not None and hit[2] * R <= s.gpart.size:
-            cache[key] = hit[:3]
-            s.__dict__.setdefault("g5var", {})[key] = hit[3]
-            return hit[:3]
     K = s.k
     W5 = s.w[name][1]
     Ws = [W5]
@@ -248,7 +185,7 @@ def g5_tuned(s, name, R, NG, rowpar):
                     ev1.record()
                     ev1.synchronize()
                     ms = cp.cuda.get_elapsed_time(ev0, ev1) / len(Wt)
-                    if best is None or ms < best[0]:
+                    if ms < best[0]:
                         best, fz = (ms, nt, rpt, sp), True
     var = "s" if fz else "r"
     if rt.is_hip and not s.g5l and os.environ.get("KINDI_G5_AB", "1") == "1":
@@ -262,19 +199,19 @@ def g5_tuned(s, name, R, NG, rowpar):
                         continue
                     f = fab[rpt]
 
-                    def run_ab():
+                    def run():
                         f((gx, sp), (nt,), (W5, s.gpart, i32(R), i32(NG), x))
                         if sp > 1 and not rowpar:
                             K.k_sumparts(((R + 255) // 256,), (256,), (s.gpart, s.y if R <= s.y.size else s.gpart, i32(R), i32(sp)))
                     for _ in range(3):
-                        run_ab()
+                        run()
                     ev0.record()
                     for W5 in Wt:
                         run()
                     ev1.record()
                     ev1.synchronize()
                     ms = cp.cuda.get_elapsed_time(ev0, ev1) / len(Wt) + (0.00002 * sp if rowpar else 0.0)
-                    if best is None or ms < best[0]:
+                    if ms < best[0]:
                         best, var = (ms, nt, rpt, sp), "a"
                     if sp > 1 and not rowpar and gx <= s.g5cnt.size:
                         # the same with the parts added by the last block (k_g5a*s: no k_sumparts launch)
@@ -288,15 +225,12 @@ def g5_tuned(s, name, R, NG, rowpar):
                         ev1.record()
                         ev1.synchronize()
                         ms = cp.cuda.get_elapsed_time(ev0, ev1) / len(Wt)
-                        if best is None or ms < best[0]:
+                        if ms < best[0]:
                             best, var = (ms, nt, rpt, sp), "as"
     s.__dict__.setdefault("g5var", {})[key] = var
-    assert best is not None                    # every call has at least one candidate (the first one)
     if os.environ.get("KINDI_G5_TUNELOG"):
         print("g5 tune %s: %s %s %.1f us, %.0f GB/s" % (key, best[1:], var, best[0] * 1e3, R * NG * 28 / best[0] / 1e6), flush=True)
-        cache[key] = best[1:]
-    if ck is not None:
-        _calib.store_g5(ck[0], ck[1], bool(s.g5l), R, NG, rowpar, (*best[1:], var))
+    cache[key] = best[1:]
     return best[1:]
 
 
@@ -370,10 +304,6 @@ class Plan(object):
     def __init__(self):
         self.segs = [[]]                 # a new segment starts at every exchange
         self.dyn = []                    # (holder, Dyn)
-        self.cores: Any = None           # chunk.py's segment bookkeeping (row-parallel exchanges)
-        self.xch: Any = None
-        self.rv: Any = None              # the decode slots' row values (spec.py *_R launches)
-        self.keep: Any = None
 
     def cut(self):
         if self.segs[-1]:
@@ -441,12 +371,8 @@ class Shard(object):
         self.tp, self.card, self.log = tp, card, log
         self.D, self.NL, self.HD, self.HK, self.HB = tp.D, tp.NL, tp.HD, tp.HK, tp.HB
         self.dims = tp.dims
-        self.k0, self.k1 = tp.gdn_groups[card]         # GDN q/k groups (their v heads move with them)
-        self.v0, self.v1 = tp.gdn_v[card]              # GDN v heads / state channels
-        self.q0, self.q1 = tp.attn_q[card]             # attention q heads
-        self.kv0, self.kv1 = tp.attn_kv[card]          # attention KV heads
-        self.NK, self.NV = self.k1 - self.k0, self.v1 - self.v0
-        self.NH, self.NHKV = self.q1 - self.q0, self.kv1 - self.kv0
+        self.NK, self.NV = tp.NKg // tp.W, tp.NVg // tp.W
+        self.NH, self.NHKV = tp.NHg // tp.W, tp.NHKVg // tp.W
         self.G = self.NH // self.NHKV
         self.g0, self.g1 = tp.ffn_rows[card]           # gate/up rows (whole Hadamard blocks)
         self.d0, self.d1 = tp.ffn_cols[card]           # ffn_down columns
@@ -476,13 +402,13 @@ class Shard(object):
         tp, c, HK, HD = self.tp, self.card, self.HK, self.HD
         NK, NV, NKg = self.NK, self.NV, tp.NKg
         rep = NV // NK
-        k0 = self.k0
+        k0 = c * NK
         qk_rows = [(k0 * HK, (k0 + NK) * HK), (NKg * HK + k0 * HK, NKg * HK + (k0 + NK) * HK)]
         v_rows = [(2 * NKg * HK + (r * NKg + k0) * HK, 2 * NKg * HK + (r * NKg + k0 + NK) * HK) for r in range(rep)]
         gate_rows = [(a - 2 * NKg * HK, b - 2 * NKg * HK) for a, b in v_rows]
         vh = _ranges(*[(r * NKg + k0, r * NKg + k0 + NK) for r in range(rep)])          # this card's v heads
-        gv0 = self.v0 * HK                                                             # grouped GDN output columns
-        h0, kvh0, a0 = self.q0, self.kv0, self.q0 * HD
+        gv0 = c * NV * HK                                                              # grouped GDN output columns
+        h0, kvh0, a0 = c * self.NH, c * self.NHKV, c * self.NH * HD
         tern, flt = {}, {}
         for il in tp.layers:
             p = "blk.%d." % il
@@ -514,7 +440,6 @@ class Shard(object):
         tern, flt = self._slices()
         tern_load = {} if self.g5 else tern       # 5-trit weights: the cache files, made from the slices below if missing
         bparts, dparts, bi = [], [], {}
-        bc_all = dp_all = np.empty(0, dtype=np.uint8)   # filled below on the 2-bit path, unused on the 5-trit one
         bo = do = 0
         if not self.g5:
             # the 2-bit weights of this card, written straight into one array each: one host copy (the parts and their
@@ -557,7 +482,7 @@ class Shard(object):
             # build, or a run with dual off) left HIP prompts token by token (780M 27B read 10.8 tok/s)
             # a cache without one of this card's tensors (made before the tied-head alias: the 2B / 4B's output.weight)
             # is made again
-            stale = os.path.exists(ipath) and not set(tern) <= set(load_json(ipath))
+            stale = os.path.exists(ipath) and not set(tern) <= set(json.load(open(ipath)))
             # B16: a cache records the sha256 of the bcodes.bin it was made from (g5_KEY.src); a cache of other bcodes
             # is made again, and before a cache is made the pack's files are checked in full
             from . import packcheck
@@ -570,7 +495,7 @@ class Shard(object):
                 try:                                  # a cache from before 0.7.0: the pack must still be the one recorded
                     packcheck.check(tp.pack, "fast", tp.man)
                 except packcheck.PackError as e:
-                    raise SystemExit("kindi: %s" % e) from None
+                    raise SystemExit("kindi: %s" % e)
             if stale or not (os.path.exists(cpath) and os.path.exists(ipath)) or \
                     ((self.g5l or dual) and not os.path.exists(lpath)):
                 # one tensor at a time, from the pack's memory maps to the cache files (the row layout, and the 16-row
@@ -581,7 +506,7 @@ class Shard(object):
                     try:
                         packcheck.check(tp.pack, "full", tp.man)
                     except packcheck.PackError as e:
-                        raise SystemExit("kindi: %s" % e) from None
+                        raise SystemExit("kindi: %s" % e)
                     tp._pack_checked = True
                 offs, o = {}, 0
                 fr = open(cpath + ".tmp", "wb")
@@ -617,7 +542,7 @@ class Shard(object):
                 if src:
                     with open(spath, "w") as f:
                         f.write(src + "\n")
-            offs = {n: tuple(v) for n, v in load_json(ipath).items()}
+            offs = {n: tuple(v) for n, v in json.load(open(ipath)).items()}
             lane = self.g5l and os.path.exists(lpath)
             if self.g5l and not lane:
                 raise SystemExit("kindi: the lane-layout cache %s is missing; delete %s to rebuild both" % (lpath, cpath))
@@ -756,7 +681,7 @@ class Shard(object):
             def kv(dt, last):
                 if not self.NATT_own:
                     return [None] * self.NATT
-                a = cp.zeros((self.NATT_own, ctx, self.NHKV, last), dtype=dt)
+                a = cp.zeros((self.NATT_own, rows, self.NHKV, last), dtype=dt)
                 out = [None] * self.NATT
                 for i, il in enumerate(self.owned_attn):
                     out[self.tp._kvi[il]] = a[i]
@@ -779,11 +704,9 @@ class Shard(object):
         s, tp, K = self, self.tp, self.k
         D, HB, HK, HD = s.D, s.HB, s.HK, s.HD
         NK, NV, NH, NHKV, NFF = s.NK, s.NV, s.NH, s.NHKV, s.NFF
-        if HB != 1024 and not (HB in (512, 4096) and getattr(tp, "W", None) == 1):   # one card: the 2B / 4B / 9B folds work as well
+        if HB != 1024 and not (HB in (512, 4096) and tp.W == 1):   # one card: the 2B / 4B / 9B folds work as well
             raise SystemExit("kindi: the tensor parallel engine needs Hadamard blocks of 1024")
         st = {"h": s.hA, "h2": s.hB, "pending": 0}
-        store_kv = K.k_store_k8v4 if tp.kv == "k8v4" else K.k_store_fp8 if tp.kv == "fp8" else K.k_store_q8
-        attn_v = K.k_attn_vq4w if tp.kv == "k8v4" else K.k_attn_vf8w if tp.kv == "fp8" else K.k_attn_vq8w
 
         def fold(P, kern, width, args, out):
             """a fold kernel over `width` values: Hadamard blocks of 512 / 1024 in one launch; larger blocks (the 9B's
@@ -865,7 +788,7 @@ class Shard(object):
             """5-trit products, one launch per tensor. A row-parallel output (part given, D rows) leaves its column
             parts in `part` for the next norm to add (returns their count); any other output adds its parts here."""
             ret = 1
-            for n, out in zip(names, outs, strict=False):
+            for n, out in zip(names, outs):
                 _, W5, R, C = s.w[n]
                 R, NG = int(R), int(C) // 128
                 nt, rpt, sp = g5_tuned(s, n, R, NG, part is not None and R == D)
@@ -917,10 +840,10 @@ class Shard(object):
                 P.add(K.k_rope2, (NHKV,), (256,), (s.kn, s.kn, Dyn("pos", s.cos_t.data.ptr, rd0, ptr=True),
                                                    Dyn("pos", s.sin_t.data.ptr, rd0, ptr=True), s.kro, s.kro, i32(0), i32(HD)))
                 nb0 = NHKV * HD // 32
-                P.add(store_kv, ((64 * nb0 + 1023) // 1024,), (min(1024, 64 * nb0),), (s.kro, s.qkvbuf,
+                P.add(K.k_store_q8, ((64 * nb0 + 1023) // 1024,), (min(1024, 64 * nb0),), (s.kro, s.qkvbuf,
                                                         Dyn("pos", s.Kq[kvi].data.ptr, NHKV * HD, ptr=True),
                                                         Dyn("pos", s.Kd[kvi].data.ptr, nb0 * 2, ptr=True),
-                                                        Dyn("pos", s.Vq[kvi].data.ptr, NHKV * (HD // 2 if tp.kv == "k8v4" else HD), ptr=True),
+                                                        Dyn("pos", s.Vq[kvi].data.ptr, NHKV * HD, ptr=True),
                                                         Dyn("pos", s.Vd[kvi].data.ptr, nb0 * 2, ptr=True), i32(nb0)))
                 st["pending"] = 0
                 return
@@ -931,18 +854,17 @@ class Shard(object):
             P.add(K.k_rope2, (NH + NHKV,), (256,), (s.fo, s.kn, Dyn("pos", s.cos_t.data.ptr, rd, ptr=True),
                                                     Dyn("pos", s.sin_t.data.ptr, rd, ptr=True), s.qr, s.kro, i32(NH), i32(HD)))
             nblk = NHKV * HD // 32
-            P.add(store_kv, ((64 * nblk + 1023) // 1024,), (min(1024, 64 * nblk),), (s.kro, s.qkvbuf,
+            P.add(K.k_store_q8, ((64 * nblk + 1023) // 1024,), (min(1024, 64 * nblk),), (s.kro, s.qkvbuf,
                                                      Dyn("pos", s.Kq[kvi].data.ptr, NHKV * HD, ptr=True),
                                                      Dyn("pos", s.Kd[kvi].data.ptr, nblk * 2, ptr=True),
-                                                     Dyn("pos", s.Vq[kvi].data.ptr, NHKV * (HD // 2 if tp.kv == "k8v4" else HD), ptr=True),
+                                                     Dyn("pos", s.Vq[kvi].data.ptr, NHKV * HD, ptr=True),
                                                      Dyn("pos", s.Vd[kvi].data.ptr, nblk * 2, ptr=True), i32(nblk)))
             P.add(K.k_q8row, ((NH * HD + 1023) // 1024,), (1024,), (s.qr, s.qq, s.qd, i32(NH * HD // 32)))
             n = lambda: Dyn("pos", 1, 1)  # noqa: E731
-            attn_s = K.k_attn_sf8t if tp.kv == "fp8" else K.k_attn_sq8d if s.dp4a else K.k_attn_sq8t
-            P.add(attn_s, (NHKV, (s.ctx + 255) // 256), (256,), (s.Kq[kvi], s.Kd[kvi], s.qq, s.qd, s.sbuf, n(), i32(NHKV), i32(s.G)))
+            P.add(K.k_attn_sq8d if s.dp4a else K.k_attn_sq8t, (NHKV, (s.ctx + 255) // 256), (256,), (s.Kq[kvi], s.Kd[kvi], s.qq, s.qd, s.sbuf, n(), i32(NHKV), i32(s.G)))
             P.add(K.k_softmax_rows, (NH,), (256,), (s.sbuf, n()))
-            P.add(attn_v, (NHKV, 1, (s.ctx + 255) // 256), (128,), (s.sbuf, s.Vq[kvi], s.Vd[kvi], s.apart, n(),
-                                                                     i32(NH), i32(NHKV), i32(s.G)))
+            P.add(K.k_attn_vq8w, (NHKV, 1, (s.ctx + 255) // 256), (128,), (s.sbuf, s.Vq[kvi], s.Vd[kvi], s.apart, n(),
+                                                                         i32(NH), i32(NHKV), i32(s.G)))
             P.add(K.k_attn_combn, (NH,), (256,), (s.apart, s.qn, s.att, n(), i32(NH)))
             fold(P, K.k_fold_fwht, NH * HD, (s.att, s.sA, s.xp), s.xp)
             st["pending"] = gemv(P, [p + "attn_output.weight"], s.xp, [s.y])
@@ -1040,114 +962,6 @@ class Shard(object):
 
 # ====================================================================================== the engine
 
-def tp_split_mode():
-    """KINDI_TP_SPLIT: auto derives the two cards' shares from their free VRAM; equal (the default)
-    keeps the historical 50/50 layout. Auto still uses equal when the usable capacities are close."""
-    raw = os.environ.get("KINDI_TP_SPLIT", "equal").strip().lower()
-    if raw in ("auto", "vram", "1", "on"):
-        return "auto"
-    if raw in ("", "equal", "off", "0"):
-        return "equal"
-    raise SystemExit("kindi: KINDI_TP_SPLIT must be auto or equal (got %r)" % raw)
-
-
-def vram_share(free, reserve):
-    """The first card's share of the usable free bytes. An unusable measurement is 50/50."""
-    usable = [max(0, int(x) - int(reserve)) for x in free]
-    if len(usable) != 2 or min(usable) <= 0 or sum(usable) <= 0:
-        return 0.5
-    return usable[0] / float(sum(usable))
-
-
-def _aligned_split(total, fraction, unit):
-    """The nearest multiple of unit to total * fraction, strictly between 0 and total."""
-    total, unit = int(total), int(unit)
-    if unit <= 0 or total <= 0 or total % unit or total < 2 * unit:
-        return None
-    slots = total // unit
-    k = int(round(total * float(fraction) / unit))
-    k = max(1, min(slots - 1, k))
-    return k * unit
-
-
-def _aligned_half(total, unit):
-    """An aligned fallback when a component is too small for a proportional split."""
-    total, unit = int(total), int(unit)
-    if unit <= 0 or total < 2 * unit or total % unit:
-        raise SystemExit("kindi: a tensor-parallel component of %d is too small to split" % total)
-    slots = total // unit
-    return max(1, min(slots - 1, slots // 2)) * unit
-
-
-def plan_split(dims, hb, vocab, fraction):
-    """A complete per-card layout for a two-card tensor-parallel run.
-
-    Every local width that a fold kernel consumes is a multiple of the pack's Hadamard block:
-    GDN v heads are HB-aligned (the q/k groups move with their v heads), attention q heads are
-    HB-aligned with their KV heads, the FFN rows and columns are whole HB blocks, and the output
-    head is split on 16-row units. A component that is too small for an aligned proportional
-    split keeps an aligned near-half split instead. The equal 50/50 path never calls this.
-    """
-    hb = int(hb)
-    NKg = int(dims["groups"])
-    HK = int(dims["state_size"])
-    HD = int(dims["head_dim"])
-    NHg = int(dims["heads"])
-    NHKVg = int(dims["kv_heads"])
-    NFFg = int(dims["ffn"])
-    NVg = int(dims["gdn_inner"]) // HK
-    if not 0.0 < float(fraction) < 1.0:
-        raise SystemExit("kindi: a tensor-parallel share must be between 0 and 1 (got %r)" % fraction)
-    if NVg % NKg or NHg % NHKVg:
-        raise SystemExit("kindi: the grouped GDN/attention dimensions do not divide evenly")
-    for width, what in ((NVg * HK, "GDN"), (NHg * HD, "attention"), (NFFg, "FFN")):
-        if hb <= 0 or width % hb:
-            raise SystemExit("kindi: the %s width %d is not a multiple of Hadamard block %d; "
-                             "proportional splitting is not aligned" % (what, width, hb))
-    rep = NVg // NKg
-    g_unit = hb // math.gcd(hb, rep * HK)                 # GDN groups that keep NV * HK HB-aligned
-    nk0 = _aligned_split(NKg, fraction, g_unit)
-    if nk0 is None:
-        nk0 = _aligned_half(NKg, g_unit)
-    nv0 = nk0 * rep
-    q_per_kv = NHg // NHKVg
-    kv_unit = hb // math.gcd(hb, q_per_kv * HD)           # KV heads that keep NH * HD HB-aligned
-    kv0 = _aligned_split(NHKVg, fraction, kv_unit)
-    if kv0 is None:
-        kv0 = _aligned_half(NHKVg, kv_unit)
-    q0 = kv0 * q_per_kv
-    f0 = _aligned_split(NFFg, fraction, hb)
-    if f0 is None:
-        f0 = _aligned_half(NFFg, hb)
-    h0 = _aligned_split(vocab, fraction, 16) if int(vocab) % 16 == 0 else None
-    if h0 is None:
-        h0 = max(1, min(int(vocab) - 1, int(vocab) // 2))
-    return {
-        "gdn_groups": [(0, nk0), (nk0, NKg)],
-        "gdn_v": [(0, nv0), (nv0, NVg)],
-        "attn_q": [(0, q0), (q0, NHg)],
-        "attn_kv": [(0, kv0), (kv0, NHKVg)],
-        "ffn_rows": [(0, f0), (f0, NFFg)],
-        "ffn_cols": [(0, f0), (f0, NFFg)],
-        "head_split": [0, h0, int(vocab)],
-    }
-
-
-def fd_supported(dims):
-    """KINDI_FD's split decode attention is verified for widths that are a multiple of 1024.
-
-    The 4B's 2560-wide products (the only padded-width Bonsai pack) diverge from llama.cpp with FD on;
-    the standard decode attention is exact apart from an accepted llama.cpp tie.
-    """
-    return int(dims.get("width", 0)) % 1024 == 0
-
-
-def layout_tag(layout):
-    """A filesystem-safe tag that keys the per-card g5 caches by the whole layout."""
-    raw = json.dumps(layout, sort_keys=True, separators=(",", ":")).encode("ascii")
-    return "-s" + hashlib.sha1(raw).hexdigest()[:10]
-
-
 class TPEngine(object):
     """Same interface as Engine (reset, feed, step, generate) over two cards.
 
@@ -1163,19 +977,17 @@ class TPEngine(object):
         blocking_sync(log)
         t0 = time.time()
         self.log = log
-        self.kv = kv_mode()
-        if self.kv != "q8_0" and os.environ.get("KINDI_SPEC", "0") == "1":
-            raise SystemExit("kindi: speculative decoding does not support KINDI_KV=%s" % self.kv)
         self.W = int(os.environ.get("KINDI_CARDS") or min(2, rt.getDeviceCount()))
         if self.W not in (1, 2) or rt.getDeviceCount() < self.W:
             raise SystemExit("kindi: the plan engine runs on 1 or 2 cards (%d found)" % rt.getDeviceCount())
         if layers is not None and self.W != 1:
             raise SystemExit("kindi: a tandem GPU owner runs on one card; set KINDI_CARDS=1")
-        man = self.man = load_json(os.path.join(pack, "kindi_pack.json"))
+        man = self.man = json.load(open(os.path.join(pack, "kindi_pack.json")))
         self.pack = pack
         self.dims = dict(DEFAULT_DIMS, **man.get("dimensions", {}))
         self.HB = int(man.get("hadamard_block", 512))
         self.D, self.NL = self.dims["width"], self.dims["layers"]
+        self.kv = "q8_0"          # the plan engine always uses q8_0 K/V
         self.NHg, self.NHKVg, self.HD = self.dims["heads"], self.dims["kv_heads"], self.dims["head_dim"]
         # A tandem split gives this engine only the layers it runs: see the class docstring. The layer
         # lists below stay indexed by the original layer number, with None for the other backend's
@@ -1215,72 +1027,31 @@ class TPEngine(object):
                 log("kindi: KINDI_KV=k8v4 keeps the V4 flash chunk attention (the tensor-core prompt attention is q8-only)")
             if os.environ.get("KINDI_FD", "0") == "1":
                 log("kindi: KINDI_KV=k8v4 keeps the per-query verify attention (the split flash-decode path is q8-only)")
-        if self.kv == "fp8":
-            log("kindi: KINDI_KV=fp8 uses E4M3 decode attention only (no chunk prompt path, no tensor-core "
-                "verify plans, no batch prompt path); prompts are fed one token at a time")
-            if os.environ.get("KINDI_FD", "0") == "1":
-                os.environ["KINDI_FD"] = "0"
         self.NKg, self.HK = self.dims["groups"], self.dims["state_size"]
         self.NVg = self.dims["gdn_inner"] // self.HK
         self.NFFg = self.dims["ffn"]
         self.inv_freq = np.float64(self.dims["rope_base"]) ** (-2.0 * np.arange(self.dims["rope_dim"] // 2) / self.dims["rope_dim"])
-        self.split_mode = tp_split_mode()
-        self.split_tag = ""
-        self.split_layout = None
         if self.W == 1:
-            self.gdn_groups, self.gdn_v = [(0, self.NKg)], [(0, self.NVg)]
-            self.attn_q, self.attn_kv = [(0, self.NHg)], [(0, self.NHKVg)]
             self.ffn_rows, self.ffn_cols, self.head_split = [(0, self.NFFg)], [(0, self.NFFg)], [0, VOCAB]
-            self.split_layout = {"gdn_groups": self.gdn_groups, "gdn_v": self.gdn_v,
-                                 "attn_q": self.attn_q, "attn_kv": self.attn_kv,
-                                 "ffn_rows": self.ffn_rows, "ffn_cols": self.ffn_cols,
-                                 "head_split": self.head_split}
         else:
-            layout = None
-            if self.split_mode == "auto":
-                free = []
-                for c in range(self.W):
-                    with cp.cuda.Device(c):
-                        free.append(rt.memGetInfo()[0])
-                fraction = vram_share(free, 512 * 2 ** 20)
-                fraction = min(0.8, max(0.2, fraction))
-                if abs(fraction - 0.5) > 0.05:
-                    layout = plan_split(self.dims, self.HB, VOCAB, fraction)
-                    self.split_tag = layout_tag(layout)
-                    log("plan engine: proportional split %.0f%% / %.0f%% from %.2f / %.2f GiB free"
-                        % (100 * fraction, 100 * (1 - fraction), free[0] / 2 ** 30, free[1] / 2 ** 30))
-            if layout is None:
-                for x in (self.NKg, self.NVg, self.NHg, self.NHKVg):
-                    if x % 2:
-                        raise SystemExit("kindi: dimensions do not split over two cards")
-                # FFN: gate/up in whole Hadamard blocks (an odd middle block on both cards), down columns split in half
-                nb = self.NFFg // self.HB
-                half = self.NFFg // 2
-                if half % 512:
-                    raise SystemExit("kindi: the FFN width does not split over two cards")
-                self.gdn_groups = [(0, self.NKg // 2), (self.NKg // 2, self.NKg)]
-                self.gdn_v = [(0, self.NVg // 2), (self.NVg // 2, self.NVg)]
-                self.attn_q = [(0, self.NHg // 2), (self.NHg // 2, self.NHg)]
-                self.attn_kv = [(0, self.NHKVg // 2), (self.NHKVg // 2, self.NHKVg)]
-                self.ffn_rows = [(0, (nb + 1) // 2 * self.HB), (nb // 2 * self.HB, self.NFFg)]
-                self.ffn_cols = [(0, half), (half, self.NFFg)]
-                self.head_split = [0, VOCAB // 2, VOCAB]
-                if os.environ.get("KINDI_TC", "0") == "1":
-                    # the tc plans (spec.py) take whole 1024-column units: the odd middle block goes to card 0
-                    m = (nb + 1) // 2 * self.HB
-                    self.ffn_rows = self.ffn_cols = [(0, m), (m, self.NFFg)]
-                    self.split_tag = "-b"
-            else:
-                self.gdn_groups, self.gdn_v = layout["gdn_groups"], layout["gdn_v"]
-                self.attn_q, self.attn_kv = layout["attn_q"], layout["attn_kv"]
-                self.ffn_rows, self.ffn_cols = layout["ffn_rows"], layout["ffn_cols"]
-                self.head_split = layout["head_split"]
-            self.split_layout = {"gdn_groups": self.gdn_groups, "gdn_v": self.gdn_v,
-                                 "attn_q": self.attn_q, "attn_kv": self.attn_kv,
-                                 "ffn_rows": self.ffn_rows, "ffn_cols": self.ffn_cols,
-                                 "head_split": self.head_split}
-        self.idx = load_json(os.path.join(pack, "index.json"))
-        self.bi = load_json(os.path.join(pack, "bcodes_index.json"))["tensors"]
+            for x in (self.NKg, self.NVg, self.NHKVg):
+                if x % 2:
+                    raise SystemExit("kindi: dimensions do not split over two cards")
+            # FFN: gate/up in whole Hadamard blocks (an odd middle block on both cards), down columns split in half
+            nb = self.NFFg // self.HB
+            half = self.NFFg // 2
+            if half % 512:
+                raise SystemExit("kindi: the FFN width does not split over two cards")
+            self.ffn_rows = [(0, (nb + 1) // 2 * self.HB), (nb // 2 * self.HB, self.NFFg)]
+            self.ffn_cols = [(0, half), (half, self.NFFg)]
+            if os.environ.get("KINDI_TC", "0") == "1":
+                # the tc plans (spec.py) take whole 1024-column units: the odd middle block goes to card 0
+                m = (nb + 1) // 2 * self.HB
+                self.ffn_rows = self.ffn_cols = [(0, m), (m, self.NFFg)]
+                self.split_tag = "-b"
+            self.head_split = [0, VOCAB // 2, VOCAB]
+        self.idx = json.load(open(os.path.join(pack, "index.json")))
+        self.bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
         self.tied_head = "output.weight" not in self.bi   # tied embeddings (2B, 4B): the head is token_embd
         if self.tied_head:
             self.bi["output.weight"] = self.bi["token_embd.weight"]
@@ -1291,7 +1062,7 @@ class TPEngine(object):
         self.flm = np.memmap(os.path.join(pack, "f32.bin"), dtype=np.float32, mode="r")
         self.signs = {w: np.fromfile(os.path.join(pack, "signs_%d.f32" % w), dtype=np.float32)
                       for w in (self.D, self.NVg * self.HK, self.NHg * self.HD, self.NFFg)}
-        self.vocab = load_json(os.path.join(pack, "vocab.json"))
+        self.vocab = json.load(open(os.path.join(pack, "vocab.json")))
         self._host_buffers()
         self.emb = None
         if self.need_embed:
@@ -1330,13 +1101,7 @@ class TPEngine(object):
         self.NB = int(os.environ.get("KINDI_BATCH", "4"))          # prompt tokens per batch (1: off; at most 6)
         self.batch_ok = False
         self.chunk, self.chunk_ok = {}, False
-        if self.kv == "fp8":
-            log("kindi: KINDI_KV=fp8 disables the batched/chunked prompt paths (their kernels are q8-only); "
-                "prompts are fed one token at a time")
-            self.batch_ok = False
-            self.chunk_ok = False
-            self.NB = 1
-        elif self.partial:
+        if self.partial:
             # a tandem owner is stepped one block per token by the other backend; the batched prompt
             # path and the chunked prompt path both replay the full model and cannot apply
             self.NB = 1
@@ -1345,11 +1110,17 @@ class TPEngine(object):
                 with cp.cuda.Device(s.card):        # kernel handles belong to the device that is current
                     s.plan_batch = build_batch_plan(s, self.NB)
             self.batch_ok = True
-        if not self.partial and self.kv != "fp8":
+        if not self.partial:
             _chunk.build(self)
         self.ylog_n, self.ylog_map = VOCAB, None
         self._state_views()
-        log("plan engine ready: %d card%s, ctx %d, K/V %s, weights %s (%.1fs)" % (self.W, "s" if self.W > 1 else "", self.ctx, self.kv, ("5-trit lane" if self.cards[0].g5l else "5-trit") if self.cards[0].g5 else "2-bit", time.time() - t0))
+        self.slots = None
+        if ns > 1:
+            if not getattr(self, "tc", False):
+                log("decode slots: need the tensor-core plans (KINDI_TC=1 on one card); one slot")
+            else:
+                self.slots = _slots.SlotSet(self, ns, log)
+        log("plan engine ready: %d card%s, ctx %d, K/V q8_0, weights %s (%.1fs)" % (self.W, "s" if self.W > 1 else "", self.ctx, ("5-trit lane" if self.cards[0].g5l else "5-trit") if self.cards[0].g5 else "2-bit", time.time() - t0))
 
     def _auto_split(self, ctx, log):
         """VRAM auto-split (0.7.0): on two cards with different free memory (mixed cards, or a card that also drives a
@@ -1390,7 +1161,7 @@ class TPEngine(object):
             try:
                 f = float(want)
             except ValueError:
-                raise SystemExit("kindi: KINDI_TP_SPLIT must be auto, even or a fraction, not %r" % want) from None
+                raise SystemExit("kindi: KINDI_TP_SPLIT must be auto, even or a fraction, not %r" % want)
             why = "KINDI_TP_SPLIT=%s" % want
         f = min(0.9, max(0.1, f))
         m = int(round(f * self.NFFg / U)) * U
@@ -1494,14 +1265,29 @@ class TPEngine(object):
             return cp.asnumpy(self._buf[:self.D]).copy()
 
     def set_hidden(self, values):
-        """Accept the other backend's residual as this backend's layer input."""
+        """Accept the other backend's residual as this backend's layer input.
+
+        The partial plans alternate their residual buffer: a block starts in one of hA/hB and
+        leaves its residual in the other.  ``self._buf`` follows that alternation, so writing it
+        here would put the handoff in the wrong buffer after the first token; the next block
+        would read its previous input.  Fill every block's start buffer instead, then reset the
+        cursor to the entry buffer.  Two small copies per handoff keep arbitrary explicit layer
+        sets (and therefore more than one handoff) correct.
+        """
         x = np.asarray(values, dtype=np.float32)
         if x.shape != (self.D,):
             raise ValueError("hidden state has shape %r, expected (%d,)" % (x.shape, self.D))
         self.flush()
         s = self.cards[0]
         with cp.cuda.Device(s.card):
-            self._buf[:self.D] = cp.asarray(x)
+            xg = cp.asarray(x)
+            seen = set()
+            for buf in s.plan_start.values():
+                if id(buf) in seen:
+                    continue
+                seen.add(id(buf))
+                buf[:self.D] = xg
+        self._buf = s.plan_entry_buf
         self._pending = 0
 
     def finish(self):
@@ -1731,9 +1517,6 @@ def build_batch_plan(s, NB):
     NK, NV, NH, NHKV, NFF = s.NK, s.NV, s.NH, s.NHKV, s.NFF
     z = lambda n, t=cp.float32: cp.zeros(n, dtype=t)  # noqa: E731
     work = max(D, NFF, NV * HK)
-    store_kv = K.k_store_k8v4 if tp.kv == "k8v4" else K.k_store_q8
-    attn_v = K.k_attn_vq4w if tp.kv == "k8v4" else K.k_attn_vq8w
-    vstride = NHKV * (HD // 2 if tp.kv == "k8v4" else HD)
     with cp.cuda.Device(s.card):
         HA, HBUF, XN = z(NB * D), z(NB * D), z(NB * D)
         XP, PART, Y = z(NB * work), z(NB * s.nsm * work), z(NB * D)
@@ -1746,7 +1529,7 @@ def build_batch_plan(s, NB):
     def gemv(P, names, x, outs, part):
         if s.g5:
             ret = 1
-            for n, out in zip(names, outs, strict=False):
+            for n, out in zip(names, outs):
                 _, W5, R, C = s.w[n]
                 R, NG = int(R), int(C) // 128
                 nt, rpt, sp = g5_tuned(s, n, R, NG, part is not None and R == D)
@@ -1872,10 +1655,10 @@ def build_batch_plan(s, NB):
                 P.add(K.k_rope2, (NHKV,), (256,), (s.kn, s.kn, Dyn("pos", s.cos_t.data.ptr + k * rd, rd, ptr=True),
                                                    Dyn("pos", s.sin_t.data.ptr + k * rd, rd, ptr=True), s.kro, s.kro,
                                                    i32(0), i32(HD)))
-            P.add(store_kv, ((64 * nb0 + 1023) // 1024,), (min(1024, 64 * nb0),), (s.kro, v(VB, k, NHKV * HD),
+            P.add(K.k_store_q8, ((64 * nb0 + 1023) // 1024,), (min(1024, 64 * nb0),), (s.kro, v(VB, k, NHKV * HD),
                                                     Dyn("pos", s.Kq[kvi].data.ptr + k * NHKV * HD, NHKV * HD, ptr=True),
                                                     Dyn("pos", s.Kd[kvi].data.ptr + k * nb0 * 2, nb0 * 2, ptr=True),
-                                                    Dyn("pos", s.Vq[kvi].data.ptr + k * vstride, vstride, ptr=True),
+                                                    Dyn("pos", s.Vq[kvi].data.ptr + k * NHKV * HD, NHKV * HD, ptr=True),
                                                     Dyn("pos", s.Vd[kvi].data.ptr + k * nb0 * 2, nb0 * 2, ptr=True), i32(nb0)))
             if last:
                 continue
@@ -1884,8 +1667,8 @@ def build_batch_plan(s, NB):
             P.add(K.k_attn_sq8d if s.dp4a else K.k_attn_sq8t, (NHKV, (s.ctx + 255) // 256), (256,), (s.Kq[kvi], s.Kd[kvi], s.qq, s.qd, s.sbuf, n(),
                                                                        i32(NHKV), i32(s.G)))
             P.add(K.k_softmax_rows, (NH,), (256,), (s.sbuf, n()))
-            P.add(attn_v, (NHKV, 1, (s.ctx + 255) // 256), (128,), (s.sbuf, s.Vq[kvi], s.Vd[kvi], s.apart, n(),
-                                                                  i32(NH), i32(NHKV), i32(s.G)))
+            P.add(K.k_attn_vq8w, (NHKV, 1, (s.ctx + 255) // 256), (128,), (s.sbuf, s.Vq[kvi], s.Vd[kvi], s.apart, n(),
+                                                                          i32(NH), i32(NHKV), i32(s.G)))
             P.add(K.k_attn_combn, (NH,), (256,), (s.apart, v(QN, k, NH * 2 * HD), s.att, n(), i32(NH)))
             P.add(K.k_fold_fwht, (NH * HD // HB,), (512,), (s.att, s.sA, v(XP, k, work), i32(HB)))
             pt, yt = out(k)
