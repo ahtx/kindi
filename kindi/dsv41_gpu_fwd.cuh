@@ -483,6 +483,22 @@ __global__ void k_compress(const float* ck, const float* cg, int T, const int* c
 }
 
 /* the latents -> index keys ik[g] and compressed kv ckv[g]; block per latent (HD threads); cs_lat [nl][RD] */
+#define CKV4_ROW (HD / 2 + HD / 16)    /* KINDI_DSV_CKV4: bytes of a packed compressed-KV entry (see KRow) */
+__device__ int g_ckv4;
+/* FP4 E2M1 value (one of 0, 0.5, 1, 1.5, 2, 3, 4, 6 with a sign) -> its 4-bit code (bit 3 = sign) */
+__device__ __forceinline__ int e2m1_code(float v) {
+    const float a = fabsf(v);
+    const int m = a < 0.25f ? 0 : a < 0.75f ? 1 : a < 1.25f ? 2 : a < 1.75f ? 3 : a < 2.5f ? 4 : a < 3.5f ? 5 : a < 5.f ? 6 : 7;
+    return m | (v < 0.f || (v == 0.f && signbit(v)) ? 8 : 0);
+}
+/* a positive E4M3 value (as rne_e4m3_s returns) -> its byte */
+__device__ __forceinline__ int e4m3_code(float v) {
+    int ex;
+    const float fr = frexpf(v, &ex);                 /* v = fr * 2^ex, fr in [0.5, 1) */
+    int e = ex - 1 + 7;                              /* biased exponent of 1.m form */
+    if (e >= 1) return (e << 3) | (int)lrintf((fr * 2.f - 1.f) * 8.f);
+    return (int)lrintf(v * 512.f);                   /* subnormal: mt x 2^-9 */
+}
 __global__ void k_lat(const float* lat, const float* latk, const int* latg, const float* cs_lat, const float* iknorm,
                       float* ik, float* ckv, int flags, const int* nlp) {
     if ((int)blockIdx.x >= *nlp) return;
@@ -522,11 +538,20 @@ __global__ void k_lat(const float* lat, const float* latk, const int* latg, cons
         ik[(size_t)g * IHD + d] = y;
     }
     float y = lv[d];
-    if (flags & F_FP4_CKV) {
+    if ((flags & F_FP4_CKV) || g_ckv4) {      /* the packed layout holds only FP4-rounded values (KINDI_DSV_CKV4) */
         float am = fabsf(y);
         for (int o = 8; o; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
         float sc = rne_e4m3_s(fmaxf(am, 6.f * 0x1p-9f) / 6.f);
-        y = v_rne_e2m1(fminf(fmaxf(y / sc, -6.f), 6.f)) * sc;
+        const float qv = v_rne_e2m1(fminf(fmaxf(y / sc, -6.f), 6.f));
+        y = qv * sc;
+        if (g_ckv4) {
+            const int c = e2m1_code(qv);
+            const int c1 = __shfl_down_sync(0xffffffffu, c, 1);
+            uint8_t* row = (uint8_t*)ckv + (size_t)g * CKV4_ROW;
+            if (!(d & 1)) row[d >> 1] = (uint8_t)(c | (c1 << 4));
+            if (!(d & 15)) row[HD / 2 + (d >> 4)] = (uint8_t)e4m3_code(sc);
+            return;
+        }
     }
     if (flags & F_F16_CACHE) y = f16r(y);
     ckv[(size_t)g * HD + d] = y;
@@ -700,11 +725,34 @@ __device__ __forceinline__ int attn_n(int p, int ratio, const int* ntop, int t) 
     int w0 = p - WIN + 1 < 0 ? 0 : p - WIN + 1;
     return (p - w0 + 1) + (ratio ? ntop[t] : 0);
 }
-__device__ __forceinline__ const float* attn_ent(int e, int p, int W, const float* win, const int* topk, int t,
-                                                 const float* ckv) {
+/* KINDI_DSV_CKV4=1 (F9 option B): the compressed KV is stored as its FP4 codes and E4M3 scales (one per 16 values),
+   CKV4_ROW = 288 bytes per entry instead of 2,048. The values are those of the F_FP4_CKV rounding (code value x
+   scale, an exact product in fp32), so a reader gets the same float bits from either layout. A row handle: f = fp32
+   row, or q = packed row (f unused). */
+struct KRow { const float* f; const uint8_t* q; };
+__device__ __forceinline__ float e2m1_val(int c) {
+    const float m = (c & 7) < 4 ? 0.5f * (c & 7) : (float)(1 << (((c & 7) >> 1) - 1)) * (1.f + 0.5f * (c & 1));
+    return c & 8 ? -m : m;
+}
+__device__ __forceinline__ float e4m3_val(int b) {       /* positive E4M3 (bias 7, subnormals below exponent 1) */
+    const int ex = (b >> 3) & 15, mt = b & 7;
+    return ex ? ldexpf(1.f + mt * 0.125f, ex - 7) : ldexpf(mt * 0.125f, -6);
+}
+__device__ __forceinline__ float kat(const KRow r, int d) {
+    if (!r.q) return r.f[d];
+    const int b = r.q[d >> 1];
+    return e2m1_val(d & 1 ? b >> 4 : b & 15) * e4m3_val(r.q[HD / 2 + (d >> 4)]);
+}
+__device__ __forceinline__ KRow attn_ent(int e, int p, int W, const float* win, const int* topk, int t,
+                                         const float* ckv) {
     int w0 = p - WIN + 1 < 0 ? 0 : p - WIN + 1, nw = p - w0 + 1;
-    if (e < nw) return win + (size_t)((w0 + e) % W) * HD;
-    return ckv + (size_t)topk[(size_t)t * ITOPK + e - nw] * HD;
+    KRow r;
+    r.q = NULL;
+    if (e < nw) { r.f = win + (size_t)((w0 + e) % W) * HD; return r; }
+    const size_t g = (size_t)topk[(size_t)t * ITOPK + e - nw];
+    if (g_ckv4) { r.f = NULL; r.q = (const uint8_t*)ckv + g * CKV4_ROW; }
+    else r.f = ckv + g * HD;
+    return r;
 }
 
 /* scores q.k * scale for (token, head, entry): 8 lane chains over d (step 8), hsum8; thread per entry.
@@ -715,14 +763,14 @@ __global__ void k_att_scores(const float* q, int qf16, const float* win, int W, 
     int t = blockIdx.z, h = blockIdx.y, e = blockIdx.x * blockDim.x + threadIdx.x, p = pos + t;
     int n = attn_n(p, ratio, ntop, t);
     if (e >= n) return;
-    const float* k = attn_ent(e, p, W, win, topk, t, ckv);
+    const KRow k = attn_ent(e, p, W, win, topk, t, ckv);
     const float* qh = q + ((size_t)t * NH + h) * HD;
     float a[8];
 #pragma unroll
     for (int l = 0; l < 8; l++) a[l] = 0.f;
     for (int d = 0; d < HD; d += 8)
 #pragma unroll
-        for (int l = 0; l < 8; l++) a[l] = __fmaf_rn(qf16 ? f16r(qh[d + l]) : qh[d + l], k[d + l], a[l]);
+        for (int l = 0; l < 8; l++) a[l] = __fmaf_rn(qf16 ? f16r(qh[d + l]) : qh[d + l], kat(k, d + l), a[l]);
     S[((size_t)t * NH + h) * MAXE + e] = hsum8v(a) * (1.f / sqrtf((float)HD));
 }
 
@@ -746,12 +794,12 @@ __global__ void __launch_bounds__(256) k_att_scores8(const float* q, int qf16, c
     for (int i0 = 0; i0 < ne * 8; i0 += blockDim.x) {
         const int i = i0 + threadIdx.x, el = i >> 3, l = i & 7;
         const bool live = el < ne;
-        const float* k = attn_ent(e0 + (live ? el : 0), p, W, win, topk, t, ckv);
+        const KRow k = attn_ent(e0 + (live ? el : 0), p, W, win, topk, t, ckv);
         float a[8];
 #pragma unroll
         for (int h = 0; h < 8; h++) a[h] = 0.f;
         for (int d = 0; d < HD; d += 8) {
-            const float kv = k[d + l];
+            const float kv = kat(k, d + l);
 #pragma unroll
             for (int h = 0; h < 8; h++) a[h] = __fmaf_rn(qs[h][d + l], kv, a[h]);
         }
@@ -786,7 +834,7 @@ __global__ void __launch_bounds__(256) k_att_scores8x4(const float* q, int qf16,
     const float scale = 1.f / sqrtf((float)HD);
     const int eg = threadIdx.x >> 3, l = threadIdx.x & 7, ng = blockDim.x >> 3;   /* 32 entry groups */
     for (int b0 = 0; b0 < ne; b0 += 4 * ng) {
-        const float* k[4]; bool live[4];
+        KRow k[4]; bool live[4];
 #pragma unroll
         for (int j = 0; j < 4; j++) {
             const int el = b0 + eg + j * ng;
@@ -801,7 +849,7 @@ __global__ void __launch_bounds__(256) k_att_scores8x4(const float* q, int qf16,
         for (int d = 0; d < HD; d += 8) {
             float kv[4];
 #pragma unroll
-            for (int j = 0; j < 4; j++) kv[j] = k[j][d + l];
+            for (int j = 0; j < 4; j++) kv[j] = kat(k[j], d + l);
 #pragma unroll
             for (int h = 0; h < 8; h++) {
                 const float qv = qs[h][d + l];
@@ -835,7 +883,7 @@ __global__ void __launch_bounds__(HD) k_att_split_out8(const float* S, const flo
 #pragma unroll
     for (int h = 0; h < 8; h++) o[h] = 0.f;
     for (int e = 0; e < ne; e++) {
-        const float kv = attn_ent(e0 + e, p, W, win, topk, t, ckv)[d];
+        const float kv = kat(attn_ent(e0 + e, p, W, win, topk, t, ckv), d);
 #pragma unroll
         for (int h = 0; h < 8; h++) o[h] = __fmaf_rn(ps[h][e], kv, o[h]);
     }
@@ -859,8 +907,8 @@ __global__ void __launch_bounds__(HD / 2) k_att_split_out8x2(const float* S, con
 #pragma unroll
     for (int h = 0; h < 8; h++) o[h] = o2[h] = 0.f;
     for (int e = 0; e < ne; e++) {
-        const float* kr = attn_ent(e0 + e, p, W, win, topk, t, ckv);
-        const float kv = kr[d], kv2 = kr[d + HD / 2];
+        const KRow kr = attn_ent(e0 + e, p, W, win, topk, t, ckv);
+        const float kv = kat(kr, d), kv2 = kat(kr, d + HD / 2);
 #pragma unroll
         for (int h = 0; h < 8; h++) { o[h] = __fmaf_rn(ps[h][e], kv, o[h]); o2[h] = __fmaf_rn(ps[h][e], kv2, o2[h]); }
     }
@@ -880,8 +928,8 @@ __global__ void __launch_bounds__(HD / 2) k_att_fa_out8x2(const float* S, const 
 #pragma unroll
     for (int h = 0; h < 8; h++) acc[h] = acc2[h] = 0.f;
     for (int e = 0; e < n; e++) {
-        const float* kr = attn_ent(e, p, W, win, topk, t, ckv);
-        const float kv = kr[d], kv2 = kr[d + HD / 2];
+        const KRow kr = attn_ent(e, p, W, win, topk, t, ckv);
+        const float kv = kat(kr, d), kv2 = kat(kr, d + HD / 2);
 #pragma unroll
         for (int h = 0; h < 8; h++) {
             const size_t ix = ((size_t)t * NH + h0 + h) * MAXE + e;
@@ -908,7 +956,7 @@ __global__ void __launch_bounds__(HD) k_att_fa_out8(const float* S, const float*
 #pragma unroll
     for (int h = 0; h < 8; h++) acc[h] = 0.f;
     for (int e = 0; e < n; e++) {
-        const float kv = attn_ent(e, p, W, win, topk, t, ckv)[d];
+        const float kv = kat(attn_ent(e, p, W, win, topk, t, ckv), d);
 #pragma unroll
         for (int h = 0; h < 8; h++) {
             const size_t ix = ((size_t)t * NH + h0 + h) * MAXE + e;
@@ -967,7 +1015,7 @@ __global__ void k_att_split_out(const float* S, const float* win, int W, const i
     int ne = n - c * ACS < ACS ? n - c * ACS : ACS;
     const float* sc = S + ((size_t)t * NH + h) * MAXE + c * ACS;
     float o = 0.f;
-    for (int e = 0; e < ne; e++) o = __fmaf_rn(sc[e], attn_ent(c * ACS + e, p, W, win, topk, t, ckv)[d], o);
+    for (int e = 0; e < ne; e++) o = __fmaf_rn(sc[e], kat(attn_ent(c * ACS + e, p, W, win, topk, t, ckv), d), o);
     ap[(((size_t)t * NH + h) * ANCH + c) * HD + d] = o;
 }
 /* step 3: merge the chunks of each head with the sink, into o[t][h] */
@@ -1011,13 +1059,13 @@ __global__ void __launch_bounds__(256) k_att_scores8w(const float* q, int qf16, 
     const float scale = 1.f / sqrtf((float)HD);
     const int el = threadIdx.x >> 3, l = threadIdx.x & 7;      /* 32 entries x 8 lanes */
     const bool live = e0 + el < n;
-    const float* k = attn_ent(live ? e0 + el : e0, p, W, win, topk, t, ckv);
+    const KRow k = attn_ent(live ? e0 + el : e0, p, W, win, topk, t, ckv);
     float a[8];
 #pragma unroll
     for (int h = 0; h < 8; h++) a[h] = 0.f;
 #pragma unroll 4
     for (int d = 0; d < HD; d += 8) {
-        const float kv = k[d + l];
+        const float kv = kat(k, d + l);
 #pragma unroll
         for (int h = 0; h < 8; h++) a[h] = __fmaf_rn(qs[h][d + l], kv, a[h]);
     }
@@ -1062,7 +1110,7 @@ __global__ void __launch_bounds__(HD / ATT_DS) k_att_split_out8w(const float* S,
     if (e0 >= n) return;
     const int ne = n - e0 < ACS ? n - e0 : ACS;
     __shared__ float ps[8][ACS];
-    __shared__ const float* kp[ACS];
+    __shared__ KRow kp[ACS];
     for (int i = threadIdx.x; i < 8 * ACS; i += blockDim.x)
         ps[i / ACS][i % ACS] = (i % ACS) < ne ? S[((size_t)t * NH + h0 + i / ACS) * MAXE + e0 + i % ACS] : 0.f;
     for (int e = threadIdx.x; e < ne; e += blockDim.x) kp[e] = attn_ent(e0 + e, p, W, win, topk, t, ckv);
@@ -1072,7 +1120,7 @@ __global__ void __launch_bounds__(HD / ATT_DS) k_att_split_out8w(const float* S,
     for (int h = 0; h < 8; h++) o[h] = 0.f;
     int e = 0;
     for (; e + 4 <= ne; e += 4) {
-        const float k0 = kp[e][d], k1 = kp[e + 1][d], k2 = kp[e + 2][d], k3 = kp[e + 3][d];
+        const float k0 = kat(kp[e], d), k1 = kat(kp[e + 1], d), k2 = kat(kp[e + 2], d), k3 = kat(kp[e + 3], d);
 #pragma unroll
         for (int h = 0; h < 8; h++) {
             o[h] = __fmaf_rn(ps[h][e], k0, o[h]);
@@ -1082,7 +1130,7 @@ __global__ void __launch_bounds__(HD / ATT_DS) k_att_split_out8w(const float* S,
         }
     }
     for (; e < ne; e++) {
-        const float kv = kp[e][d];
+        const float kv = kat(kp[e], d);
 #pragma unroll
         for (int h = 0; h < 8; h++) o[h] = __fmaf_rn(ps[h][e], kv, o[h]);
     }
@@ -1125,7 +1173,7 @@ __global__ void k_att_fa_out(const float* S, const float* MS, const float* den, 
     float acc = 0.f;
     for (int e = 0; e < n; e++) {
         if (ms[e] != 1.f) acc = f16r(acc * ms[e]);
-        acc = f16r(acc + vs[e] * attn_ent(e, p, W, win, topk, t, ckv)[d]);
+        acc = f16r(acc + vs[e] * kat(attn_ent(e, p, W, win, topk, t, ckv), d));
     }
     o[((size_t)t * NH + h) * HD + d] = acc / den[(size_t)t * NH + h];
 }
@@ -1436,6 +1484,9 @@ static struct {
     float *hx, *hmo, *hwsel; int* hsel;
     float *hlog, *lg;
     int* ctl;                     /* device: [0] = pos of the forward, [1 + l] = latents of layer l (upload) */
+    int* ctlb;                    /* device: ctl with [0] moved to a query block's first position (tiled attention) */
+    int att_ta;                   /* query tokens the attention scratch holds (KINDI_DSV_ATT_TILE, or tmax) */
+    int ckv4;                     /* the compressed KV in FP4 codes (KINDI_DSV_CKV4) */
     int graphing;                 /* 1 while a decode graph is captured: grids at their maxima */
     cudaGraphExec_t seg[NL + 1];  /* decode (T = 1) graphs: [embed + A0], [B(l-1) + A(l)], [B(39) + head] */
     int seg_flags, seg_ok;
@@ -1531,11 +1582,19 @@ static inline int ew_grid(size_t n) { size_t g = (n + 255) / 256; return (int)(g
 
 extern "C" {
 
+/* KINDI_DSV_ATT_TILE: see att_core */
+static int att_tile(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("KINDI_DSV_ATT_TILE") ? atoi(getenv("KINDI_DSV_ATT_TILE")) : 128;
+    return v;
+}
 int dg_model_init(int cap, int tmax, int m_out, const float* out_norm, const DgLayerDesc* desc) {
     /* the verify-batch GEMV may need more than 48 KB of shared memory (set before any graph capture) */
     CK(cudaFuncSetAttribute(k_q8ws<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024));
     CK(cudaFuncSetAttribute(k_q8ws<TTN>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024));
     G.cap = cap; G.tmax = tmax; G.W = WIN + tmax; G.m_out = m_out;
+    G.ckv4 = getenv("KINDI_DSV_CKV4") && atoi(getenv("KINDI_DSV_CKV4")) != 0;
+    CK(cudaMemcpyToSymbol(g_ckv4, &G.ckv4, sizeof(int)));
     G.cands = cap / CBLK + 1; G.scs = cap + 8;
     G.out_norm = dvec(out_norm, D);
     for (int l = 0; l < NL; l++) {
@@ -1552,7 +1611,7 @@ int dg_model_init(int cap, int tmax, int m_out, const float* out_norm, const DgL
         L->win = (float*)dz((size_t)G.W * HD * 4);
         if (d->kv_src) {
             size_t ng = (size_t)cap / d->ratio + 1;
-            L->ckv = (float*)dz(ng * HD * 4); L->ik = (float*)dz(ng * IHD * 4);
+            L->ckv = (float*)dz(ng * (G.ckv4 ? CKV4_ROW : HD * 4)); L->ik = (float*)dz(ng * IHD * 4);
             L->cst_kv = (float*)dz(CRING * HD * 4); L->cst_sc = (float*)dz(CRING * HD * 4);
         }
         if (d->idx_src) { L->topk = (int*)dz((size_t)tmax * ITOPK * 4); L->ntop = (int*)dz((size_t)tmax * 4); }
@@ -1579,9 +1638,15 @@ int dg_model_init(int cap, int tmax, int m_out, const float* out_norm, const DgL
     for (int l = 0; l < NL; l++) if (desc[l].eng >= 0 && desc[l].eng < 2) G.eng_l[desc[l].eng] = l;
     for (int e = 0; e < 2; e++) G.ekv_e[e] = (float*)dz((size_t)HOTT * (HC + 1) * D * 4);
     G.lat = (float*)dz(T * HD * 4); G.latk = (float*)dz(T * IHD * 4);
-    G.sc = (float*)dz(T * G.scs * 4); G.bs = (float*)dz(T * G.cands * 4);
-    G.S = (float*)dz(T * NH * MAXE * 4); G.MS = (float*)dz(T * NH * MAXE * 4); G.den = (float*)dz(T * NH * 4);
-    G.ap = (float*)dz(T * NH * ANCH * HD * 4); G.am = (float*)dz(T * NH * ANCH * 4); G.as = (float*)dz(T * NH * ANCH * 4);
+    {   /* the attention scratch for att_ta query tokens: a prompt chunk's attention runs in blocks of that many */
+        const int tile = att_tile();
+        G.att_ta = tile > 0 && (size_t)tile < T ? tile : (int)T;
+        const size_t TA = G.att_ta;
+        G.sc = (float*)dz(TA * G.scs * 4); G.bs = (float*)dz(TA * G.cands * 4);
+        G.S = (float*)dz(TA * NH * MAXE * 4); G.MS = (float*)dz(TA * NH * MAXE * 4); G.den = (float*)dz(TA * NH * 4);
+        G.ap = (float*)dz(TA * NH * ANCH * HD * 4); G.am = (float*)dz(TA * NH * ANCH * 4); G.as = (float*)dz(TA * NH * ANCH * 4);
+        G.ctlb = (int*)dz(256 * 4);
+    }
     G.xq = (int8_t*)dz(T * D); G.xd = (float*)dz(T * D / QK * 4);
     G.qaq = (int8_t*)dz(T * QR); G.qad = (float*)dz(T * QR / QK * 4);
     G.oq = (int8_t*)dz(T * NH * HD); G.od = (float*)dz(T * NH * HD / QK * 4);
@@ -1764,12 +1829,82 @@ static void hc_in_d(const float* fn, const float* scale, const float* base, cons
     rms_quant(G.x, D, norm_w, T, G.xq, G.xd);
 }
 
+/* KINDI_DSV_ATT_TILE (default 128; 0 = off): a prompt chunk's sparse attention (index scores, top-k, the attention
+   itself) runs in blocks of this many query tokens, so its scratch (scores over the whole context, softmax, anchors:
+   about 0.6 GB for 512 tokens at an 81,920 context) is sized for one block, not for tmax. Every kernel here computes
+   each query token on its own, from its own position (ctl[0] + t) and its own rows; a block gets a copy of ctl with
+   [0] moved to its first position and the pointers of its rows, so every token gets the same bits as without blocks.
+   The kernel variants are chosen from the whole chunk's T, as before. */
+__global__ void k_ctl_shift(const int* src, int* dst, int n, int t0) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i] + (i == 0 ? t0 : 0);
+}
+static void att_core(int l, int T, int pos, int flags) {
+    DLayer* L = &G.L[l];
+    const DgLayerDesc* d = &L->h;
+    const DLayer *KS = d->ratio ? &G.L[d->ks] : NULL, *IS = d->ratio ? &G.L[d->is] : NULL;
+    const int TB = !G.graphing && T > G.att_ta ? G.att_ta : T;
+    const int wide = T <= att_wide(), xmin = T > att_x_min();
+    const int ratio = d->ratio;
+    const int fa = (flags & F_LLAMA_FA) != 0;
+    const int nmaxe = G.graphing ? WIN + ITOPK : (pos + T < WIN ? pos + T : WIN) + (ratio ? ITOPK : 0);
+    for (int t0 = 0; t0 < T; t0 += TB) {
+        const int nb = T - t0 < TB ? T - t0 : TB;
+        const int* ctl = G.ctl;
+        if (t0) { k_ctl_shift<<<1, 64, 0, st>>>(G.ctl, G.ctlb, 2 + NL, t0); ctl = G.ctlb; }
+        uint8_t* cand = G.cand + (size_t)t0 * G.cands;
+        if (ratio && d->idx_src) {
+            int* ltopk = L->topk + (size_t)t0 * ITOPK;
+            int* lntop = L->ntop + t0;
+            int r = ratio, nmax = G.graphing ? G.cap / r : (pos + T) / r;
+            if (nmax > 0) {
+                k_idx_score<<<dim3((nmax + 127) / 128, nb), 128, 0, st>>>(G.iq + (size_t)t0 * IH * IHD, G.iw + (size_t)t0 * IH,
+                                                                          KS->ik, ctl, r, l > CAND_SRC, cand, G.cands,
+                                                                          G.sc, G.scs);
+                if (l == CAND_SRC) {
+                    int nbm = (nmax + CBLK - 1) / CBLK;
+                    k_blockmax<<<dim3((nbm + 255) / 256, nb), 256, 0, st>>>(G.sc, G.scs, ctl, r, G.bs, G.cands);
+                    /* the block list goes to bs-sized scratch (G.ap is free at this point) */
+                    k_topk<<<nb, 1024, 0, st>>>(G.bs, G.cands, ctl, r, 1, CTOPK, (int*)G.ap, G.cands, NULL, cand, G.cands);
+                }
+            }
+            k_topk<<<nb, 1024, 0, st>>>(G.sc, G.scs, ctl, r, 0, ITOPK, ltopk, ITOPK, lntop, NULL, 0);
+        }
+        PMARK(l, 4);
+        const int* topk = IS ? IS->topk + (size_t)t0 * ITOPK : NULL;
+        const int* ntop = IS ? IS->ntop + t0 : NULL;
+        const float* ckv = KS ? KS->ckv : NULL;
+        const float* q = G.q + (size_t)t0 * NH * HD;
+        float* o = G.o + (size_t)t0 * NH * HD;
+        if (wide)
+            k_att_scores8w<<<dim3((nmaxe + ACS1 - 1) / ACS1, NH / 8, nb), 256, 0, st>>>(q, fa, L->win, G.W, ctl, ratio, topk,
+                                                                                      ntop, ckv, G.S);
+        else if (xmin)
+            k_att_scores8x4<<<dim3((nmaxe + ACS - 1) / ACS, NH / 8, nb), 256, 0, st>>>(q, fa, L->win, G.W, ctl, ratio, topk,
+                                                                                     ntop, ckv, G.S);
+        else
+            k_att_scores8<<<dim3((nmaxe + ACS - 1) / ACS, NH / 8, nb), 256, 0, st>>>(q, fa, L->win, G.W, ctl, ratio, topk,
+                                                                                    ntop, ckv, G.S);
+        if (fa) {
+            k_att_fa_soft<<<dim3(1, nb), NH, 0, st>>>(G.S, G.MS, ctl, ratio, ntop, L->sinks, G.den);
+            if (xmin) k_att_fa_out8x2<<<dim3(NH / 8, nb), HD / 2, 0, st>>>(G.S, G.MS, G.den, L->win, G.W, ctl, ratio, topk, ntop, ckv, o);
+            else k_att_fa_out8<<<dim3(NH / 8, nb), HD, 0, st>>>(G.S, G.MS, G.den, L->win, G.W, ctl, ratio, topk, ntop, ckv, o);
+        } else {
+            if (wide) k_att_split_softw<<<dim3(NH, nb), 32 * ANCH, 0, st>>>(G.S, ctl, ratio, ntop, G.am, G.as);
+            else k_att_split_soft<<<dim3(NH, nb), 32, 0, st>>>(G.S, ctl, ratio, ntop, G.am, G.as);
+            if (wide) k_att_split_out8w<<<dim3(ANCH, NH / 8, nb * ATT_DS), HD / ATT_DS, 0, st>>>(G.S, L->win, G.W, ctl, ratio,
+                                                                                               topk, ntop, ckv, G.ap);
+            else if (xmin) k_att_split_out8x2<<<dim3(ANCH, NH / 8, nb), HD / 2, 0, st>>>(G.S, L->win, G.W, ctl, ratio, topk, ntop, ckv, G.ap);
+            else k_att_split_out8<<<dim3(ANCH, NH / 8, nb), HD, 0, st>>>(G.S, L->win, G.W, ctl, ratio, topk, ntop, ckv, G.ap);
+            k_att_combine<<<dim3(NH, nb), HD, 0, st>>>(G.ap, G.am, G.as, L->sinks, ctl, ratio, ntop, o);
+        }
+    }
+}
+
 static void attention_d(int l, int T, int pos, int flags, const float* cs, const float* cs_lat, const int* latg, int nl) {
     DLayer* L = &G.L[l];
     const DgLayerDesc* d = &L->h;
     const int br = branch_on();
     int csoff = d->ratio ? RD : 0;
-    const DLayer *KS = d->ratio ? &G.L[d->ks] : NULL, *IS = d->ratio ? &G.L[d->is] : NULL;
     /* the kv path (window kv, compressor, indexer weights) beside the query path (q_a, norm, q_b, RoPE) */
     if (br) br_fork(1);
     ON_SIDE(br, {
@@ -1801,52 +1936,7 @@ static void attention_d(int l, int T, int pos, int flags, const float* cs, const
     if (flags & F_F16_Q) k_round_f16<<<ew_grid((size_t)T * NH * HD), 256, 0, st>>>(G.q, (size_t)T * NH * HD);
     if (br) br_join(1);
     if (d->idx_src) k_iq_prep<<<T, IH * 32, 0, st>>>(G.iq, G.iw, cs, flags);
-    if (d->ratio) {
-        if (d->idx_src) {
-            int r = d->ratio, nmax = G.graphing ? G.cap / r : (pos + T) / r;
-            if (nmax > 0) {
-                k_idx_score<<<dim3((nmax + 127) / 128, T), 128, 0, st>>>(G.iq, G.iw, KS->ik, G.ctl, r, l > CAND_SRC, G.cand,
-                                                                         G.cands, G.sc, G.scs);
-                if (l == CAND_SRC) {
-                    int nbm = (nmax + CBLK - 1) / CBLK;
-                    k_blockmax<<<dim3((nbm + 255) / 256, T), 256, 0, st>>>(G.sc, G.scs, G.ctl, r, G.bs, G.cands);
-                    /* the block list goes to bs-sized scratch (G.ap is free at this point) */
-                    k_topk<<<T, 1024, 0, st>>>(G.bs, G.cands, G.ctl, r, 1, CTOPK, (int*)G.ap, G.cands, NULL, G.cand, G.cands);
-                }
-            }
-            k_topk<<<T, 1024, 0, st>>>(G.sc, G.scs, G.ctl, r, 0, ITOPK, L->topk, ITOPK, L->ntop, NULL, 0);
-        }
-    }
-    PMARK(l, 4);
-    const int* topk = IS ? IS->topk : NULL;
-    const int* ntop = IS ? IS->ntop : NULL;
-    const float* ckv = KS ? KS->ckv : NULL;
-    int ratio = d->ratio;
-    int nmaxe = G.graphing ? WIN + ITOPK : (pos + T < WIN ? pos + T : WIN) + (ratio ? ITOPK : 0);
-    int fa = (flags & F_LLAMA_FA) != 0;
-    const int wide = T <= att_wide();
-    if (wide)
-        k_att_scores8w<<<dim3((nmaxe + ACS1 - 1) / ACS1, NH / 8, T), 256, 0, st>>>(G.q, fa, L->win, G.W, G.ctl, ratio, topk,
-                                                                                 ntop, ckv, G.S);
-    else if (T > att_x_min())
-        k_att_scores8x4<<<dim3((nmaxe + ACS - 1) / ACS, NH / 8, T), 256, 0, st>>>(G.q, fa, L->win, G.W, G.ctl, ratio, topk,
-                                                                                ntop, ckv, G.S);
-    else
-        k_att_scores8<<<dim3((nmaxe + ACS - 1) / ACS, NH / 8, T), 256, 0, st>>>(G.q, fa, L->win, G.W, G.ctl, ratio, topk, ntop,
-                                                                               ckv, G.S);
-    if (fa) {
-        k_att_fa_soft<<<dim3(1, T), NH, 0, st>>>(G.S, G.MS, G.ctl, ratio, ntop, L->sinks, G.den);
-        if (T > att_x_min()) k_att_fa_out8x2<<<dim3(NH / 8, T), HD / 2, 0, st>>>(G.S, G.MS, G.den, L->win, G.W, G.ctl, ratio, topk, ntop, ckv, G.o);
-        else k_att_fa_out8<<<dim3(NH / 8, T), HD, 0, st>>>(G.S, G.MS, G.den, L->win, G.W, G.ctl, ratio, topk, ntop, ckv, G.o);
-    } else {
-        if (wide) k_att_split_softw<<<dim3(NH, T), 32 * ANCH, 0, st>>>(G.S, G.ctl, ratio, ntop, G.am, G.as);
-        else k_att_split_soft<<<dim3(NH, T), 32, 0, st>>>(G.S, G.ctl, ratio, ntop, G.am, G.as);
-        if (wide) k_att_split_out8w<<<dim3(ANCH, NH / 8, T * ATT_DS), HD / ATT_DS, 0, st>>>(G.S, L->win, G.W, G.ctl, ratio, topk,
-                                                                                          ntop, ckv, G.ap);
-        else if (T > att_x_min()) k_att_split_out8x2<<<dim3(ANCH, NH / 8, T), HD / 2, 0, st>>>(G.S, L->win, G.W, G.ctl, ratio, topk, ntop, ckv, G.ap);
-        else k_att_split_out8<<<dim3(ANCH, NH / 8, T), HD, 0, st>>>(G.S, L->win, G.W, G.ctl, ratio, topk, ntop, ckv, G.ap);
-        k_att_combine<<<dim3(NH, T), HD, 0, st>>>(G.ap, G.am, G.as, L->sinks, G.ctl, ratio, ntop, G.o);
-    }
+    att_core(l, T, pos, flags);
     PMARK(l, 5);
     k_rope<<<dim3(T, NH / 8), dim3(RD / 2, 8), 0, st>>>(G.o, NH, HD, cs, 2 * RD, csoff, 1);
     if (flags & F_FP8_O) k_sim_fp8<<<dim3(NH * HD / 256, T), 256, 0, st>>>(G.o, NH * HD, NH * HD);
@@ -2983,7 +3073,7 @@ static size_t state_parts(int pos, void* host, int load) {
         PART(L->win, (size_t)G.W * HD * 4);
         if (L->h.kv_src) {
             const size_t ng = (size_t)pos / L->h.ratio + 1;
-            PART(L->ckv, ng * HD * 4);
+            PART(L->ckv, ng * (G.ckv4 ? CKV4_ROW : HD * 4));
             PART(L->ik, ng * IHD * 4);
             PART(L->cst_kv, (size_t)CRING * HD * 4);
             PART(L->cst_sc, (size_t)CRING * HD * 4);
@@ -2995,7 +3085,46 @@ static size_t state_parts(int pos, void* host, int load) {
     return off;
 }
 
+/* Ring checkpoints (0.7.0, rewind past the window ring): only the parts of the state that later positions overwrite
+   in place - the WIN window-ring rows of positions pos - WIN .. pos - 1 in every layer, the compressor input rings and
+   the drafter's rings. The compressed KV and index keys are indexed by position: their entries below pos stay valid
+   while the tokens before pos are unchanged, so a checkpoint plus those entries on the card is the full state at pos
+   (about 11 MB, against 400 MB for a full state at 32K). */
+static size_t ring_parts(int pos, void* host, int load) {
+    size_t off = 0;
+    uint8_t* h = (uint8_t*)host;
+#define PART(dptr, bytes) do { size_t b_ = (bytes); if (h) { if (load) cudaMemcpy((dptr), h + off, b_, cudaMemcpyHostToDevice);                                                          else cudaMemcpy(h + off, (dptr), b_, cudaMemcpyDeviceToHost); } off += b_; } while (0)
+    for (int l = 0; l < NL; l++) {
+        DLayer* L = &G.L[l];
+        for (int p = pos - WIN; p < pos; ) {             /* the slots of positions pos - WIN .. pos - 1, in runs */
+            if (p < 0) { off += (size_t)(-p) * HD * 4; p = 0; continue; }
+            const int s = p % G.W, n = (pos - p) < (G.W - s) ? (pos - p) : (G.W - s);
+            PART(L->win + (size_t)s * HD, (size_t)n * HD * 4);
+            p += n;
+        }
+        if (L->h.kv_src) {
+            PART(L->cst_kv, (size_t)CRING * HD * 4);
+            PART(L->cst_sc, (size_t)CRING * HD * 4);
+        }
+    }
+    /* the drafter's rings have their place whether DSpark is on or not: the size is asked once, when the model
+       loads, and DSpark is loaded after that (with the place only while on, a save after dspark_load wrote 768 KB
+       past the host buffer: the 11-15 crash in dsv_ring_save) */
+    for (int s = 0; s < DS_STAGES; s++) {
+        if (DS.on) PART(DS.S[s].ring, (size_t)DS_WIN * HD * 4);
+        else off += (size_t)DS_WIN * HD * 4;
+    }
+#undef PART
+    return off;
+}
+
+size_t dg_ring_size(void) { return ring_parts(WIN, NULL, 0); }
+int dg_ring_save(int pos, void* host) { CK(cudaStreamSynchronize(st)); ring_parts(pos, host, 0); return 0; }
+int dg_ring_load(int pos, const void* host) { CK(cudaStreamSynchronize(st)); ring_parts(pos, (void*)host, 1); CK(cudaDeviceSynchronize()); return 0; }
+
 size_t dg_state_size(int pos) { return state_parts(pos, NULL, 0); }
+/* the layout of the saved state: 1 when the compressed KV is in FP4 codes (a different checkpoint format) */
+int dg_ckv4(void) { return G.ckv4; }
 int dg_state_save(int pos, void* host) { CK(cudaStreamSynchronize(st)); state_parts(pos, host, 0); return 0; }
 int dg_state_load(int pos, const void* host) { CK(cudaStreamSynchronize(st)); state_parts(pos, (void*)host, 1); CK(cudaDeviceSynchronize()); return 0; }
 

@@ -5,6 +5,7 @@ Copyright (c) 2026 Amir Husain. SPDX-License-Identifier: AGPL-3.0-only. See LICE
 """
 import configparser
 import hashlib
+import json
 import os
 import sys
 import urllib.request
@@ -75,11 +76,20 @@ def fits(m, cards):
 
 
 def model_dir(cfg):
-    return os.path.join(os.path.dirname(os.path.expanduser(cfg["pack"]).rstrip("/")) or ".", "models")
+    base = os.path.dirname(os.path.normpath(os.path.expanduser(cfg["pack"])))
+    if os.path.basename(base) == "packs":   # a pack that `kindi use` made (KINDI_HOME/packs/ID): the same home
+        base = os.path.dirname(base)
+    return os.path.join(base or ".", "models")
 
 
-def list_models(cfg, log=print):
+def list_models(cfg, log=print, as_json=False):
     cards = _cards()
+    if as_json:                      # for programs (Kindi Monitor's model selector): stdout only, no log lines
+        d = model_dir(cfg)
+        print(json.dumps([{"id": mid, "what": m["what"], "size_gb": round(m["size"] / 1e9, 1),
+                           "fits": fits(m, cards) or "", "downloaded": os.path.isfile(os.path.join(d, m["file"]))}
+                          for mid, m in MODELS.items()]))
+        return
     log("GPUs: %s" % (", ".join("%s (%d MiB)" % c for c in cards) or "none (the CPU engine runs the Bonsai models)"))
     d = model_dir(cfg)
     for mid, m in MODELS.items():

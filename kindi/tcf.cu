@@ -481,9 +481,10 @@ template <int G>
 __device__ __forceinline__ void fd_q8(const uint4* __restrict__ Kq, const unsigned short* __restrict__ Kd,
     const unsigned int* __restrict__ Vq4, const unsigned short* __restrict__ Vd, const signed char* __restrict__ qq,
     const float* __restrict__ qd, int qs, float* __restrict__ part, long long ps, float* __restrict__ ml, long long mls,
-    int n0, int n_kv){
-  const int kv = blockIdx.x, c = blockIdx.y, q = blockIdx.z, tid = threadIdx.x;
-  const int n = n0 + q, p0 = c * FD_CH;
+    int q, int n, int n_kv){
+  /* q: the query (blockIdx.z), n: the positions it sees (n0 + q; a decode slot row: its own count) */
+  const int kv = blockIdx.x, c = blockIdx.y, tid = threadIdx.x;
+  const int p0 = c * FD_CH;
   if(p0 >= n) return;
   const int len = min(FD_CH, n - p0), NH = n_kv * G;
   __shared__ float S[G][FD_CH < 512 ? 512 : FD_CH];   /* (also the value-sum reduction: 2 G 256 floats) */
@@ -607,14 +608,13 @@ __device__ __forceinline__ void fd_q8(const uint4* __restrict__ Kq, const unsign
 }
 
 #define FD_ARGS const uint4* __restrict__ Kq, const unsigned short* __restrict__ Kd, const unsigned int* __restrict__ Vq4,     const unsigned short* __restrict__ Vd, const signed char* __restrict__ qq, const float* __restrict__ qd, int qs,     float* __restrict__ part, long long ps, float* __restrict__ ml, long long mls, int n0, int n_kv
-extern "C" __global__ void __launch_bounds__(256) k_fd_q8_4(FD_ARGS){ fd_q8<4>(Kq, Kd, Vq4, Vd, qq, qd, qs, part, ps, ml, mls, n0, n_kv); }
-extern "C" __global__ void __launch_bounds__(256) k_fd_q8_6(FD_ARGS){ fd_q8<6>(Kq, Kd, Vq4, Vd, qq, qd, qs, part, ps, ml, mls, n0, n_kv); }
-extern "C" __global__ void __launch_bounds__(256) k_fd_q8_8(FD_ARGS){ fd_q8<8>(Kq, Kd, Vq4, Vd, qq, qd, qs, part, ps, ml, mls, n0, n_kv); }
+extern "C" __global__ void __launch_bounds__(256) k_fd_q8_4(FD_ARGS){ fd_q8<4>(Kq, Kd, Vq4, Vd, qq, qd, qs, part, ps, ml, mls, blockIdx.z, n0 + blockIdx.z, n_kv); }
+extern "C" __global__ void __launch_bounds__(256) k_fd_q8_6(FD_ARGS){ fd_q8<6>(Kq, Kd, Vq4, Vd, qq, qd, qs, part, ps, ml, mls, blockIdx.z, n0 + blockIdx.z, n_kv); }
+extern "C" __global__ void __launch_bounds__(256) k_fd_q8_8(FD_ARGS){ fd_q8<8>(Kq, Kd, Vq4, Vd, qq, qd, qs, part, ps, ml, mls, blockIdx.z, n0 + blockIdx.z, n_kv); }
 
-extern "C" __global__ void k_fd_comb(const float* __restrict__ part, long long ps, const float* __restrict__ ml,
-    long long mls, const float* __restrict__ gatev, int gs, float* __restrict__ att, int as, int n0, int nheads){
-  /* grid (NH, queries), block 256 (a thread = a feature): the chunks merged in order, then the sigmoid gate */
-  const int hh = blockIdx.x, q = blockIdx.y, f = threadIdx.x, n = n0 + q, nch = (n + FD_CH - 1) / FD_CH;
+__device__ __forceinline__ void fd_comb(const float* __restrict__ part, long long ps, const float* __restrict__ ml,
+    long long mls, const float* __restrict__ gatev, int gs, float* __restrict__ att, int as, int q, int n, int nheads){
+  const int hh = blockIdx.x, f = threadIdx.x, nch = (n + FD_CH - 1) / FD_CH;
   part += q * ps;
   ml += q * mls;
   float M = -1e30f;
@@ -627,6 +627,26 @@ extern "C" __global__ void k_fd_comb(const float* __restrict__ part, long long p
   }
   const float g = gatev[(long long)q * gs + hh * 512 + 256 + f];
   att[(long long)q * as + hh * 256 + f] = (acc / L) * (1.0f / (1.0f + expf(-g)));
+}
+
+extern "C" __global__ void k_fd_comb(const float* __restrict__ part, long long ps, const float* __restrict__ ml,
+    long long mls, const float* __restrict__ gatev, int gs, float* __restrict__ att, int as, int n0, int nheads){
+  /* grid (NH, queries), block 256 (a thread = a feature): the chunks merged in order, then the sigmoid gate */
+  fd_comb(part, ps, ml, mls, gatev, gs, att, as, blockIdx.y, n0 + blockIdx.y, nheads);
+}
+
+/* decode slots (slots.py): the split flash-decode of every row of a batched pass in one launch. Row r is query r
+   (blockIdx.z / blockIdx.y, as in a verify pass) with its own cache (ptab[j * R + r]: Kq, Kd, Vq, Vd) and its own
+   position count rv[R + r]; the arithmetic is fd_q8's / fd_comb's for one query. */
+#define FD_R_ARGS const unsigned long long* __restrict__ ptab, const int* __restrict__ rv, int R,     const signed char* __restrict__ qq, const float* __restrict__ qd, int qs, float* __restrict__ part, long long ps,     float* __restrict__ ml, long long mls, int n_kv
+#define FD_R(G) { const int r = blockIdx.z;     fd_q8<G>(reinterpret_cast<const uint4*>(ptab[r]), reinterpret_cast<const unsigned short*>(ptab[R + r]),              reinterpret_cast<const unsigned int*>(ptab[2 * R + r]), reinterpret_cast<const unsigned short*>(ptab[3 * R + r]),              qq, qd, qs, part, ps, ml, mls, r, rv[R + r], n_kv); }
+extern "C" __global__ void __launch_bounds__(256) k_fd_q8_4R(FD_R_ARGS) FD_R(4)
+extern "C" __global__ void __launch_bounds__(256) k_fd_q8_6R(FD_R_ARGS) FD_R(6)
+extern "C" __global__ void __launch_bounds__(256) k_fd_q8_8R(FD_R_ARGS) FD_R(8)
+extern "C" __global__ void k_fd_comb_R(const int* __restrict__ rv, int R, const float* __restrict__ part, long long ps,
+    const float* __restrict__ ml, long long mls, const float* __restrict__ gatev, int gs, float* __restrict__ att, int as,
+    int nheads){
+  fd_comb(part, ps, ml, mls, gatev, gs, att, as, blockIdx.y, rv[R + blockIdx.y], nheads);
 }
 
 /* ------------------------------------------------------------------ D1: residual add + RMS norm + fold + quantise */

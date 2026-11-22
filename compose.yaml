@@ -11,7 +11,7 @@
 # Settings (environment or a .env file beside this file):
 #   KINDI_MODEL       a model id (bonsai-2b, bonsai-4b, bonsai-9b, bonsai-27b, nemotron-e4b, nanbeige-33b) or a GGUF
 #                     path in the container, for example /data/models/my-model.gguf
-#   KINDI_TAG         the image tag (default: cuda = the latest release; pin a release with 0.6.1-cuda)
+#   KINDI_TAG         the image tag (default: cuda = the latest release; pin a release with 0.6.0-cuda)
 #   KINDI_PORT        the host port (default 8093); KINDI_BIND=0.0.0.0 serves the LAN (set KINDI_API_KEY then)
 #   KINDI_DATA        a host folder for /data instead of the named volume (an absolute path)
 #   KINDI_VOLUME      the name of the named volume (default kindi-data, the same as in the docker run examples)

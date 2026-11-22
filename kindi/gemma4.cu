@@ -268,7 +268,9 @@ __device__ __forceinline__ unsigned int g4_vsub4(unsigned int a,unsigned int b) 
 #endif
 }
 __device__ __forceinline__ int g4_dp4a(int a,int b,int c) {
-#if KHIP
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+    return __builtin_amdgcn_sdot4(a,b,c,false);                  /* RDNA2: v_dot4_i32_i8 (no sudot4) */
+#elif KHIP
     return __builtin_amdgcn_sudot4(true,a,true,b,c,false);       /* v_dot4_i32_iu8, both operands signed */
 #elif __CUDA_ARCH__ >= 610
     int d; asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c)); return d;

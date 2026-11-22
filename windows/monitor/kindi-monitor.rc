@@ -1,0 +1,27 @@
+// Kindi Monitor resources: the manifest (per-monitor DPI v2, asInvoker: no administrator prompt) and the version.
+#include <winver.h>
+1 ICON "kindi.ico"
+1 24 "kindi-monitor.manifest"
+1 VERSIONINFO
+FILEVERSION 0,7,0,0
+PRODUCTVERSION 0,7,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Kindi"
+      VALUE "FileDescription", "Kindi Monitor"
+      VALUE "FileVersion", "0.7.0"
+      VALUE "LegalCopyright", "Copyright (c) 2026 Amir Husain. AGPL-3.0-only."
+      VALUE "ProductName", "Kindi"
+      VALUE "ProductVersion", "0.7.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

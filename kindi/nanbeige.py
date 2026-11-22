@@ -36,8 +36,11 @@ HOST_SLOTS = int(os.environ.get("KINDI_NB_SLOTS", "2"))     # device buffers for
 KRB = 8                                                      # nbq_k35.cu NBQ_KRB: rows per batch of nbq_mvc
 MVN = {12: "nbq_mvn_q4k", 13: "nbq_mvn_q5k", 18: "nbq_mvn_iq3xxs", 21: "nbq_mvn_iq3s", 22: "nbq_mvn_iq2s"}
 FA_SMEM = 2 * 64 * 136 * 2                                   # nbq_fa.cu: K and V tiles
+FAV_KERNELS = ("nbq_fav_prefill", "nbq_fav_prefill_g5")       # nbq_fa.cu, Volta (NBQ_HMMA)
+FAV_SMEM = (2 * 64 * 136 + 128 * 72 + 4 * 16 * 72) * 2        # NBQ_FAV_SMEM
 MM = {12: "nbq_mm_q4k", 13: "nbq_mm_q5k", 18: "nbq_mm_iq3xxs", 21: "nbq_mm_iq3s", 22: "nbq_mm_iq2s", (22, 12): "nbq_mm_iq2s_q4k"}
 GEMM_SMEM = 2 * 128 * 144 + 128 * 8 * 4 + 3 * 128 * 4 * 4    # NBQ_GEMM_SMEM in nbq_mm.cu
+HM_SMEM = 2 * 128 * 136 * 2 + 128 * 8 * 4 + 3 * 128 * 4 * 4   # NBQ_HM_SMEM (Volta, fp16 tensor cores)
 FA_KERNELS = ("nbq_fa_prefill", "nbq_fa_prefill_g5", "nbq_fa_prefill_q8", "nbq_fa_prefill_q8_g5")
 TC_KERNELS = set(MM.values()) | set(TCV.values()) | set(FA_KERNELS)
 KV_TYPES = ("f16", "q8_0")                                  # the K/V cache (config kv_cache)
@@ -208,6 +211,12 @@ class Card(object):
         self.kslow = kepler(cp, dev) and not kfast
         self.host = set()                  # layers whose weights stay in pinned host memory (see Engine._plan)
         tc = (cfg is None or cfg.get("tc", True)) and not kepler(cp, dev)
+        # Volta (sm_70): the prompt GEMMs of nbq_mm.cu on fp16 tensor cores (NBQ_HMMA) or dp4a (NBQ_SIMT)
+        self.vmode = (cfg or {}).get("vmode", "") if not tc else ""
+        self.simt = bool(self.vmode)
+        self.gemm_smem = HM_SMEM if self.vmode == "hmma" else GEMM_SMEM
+        if self.vmode:
+            opts = opts + (("-DNBQ_HMMA=1",) if self.vmode == "hmma" else ("-DNBQ_SIMT=1",))
         # the bank-free IQ3_XXS codebook of the decode products (nbq.cu NBQ_REP): KINDI_NB_REP=0 / 1, default sm_80+
         rv = os.environ.get("KINDI_NB_REP", "")
         from .tc import ga100           # (GA100 only: on an RTX 3090 it cost 14%, 54.3 -> 46.6 tok/s)
@@ -216,14 +225,18 @@ class Card(object):
         with cp.cuda.Device(dev):
             mod = module(cp, source(), tc, opts)
             self.k = {n: mod.get_function(n) for n in KERNELS + (K35_KERNELS if self.k35 else ())
-                      if tc or n not in TC_KERNELS}
+                      if tc or n not in TC_KERNELS or (self.simt and n in MM.values())}
             if self.k35:                       # 8-byte banks (Kepler): nbq_kmm reads float4 rows of its tiles
                 import ctypes
-                cu = ctypes.CDLL("libcuda.so.1")
+                from .gpudrv import libcuda
+                cu = libcuda()
                 for n in tuple(KMM.values()) + tuple(MVC.values()):
                     cu.cuFuncSetSharedMemConfig(ctypes.c_void_p(getattr(self.k[n], "kernel", self.k[n]).ptr), 2)
-            for n in MM.values() if tc else ():
-                _smem(cp, self.k[n], GEMM_SMEM)
+            for n in MM.values() if tc or self.simt else ():
+                _smem(cp, self.k[n], self.gemm_smem)
+            for n in FAV_KERNELS if self.vmode == "hmma" else ():
+                self.k[n] = mod.get_function(n)
+                _smem(cp, self.k[n], FAV_SMEM)
             for n in KERNELS:
                 if n.startswith("nbq_mvn_") and tc:          # (the launches use none now: stage_x is off; sm_61
                     _smem(cp, self.k[n], 65536)               # cannot give a block more than 48 KB)
@@ -290,12 +303,26 @@ class Engine(object):
         # sm_80 read the prompt through check passes of 8 tokens
         cc = min(int(cp.cuda.Device(d).compute_capability) for d in devices)
         self.tc = cc >= 80 and os.environ.get("KINDI_NB_TC", "1") != "0"
-        self.cards = [Card(cp, d, bounds[i], bounds[i + 1], {"tc": self.tc}) for i, d in enumerate(devices)]
+        # Volta (sm_70) has fp16 tensor cores and no int8 MMA. KINDI_NB_VOLTA: hmma (default on sm_70) = the prompt
+        # GEMMs on fp16 tensor cores, dp4a = on dp4a tiles; both give the int32 dots of the int8 tensor-core kernels,
+        # so the GEMM output is that of sm_80+ bit for bit. 0 = check passes of 8 tokens (before 0.7.0). The prompt
+        # attention takes the per-token kernels. On sm_61 to sm_75 the variable turns a mode on (untested there).
+        vv = os.environ.get("KINDI_NB_VOLTA", "")
+        vmode = vv if vv in ("hmma", "dp4a") else ("hmma" if vv == "" and cc == 70 else "")
+        if vmode == "hmma" and cc < 70:
+            vmode = "dp4a"                                     # (no tensor cores before sm_70)
+        self.simt = bool(vmode) and not self.tc and 61 <= cc < 80 and not kepler(cp, devices[0])
+        self.vmode = vmode if self.simt else ""
+        self.cards = [Card(cp, d, bounds[i], bounds[i + 1], {"tc": self.tc, "vmode": self.vmode})
+                      for i, d in enumerate(devices)]
         self.k35 = any(c.k35 for c in self.cards)
         self.kslow = any(c.kslow for c in self.cards)
         if self.q8 and (self.k35 or self.kslow or cc < 61):
             raise SystemExit("kindi: the q8_0 K/V cache needs dp4a (compute capability 6.1 or newer); use kv_cache f16")
-        if not self.tc and not self.k35:
+        if self.simt:
+            log("compute capability %d: prompt GEMMs on %s (no int8 tensor cores)" % (
+                cc, "fp16 tensor cores" if self.vmode == "hmma" else "dp4a tiles"))
+        elif not self.tc and not self.k35:
             log("compute capability %d: no tensor-core prompt kernels; the prompt is read 8 tokens per pass" % cc)
         last = self.cards[-1]
         last.host = set(range(last.hi - getattr(self, "n_host", 0), last.hi))
@@ -917,7 +944,7 @@ class Engine(object):
                 nblk += (w.rows + 127) // 128
         cols = segs[0][0].cols
         c.k[name]((nblk, (nt + 127) // 128), (256,), tuple(args) + (c.XQ, c.XS, y, np.int32(cols), np.int32(nt),
-                                                                     np.int32(ldy)), shared_mem=GEMM_SMEM)
+                                                                     np.int32(ldy)), shared_mem=c.gemm_smem)
 
     def _prompt_card(self, c, nt, pos0, first):
         k, E, F = c.k, self.n_embd, self.n_ff
@@ -940,10 +967,15 @@ class Engine(object):
             else:
                 k["nbq_rope_store_rows"]((self.n_head + self.n_kv, nt), (64,), (c.QKV, c.P, np.int32(self.n_head),
                                          np.int32(self.n_kv), theta_scale, c.kc[il], c.vc[il], np.int32(self.ctx)))
-            if os.environ.get("KINDI_NB_FA", "1") == "1" and not c.k35:     # Kepler: no tensor cores
+            fa = os.environ.get("KINDI_NB_FA", "1") == "1"
+            if fa and self.tc:                                              # the fp16 MMA kernels: sm_80+
                 k[self.k_fa](((self.G * nt + 63) // 64, self.n_kv), (128,),
                                     (c.QKV, np.int32(ld), np.int32(nt), np.int32(pos0)) + self._kv(c, il) +
                                     (np.int32(self.ctx), scale, c.ATT), shared_mem=FA_SMEM)
+            elif fa and self.vmode == "hmma" and not self.q8:                # Volta: m8n8k4 (f16 cache)
+                k["nbq_fav_prefill" + ("" if self.G == 7 else "_g%d" % self.G)](
+                    ((self.G * nt + 63) // 64, self.n_kv), (128,), (c.QKV, np.int32(ld), np.int32(nt), np.int32(pos0))
+                    + self._kv(c, il) + (np.int32(self.ctx), scale, c.ATT), shared_mem=FAV_SMEM)
             else:
                 for t0 in range(0, nt, ATT_SUB):
                     n = min(ATT_SUB, nt - t0)
@@ -968,7 +1000,7 @@ class Engine(object):
         if self.k35 and os.environ.get("KINDI_NB_KROWS", "0") == "1":
             return self._prefill_rows(ids, pos0)
         cp, E = self.cp, self.n_embd
-        if not self.tc and not self.k35:
+        if not self.tc and not self.simt and not self.k35:
             return self._prefill_check(ids, pos0, hidden)
         # 256-token chunks fill the pipeline of two cards sooner; past 4K tokens 512 use the tensor cores better
         chunk = min(CHUNK, chunk or int(os.environ.get("KINDI_NB_PCHUNK", "256" if len(ids) <= 4096 and not self.k35 else "512")))

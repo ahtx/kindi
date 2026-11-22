@@ -376,8 +376,50 @@ class Engine(object):
         self.state = {"busy": False}
         self.last = {}
         self.cal = tuple(float(x) for x in a.cal.split(","))
+        self._experts = None
         self.reqdir = os.path.join(a.cache_dir, "last-requests") if a.cache_dir else None
         self._turn_file = None                          # (tokens, path, key) of the last turn saved (after_turn)
+
+    def experts_info(self):
+        """for /health: where the routed experts are (mmap: the page cache; stream: the RAM cache of KINDI_XS_GB),
+        the expert cards and the auto-calibration's decision (dsv41_xcal). Made once: none of it changes later."""
+        if getattr(self, "_experts", None) is None:
+            M = self.model
+            devs = os.environ.get("KINDI_DSV_GPU2_DEVS", "")
+            x = getattr(M, "xcal", None)
+            self._experts = {
+                "mode": getattr(M, "expert_mode", os.environ.get("KINDI_DSV_EXPERTS", "mmap")),
+                "cache_gb": float(os.environ["KINDI_XS_GB"]) if os.environ.get("KINDI_XS_GB") else None,
+                "main_card": os.environ.get("KINDI_DSV_GPU") not in (None, "", "0"),
+                "cards": [int(d) for d in devs.split(",") if d.strip().isdigit()],
+                "calibration": None if not x else {
+                    "max_pairs": x.get("maxp"), "adaptive": bool(x.get("adapt")), "source": x.get("source"),
+                    "measured": x.get("measured"), "reasons": x.get("reasons")}}
+        return self._experts
+
+    def expert_io(self):
+        """for /health, live: the expert store's counters (stream mode) and the expert cards' share of the pairs"""
+        try:
+            import ctypes
+            from .dsv41 import lib
+            L = lib()
+            out = {}
+            c = (ctypes.c_longlong * 2)()
+            if hasattr(L, "dsv_xc_counts"):
+                L.dsv_xc_counts(c)
+                out["card_pairs_pct"] = round(100.0 * c[0] / c[1], 1) if c[1] else None
+            n, d, e = (ctypes.c_longlong * 16)(), (ctypes.c_double * 2)(), (ctypes.c_double * 15)()
+            if hasattr(L, "dsv_xs_stats") and L.dsv_xs_stats(n, d, e) == 0:
+                out.update({"uses": n[0], "ram_hit_pct": round(100.0 * n[1] / n[0], 1) if n[0] else None,
+                            "prefetch_started": n[6], "prefetch_used": n[2], "prefetch_unused": n[7],
+                            "read_gb": round(e[14], 2), "drive_gbs_busy": round(e[11], 2), "iops_busy": round(e[12]),
+                            "queue_depth": round(e[10], 1), "queue_depth_max": int(e[9]), "busy_s": round(e[13], 1),
+                            "read_sizes": {k: int(v) for k, v in zip(("<64K", "<256K", "<1M", "<4M", "<16M", "<64M",
+                                                                       "<256M", ">=256M"), e[:8]) if v},
+                            "slots": n[13], "pinned": n[14], "resident": n[15]})
+            return out
+        except Exception as ex:          # telemetry must never break /health
+            return {"error": repr(ex)}
 
     @property
     def waiting(self):
@@ -976,7 +1018,8 @@ def make_handler(E):
                                         "drafting": E.drafting(),
                                         "queue": {"chat": E.lock.wait[PRIO_CHAT],
                                                   "background": E.lock.wait[PRIO_BACKGROUND], "yields": E.yields},
-                                        "slots": len(E.slot_keys)})
+                                        "slots": len(E.slot_keys), "experts": E.experts_info(),
+                                        "expert_io": E.expert_io()})
             if not self._auth():
                 return
             if self.path.rstrip("/") == "/v1/models":
@@ -1019,6 +1062,12 @@ def make_handler(E):
                 req = self._body()
             except Exception:
                 return self._err(400, "invalid JSON")
+            try:   # #38: tool_choice and response_format are honoured or refused with a 400, never ignored
+                from .oai import RequestError, check
+                req["tools"], _ = check(req, can_force=False)
+            except RequestError as e:
+                return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error",
+                                                  "param": e.param, "code": "unsupported_" + e.param}})
             cid = "chatcmpl-" + uuid.uuid4().hex[:24]
             created = int(time.time())
             stream = bool(req.get("stream"))
@@ -1216,28 +1265,50 @@ def main(argv=None):
     E = Engine(a)
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(E))
 
-    def stop(sig, frame):
-        # on stop, wait for the request being served, then save the state in memory so the conversation resumes
-        # from disk after the restart (warm turns compute too little to be saved as they go)
-        def save():
-            with E.lock:
-                try:
-                    if a.cache_dir and not a.no_prompt_cache and E.model.pos >= a.ckpt_min:
-                        t0 = time.time()
-                        M = E.model
-                        link = os.path.join(a.cache_dir, "%s.kds" % M._ckpt_key(M.hist[:M.pos - M.pos % 2]))
-                        if os.path.islink(link):            # a RAM slot (lost on reboot): write the real file
-                            os.remove(link)
-                        E.model.checkpoint_save(a.cache_dir)
-                        _log("state saved on stop: %d tokens in %.1f s" % (E.model.pos, time.time() - t0))
-                except Exception as e:
-                    _log("save on stop failed: %r" % e)
-            os._exit(0)
-        threading.Thread(target=save, daemon=True).start()
-    signal.signal(signal.SIGTERM, stop)
+    install_stop(srv, E, a)
     _log("serving %s on %s:%d (ctx %d, DSpark %s, cache %s)" % (MODEL_ID, a.host, a.port, a.ctx, bool(a.dspark),
                                                                    a.cache_dir))
     srv.serve_forever()
+    _log("stopped")
+
+
+def install_stop(srv, E, a, grace=30.0):
+    """SIGTERM / SIGINT: wait for the request being served, save the state in memory (so the conversation resumes from
+    disk after the restart; warm turns compute too little to be saved as they go), then end serve_forever() so that
+    the process exits normally and the exit handlers run (the C engine's stop reports, Python's atexit). Before 0.7
+    (B17) the handler ended with os._exit(0), which skipped them. If the normal exit hangs (a thread that does not
+    end), the process exits anyway after `grace` seconds."""
+    srv.daemon_threads = True
+    stopping = threading.Event()
+
+    def save_and_stop():
+        with E.lock:
+            try:
+                if a.cache_dir and not a.no_prompt_cache and E.model.pos >= a.ckpt_min:
+                    t0 = time.time()
+                    M = E.model
+                    link = os.path.join(a.cache_dir, "%s.kds" % M._ckpt_key(M.hist[:M.pos - M.pos % 2]))
+                    if os.path.islink(link):            # a RAM slot (lost on reboot): write the real file
+                        os.remove(link)
+                    E.model.checkpoint_save(a.cache_dir)
+                    _log("state saved on stop: %d tokens in %.1f s" % (E.model.pos, time.time() - t0))
+            except Exception as e:
+                _log("save on stop failed: %r" % e)
+
+        def last_resort():
+            time.sleep(grace)
+            _log("the normal exit did not finish in %.0f s; exiting now" % grace)
+            os._exit(0)
+        threading.Thread(target=last_resort, daemon=True).start()
+        srv.shutdown()                              # serve_forever() returns in the main thread
+
+    def stop(sig, frame):
+        if stopping.is_set():
+            return
+        stopping.set()
+        threading.Thread(target=save_and_stop, daemon=True).start()
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ Kindi reads its settings in this order - later sources win:
 | key | default | |
 |---|---|---|
 | `ctx` | `24576` | context length in tokens (prompt + answer). For GPU memory, see the notes below the table |
+| `slots` | `1` | requests written at the same time (`kindi serve --slots N`, `KINDI_SLOTS=N`, at most 8). Each slot is one conversation with its own K/V cache, recurrent state and prompt cache; one pass of the model writes one token for every slot that is writing, so the weight reads are shared. Each slot's greedy output is the same as when it runs alone. Needs the plan engine on one card with the tensor-core plans (`KINDI_TC=1`, and `KINDI_TP=1` for the 2B, 4B and 9B). The context fit gives every slot the same context. Speculative decoding (drafting: `KINDI_SPEC`, the MTP head, DSpine) is off with more than one slot; the log says so. The default is one slot, and nothing sets more by itself: the installer leaves it at 1 |
 | `head` | `exact` | `exact` = full output head (token-exact with llama.cpp); `fast` = shortlist head (needs `kindi fast-head`). `kindi head exact\|fast` overrides it at run time |
 | `fast_clusters` | `256` | clusters the fast head scores exactly (of 1,024). Fewer is faster and less exact (see the notes below the table) |
 | `kv_cache` | `auto` | AH-Nanbeige4.3-33B only: the K/V cache, `auto`, `f16` or `q8_0` (`KINDI_KV_CACHE=q8_0`). `q8_0` keeps K and V as int8 with an fp16 scale for each 32 values: half the memory (64K tokens: about 6.6 GiB instead of 13 GiB), so the 33B gets a 64K context on one 24 GB card. Needs compute capability 6.1 or later. `auto` uses `f16` when the model and its f16 cache fit on the cards at `ctx`, and `q8_0` when they do not. `kindi verify` checks `q8_0` against llama.cpp: the tokens that agree with the f16 reference must be at least as many as llama.cpp's own q8_0 cache keeps (on 2x RTX 3080: Kindi 475, llama.cpp 471, of 586) |
@@ -98,8 +99,12 @@ These variables have no config key. Use them to test or to compare.
 |---|---|---|
 | `KINDI_DEVICE` | `gpu` | `cpu` = the CPU engine (2B, 4B, 9B). Kindi also uses the CPU engine when CuPy is not installed |
 | `KINDI_CPU_CACHE` | `~/.cache/kindi` | the folder for the built CPU library (`libkcpu.so`) |
+| `KINDI_CKPT_STREAM` | `1` with decode slots, else `0` | `1` = the prompt cache copies the recurrent state (checkpoints, parked conversations, saved turns) on a side stream into pinned host memory, so that another slot's pass does not wait for the copy. Without slots it is a speed option for hosts with RAM to spare: the copies are about 10% faster (27B on a PCIe x1 link), but pinned memory then holds up to the whole checkpoint budget (`checkpoint_budget_mb`, default 20% of the RAM) |
+| `KINDI_SLOTS_ROWS` | `1` | decode slots: `0` = the batched pass launches the per-token kernels once per slot (slower; for tests) |
+| `KINDI_SLOTS_WAIT_MS` | `2` | decode slots: how long a writing slot waits for the others to hand in their tokens before a pass runs without them |
 | `KINDI_TP` | (auto) | `1` = the plan engine, `0` = the single-card engine. The 27B always uses the plan engine |
 | `KINDI_CARDS` | (all, at most 2) | the number of cards for the plan engine |
+| `KINDI_TP_SPLIT` | `auto` | two cards: when the halves do not leave room for the context on the card with less free memory, `auto` gives the other card a larger part of the FFN and of the output head, so both cards have the same room for the context. That card then does more of the work, so the halves stay whenever they fit. `even` = the halves; a number (0.1 to 0.9) = card 0's part |
 | `KINDI_CHUNK` | `256` | prompt tokens per chunk; `0` = one token at a time. The default is `128` on Kepler (sm_30) |
 | `KINDI_CHUNK_MIN` | `32` | the smallest part of a prompt that goes through a chunk |
 | `KINDI_CHUNK_Q8` | `1` | sm_61 and later: int8 activations in the chunk products (dp4a). `0` = fp32 |
@@ -112,8 +117,10 @@ These variables have no config key. Use them to test or to compare.
 | `KINDI_FD` | `0` (`1` with drafting) | `1` = the split flash-decode attention of the 27B on one card (with `KINDI_TC=1`). When drafting is on (`KINDI_SPEC` set) with `KINDI_TC=1` and `KINDI_FD` is not set, Kindi uses `1`: with `0`, a drafted answer can differ from plain decoding at near-ties |
 | `KINDI_TC_DP4A` | `0` | `1` = the Pascal dp4a kernels of the `KINDI_TC=1` path (tcp.cu) on a newer card, for tests. On sm_61 they are always used |
 | `KINDI_D1` | `0` (`1` on Pascal) | `1` = the one-pass RMS fold (Hadamard block 512 or 1024, with `KINDI_TC=1`) |
+| `KINDI_TC_HP` | `0` | `1` = the `KINDI_TC=1` products take two int8 rows per token (about 14 bits of activation precision instead of 8), at most 4 tokens per pass. The 8-bit products move the logits by up to about 0.15 from the default path, which changes the token at near-ties (#31) |
 | `KINDI_ATT_TC` | `0` | `1` = the attention of the prompt chunks on the tensor cores (sm_80 and later, with `KINDI_TC=1`) |
 | `KINDI_CKPT_VRAM` | `0` | `1` = checkpoints in card memory; the copy to the host waits until the server is idle (one card) |
 | `KINDI_CKPT_PINNED` | `1` under WSL2, else `0` | `1` = the host copies of the checkpoints are in pinned memory. Under Windows (WDDM), this makes the first token faster |
 | `KINDI_HOST_RAM_CHECK` | `1` | before the weights of a card load, the plan engine stops when the free host RAM is too small. `0` = no check |
-| `KINDI_BLOCKING_SYNC` | `1` | the host thread sleeps while it waits for the card, and does not use a CPU core. `0` = it waits in a loop (the driver default) |
+| `KINDI_NB_VOLTA` | `hmma` on sm_70 | AH-Nanbeige4.3-33B on Volta: `hmma` = the prompt products and the prompt attention on the fp16 tensor cores (mma m8n8k4), `dp4a` = the prompt products on dp4a tiles, `0` = the prompt in passes of 8 tokens (before 0.7.0). `hmma` and `dp4a` give the same products, bit for bit, as the int8 tensor cores of sm_80 and later. On sm_61 to sm_75 the variable turns a mode on (not tested there) |
+| `KINDI_BLOCKING_SYNC` | `1` before the 580 driver, `0` on 580+ | the host thread sleeps while it waits for the card, and does not use a CPU core. `0` = it waits in a loop (the driver default). On the NVIDIA 580 driver and later the sleeping thread wakes late (5 to 15% of the write speed), so it is off there unless set; the boot log says which |

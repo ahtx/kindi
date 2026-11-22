@@ -2050,10 +2050,18 @@ G5RAS(8)
 
 /* ---------------------------------------------------------------- q8_0 attention scores with dp4a (sm_61+) */
 
+/* RDNA2 (gfx103x) has v_dot4_i32_i8 (signed x signed) but not RDNA3's v_dot4_i32_iu8 (sudot4) */
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+#define KRDNA2 1
+#else
+#define KRDNA2 0
+#endif
 /* dp4a as inline PTX: NVRTC 10.2 does not define the __dp4a intrinsic (sm_61_intrinsics are not included) */
 __device__ __forceinline__ int kdp4a(int a, int b, int c){
   /* dp4a.s32.s32: four SIGNED int8 x int8 products added to c */
-#if KHIP
+#if KHIP && KRDNA2
+  return __builtin_amdgcn_sdot4(a, b, c, false);                 /* RDNA2 (gfx103x): v_dot4_i32_i8, no clamp */
+#elif KHIP
   return __builtin_amdgcn_sudot4(true, a, true, b, c, false);    /* v_dot4_i32_iu8, both operands signed, no clamp */
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
   int d; asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c)); return d;

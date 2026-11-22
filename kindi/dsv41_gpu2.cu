@@ -16,6 +16,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <sched.h>
+#include <time.h>
+#include <unistd.h>
 
 #define QK 32
 #define D 5120
@@ -138,6 +142,26 @@ __global__ void k_x_act(const int* hix, const float* gu, int8_t* hq, float* hd) 
     }
 }
 
+/* GGUF MXFP4 rows (17-byte blocks) -> the card's layout (x_mat's, on the card): codes of 16 rows of a block contiguous,
+   the scales apart. One thread per (row, block). */
+__global__ void k_x_relayout(const uint8_t* raw, int rows, int nb, uint8_t* dq, uint8_t* ds) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * nb) return;
+    const size_t r = i / nb, b = i % nb;
+    const uint8_t* B = raw + i * 17;
+    const size_t gi = ((r / 16) * nb + b) * 16 + r % 16;
+    ds[gi] = B[0];
+    uint8_t* q = dq + gi * 16;
+#pragma unroll
+    for (int j = 0; j < 16; j++) q[j] = B[1 + j];
+}
+
+/* adaptive slots (F9, KINDI_XC_ADAPT in dsv41_cpu.c): an expert is swapped into a slot on a copy stream (DMA of its
+   raw rows from the host, then k_x_relayout); the slot is out of the hot map from dx_swap until dx_poll sees its
+   copy done, so a call never reads a slot that is being written */
+#define XSTAGE 2
+typedef struct { int slot, l, e; cudaEvent_t ev; } XSwap;
+
 static struct {
     int dev, nhot, hotmap[NL][NE];
     XHot hot_h[MAXX];
@@ -151,6 +175,15 @@ static struct {
     CUcontext ctx;
     cudaEvent_t ev0, ev1;
     double gpu_ms;
+    /* adaptive slots */
+    int owner[MAXX];              /* l * NE + e of the expert in a slot (or being copied into it), -1 */
+    cudaStream_t cst;
+    uint8_t* raw[XSTAGE];
+    cudaEvent_t raw_ev[XSTAGE];
+    int nraw;
+    XSwap pend[MAXX];
+    int npend;
+    long swaps, admits;
 } X;
 
 struct CtxGuard {
@@ -195,6 +228,7 @@ int dx_init(int dev) {
     CK(cudaStreamCreateWithFlags(&X.st, cudaStreamNonBlocking));
     CK(cudaEventCreate(&X.ev0)); CK(cudaEventCreate(&X.ev1));
     for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) X.hotmap[l][e] = -1;
+    for (int i = 0; i < MAXX; i++) X.owner[i] = -1;
     CK(cudaMalloc(&X.hot_d, sizeof(XHot) * MAXX));
     /* the inputs of a call in one buffer (one copy): slot map [MAXT][NS], scales [MAXT][D / QK], codes [MAXT][D] */
     const size_t in_bytes = (size_t)MAXT * NS * 4 + (size_t)MAXT * D / QK * 4 + (size_t)MAXT * D;
@@ -209,15 +243,35 @@ int dx_init(int dev) {
     return 0;
 }
 /* one routed expert (GGUF MXFP4 rows) into the card; -1 when full or fewer than reserve bytes would stay free */
+/* KINDI_DSV_GPU2_MAX_MB: the most VRAM this card's hot experts may take, whatever cudaMemGetInfo says (on a card that
+   also drives a display, Windows' own use varies and WDDM over-commits instead of failing). "N" for every expert
+   card, or "DEV:N,DEV:N" by CUDA device. 0 or unset: no cap (the reserve alone). */
+static size_t dx_max_bytes(void) {
+    const char* s = getenv("KINDI_DSV_GPU2_MAX_MB");
+    if (!s || !s[0]) return 0;
+    if (!strchr(s, ':')) return (size_t)atol(s) << 20;
+    for (const char* p = s; p && *p;) {
+        int dev = atoi(p);
+        const char* c = strchr(p, ':');
+        if (!c) break;
+        if (dev == X.dev) return (size_t)atol(c + 1) << 20;
+        p = strchr(c, ',');
+        if (p) p++;
+    }
+    return 0;
+}
 int dx_add(int l, int e, const uint8_t* gate, const uint8_t* up, const uint8_t* down, size_t reserve) {
     if (X.nhot >= MAXX || X.hotmap[l][e] >= 0) return -1;
+    const size_t eb = (size_t)3 * FF * D / QK * 17, cap = dx_max_bytes();
+    if (cap && X.bytes + eb > cap) return -1;
     CtxGuard guard;
     size_t fr = 0, tot = 0;
     cudaMemGetInfo(&fr, &tot);
-    if (fr < (size_t)3 * FF * D / QK * 17 + reserve) return -1;
+    if (fr < eb + reserve) return -1;
     XHot* h = &X.hot_h[X.nhot];
     if (x_mat(gate, FF, D, &h->gq, &h->gs) || x_mat(up, FF, D, &h->uq, &h->us) || x_mat(down, D, FF, &h->dq, &h->ds))
         return -1;
+    X.owner[X.nhot] = l * NE + e;
     X.hotmap[l][e] = X.nhot++;
     return 0;
 }
@@ -225,6 +279,158 @@ int dx_commit(void) {
     CtxGuard guard;
     CK(cudaMemcpy(X.hot_d, X.hot_h, sizeof(XHot) * MAXX, cudaMemcpyHostToDevice));
     return X.nhot;
+}
+}  /* extern "C" */
+
+/* Adaptive slots, the copy thread (F9). dx_swap only takes the slot out of the hot map and queues the request; a
+   thread of this library (on an idle hyper-thread, KINDI_XC_COPY_CPU, default 57) copies the expert's raw rows from
+   the host (the model's page cache: pageable, nothing is page-locked) into one of XSTAGE small pinned staging buffers
+   (an expert, 18.8 MB each), then DMA, k_x_relayout into the slot, and an event. dx_poll admits the slots whose
+   events are done. The only pinned memory is the staging (XSTAGE x 18.8 MB, in this card's context), so the main
+   card loses no VRAM to page tables. The copy waits for the calls issued before dx_swap (an event on X.st). */
+typedef struct { int slot, l, e; const uint8_t *g, *u, *d; cudaEvent_t after; } XReq;
+static struct {
+    pthread_t th;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int started, quit;
+    XReq q[MAXX];
+    int head, tail;               /* queue [head, tail) modulo MAXX */
+    uint8_t* stage[XSTAGE];
+    cudaEvent_t stage_ev[XSTAGE]; /* the staging buffer's DMA is done */
+    double copy_s;                /* host memcpy time */
+} XQ = {0, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+
+static double xq_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+
+static void* xq_main(void* a) {
+    (void)a;
+    const char* cs = getenv("KINDI_XC_COPY_CPU");
+    const int cpu = cs ? atoi(cs) : 57;
+    if (cpu >= 0 && cpu < (int)sysconf(_SC_NPROCESSORS_ONLN)) {
+        cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    }
+    cuCtxSetCurrent(X.ctx);
+    const size_t gb = (size_t)FF * (D / QK) * 17, db = (size_t)D * (FF / QK) * 17;
+    const int ng = FF * (D / QK), nd = D * (FF / QK);
+    for (long n = 0;; n++) {
+        pthread_mutex_lock(&XQ.mu);
+        while (!XQ.quit && XQ.head == XQ.tail) pthread_cond_wait(&XQ.cv, &XQ.mu);
+        if (XQ.quit) { pthread_mutex_unlock(&XQ.mu); break; }
+        XReq r = XQ.q[XQ.head % MAXX];
+        XQ.head++;
+        pthread_mutex_unlock(&XQ.mu);
+        const int k = (int)(n % XSTAGE);
+        cudaEventSynchronize(XQ.stage_ev[k]);            /* the staging buffer's last DMA is done */
+        const double t0 = xq_now();
+        memcpy(XQ.stage[k], r.g, gb);
+        memcpy(XQ.stage[k] + gb, r.u, gb);
+        memcpy(XQ.stage[k] + 2 * gb, r.d, db);
+        XQ.copy_s += xq_now() - t0;
+        uint8_t* raw = X.raw[k];
+        cudaStreamWaitEvent(X.cst, r.after, 0);
+        cudaEventDestroy(r.after);
+        cudaMemcpyAsync(raw, XQ.stage[k], 2 * gb + db, cudaMemcpyHostToDevice, X.cst);
+        cudaEventRecord(XQ.stage_ev[k], X.cst);
+        const XHot* h = &X.hot_h[r.slot];
+        k_x_relayout<<<(ng + 255) / 256, 256, 0, X.cst>>>(raw, FF, D / QK, (uint8_t*)h->gq, (uint8_t*)h->gs);
+        k_x_relayout<<<(ng + 255) / 256, 256, 0, X.cst>>>(raw + gb, FF, D / QK, (uint8_t*)h->uq, (uint8_t*)h->us);
+        k_x_relayout<<<(nd + 255) / 256, 256, 0, X.cst>>>(raw + 2 * gb, D, FF / QK, (uint8_t*)h->dq, (uint8_t*)h->ds);
+        cudaEvent_t done;
+        cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
+        cudaEventRecord(done, X.cst);
+        pthread_mutex_lock(&XQ.mu);
+        XSwap* w = &X.pend[X.npend++];
+        w->slot = r.slot; w->l = r.l; w->e = r.e; w->ev = done;
+        pthread_mutex_unlock(&XQ.mu);
+    }
+    return NULL;
+}
+static int xq_start(void) {
+    CK(cudaStreamCreateWithFlags(&X.cst, cudaStreamNonBlocking));
+    const size_t eb = (size_t)3 * FF * (D / QK) * 17;
+    for (int k = 0; k < XSTAGE; k++) {
+        CK(cudaMalloc(&X.raw[k], eb));
+        CK(cudaMallocHost(&XQ.stage[k], eb));
+        CK(cudaEventCreateWithFlags(&XQ.stage_ev[k], cudaEventDisableTiming));
+        CK(cudaEventRecord(XQ.stage_ev[k], X.cst));
+    }
+    if (pthread_create(&XQ.th, NULL, xq_main, NULL)) return -1;
+    XQ.started = 1;
+    return 0;
+}
+
+extern "C" {
+/* start bringing expert (l, e) into slot (one of dx_add's) from host memory (pageable); the slot's old expert leaves
+   the hot map at once, the new one enters it at the dx_poll after its copy. 0 = queued. */
+int dx_swap(int slot, int l, int e, const uint8_t* gate, const uint8_t* up, const uint8_t* down) {
+    if (slot < 0 || slot >= X.nhot || l < 0 || l >= NL || e < 0 || e >= NE || X.hotmap[l][e] >= 0) return -1;
+    CtxGuard guard;
+    if (!XQ.started && xq_start()) return -1;
+    pthread_mutex_lock(&XQ.mu);
+    int busy = XQ.tail - XQ.head >= MAXX;
+    for (int i = XQ.head; i < XQ.tail && !busy; i++) busy = XQ.q[i % MAXX].slot == slot;
+    for (int i = 0; i < X.npend && !busy; i++) busy = X.pend[i].slot == slot;
+    pthread_mutex_unlock(&XQ.mu);
+    if (busy) return -1;
+    const int o = X.owner[slot];
+    if (o >= 0 && X.hotmap[o / NE][o % NE] == slot) X.hotmap[o / NE][o % NE] = -1;
+    X.owner[slot] = l * NE + e;
+    XReq r = {slot, l, e, gate, up, down, NULL};
+    CK(cudaEventCreateWithFlags(&r.after, cudaEventDisableTiming));
+    CK(cudaEventRecord(r.after, X.st));                /* the slot's last reads end before the copy writes it */
+    pthread_mutex_lock(&XQ.mu);
+    XQ.q[XQ.tail % MAXX] = r;
+    XQ.tail++;
+    pthread_cond_signal(&XQ.cv);
+    pthread_mutex_unlock(&XQ.mu);
+    X.swaps++;
+    return 0;
+}
+/* the swaps whose copies are done enter the hot map; their slots go to out[] (at most max); returns how many */
+int dx_poll(int* out, int max) {
+    CtxGuard guard;
+    int n = 0, k = 0;
+    pthread_mutex_lock(&XQ.mu);
+    for (int i = 0; i < X.npend; i++) {
+        XSwap* w = &X.pend[i];
+        if (n < max && cudaEventQuery(w->ev) == cudaSuccess) {
+            cudaEventDestroy(w->ev);
+            if (X.owner[w->slot] == w->l * NE + w->e) X.hotmap[w->l][w->e] = w->slot;
+            out[n++] = w->slot;
+            X.admits++;
+        } else X.pend[k++] = *w;
+    }
+    X.npend = k;
+    pthread_mutex_unlock(&XQ.mu);
+    cudaGetLastError();
+    return n;
+}
+/* stop the copy thread (at exit: a copy still queued or running while the process tears CUDA down crashed, 11-15) */
+void dx_stop(void) {
+    if (!XQ.started) return;
+    pthread_mutex_lock(&XQ.mu);
+    XQ.quit = 1;
+    pthread_cond_broadcast(&XQ.cv);
+    pthread_mutex_unlock(&XQ.mu);
+    pthread_join(XQ.th, NULL);
+    XQ.started = 0;
+    CtxGuard guard;
+    cudaStreamSynchronize(X.cst);
+}
+/* seconds the copy thread spent copying into the staging buffers */
+double dx_copy_s(void) { return XQ.copy_s; }
+}
+
+extern "C" {
+long dx_swaps(void) { return X.swaps; }
+/* 1 when the last dx_start's work is done (the host did not have to wait for the card), 0 when not yet */
+int dx_ready(void) {
+    CtxGuard guard;
+    const cudaError_t e = cudaEventQuery(X.ev1);
+    if (e != cudaSuccess && e != cudaErrorNotReady) cudaGetLastError();
+    return e == cudaSuccess;
 }
 size_t dx_bytes(void) { return X.bytes; }
 double dx_gpu_ms(void) { return X.gpu_ms; }

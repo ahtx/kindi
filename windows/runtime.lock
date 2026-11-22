@@ -1,0 +1,19 @@
+# windows/runtime.lock: written by package.ps1 -Lock from runtime.in; one file per line: sha256  name  url
+4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3  python-3.12.10-embed-amd64.zip  https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip
+f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0  annotated_types-0.8.0-py3-none-any.whl  pypi
+c66ae634e0b8228396b801741beb3294326d4b6102f7bba4041c0dfb58c29026  anyio-4.16.0-py3-none-any.whl  pypi
+8bb5376d2006950386f8c6427613334a2acadc5f559cb80e638d00b4df957e37  click-8.5.1-py3-none-any.whl  pypi
+ca06fede7b8b83ca9ad80062544ef2e5bb8d4762d1c4fc3ac8349376de9c8a5e  cupy_cuda12x-13.6.0-cp312-cp312-win_amd64.whl  pypi
+e9240b29e36fa8f4bb7290316988e90c381e5092e0cbe84e7818cc3713bcf305  fastapi-0.115.6-py3-none-any.whl  pypi
+da06d43e1625e2ffddd303edcd6d2cd068e1c486f5fd0102b3f079c44eb13e2c  fastrlock-0.8.3-cp312-cp312-win_amd64.whl  pypi
+63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86  h11-0.16.0-py3-none-any.whl  pypi
+ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c  idna-3.20-py3-none-any.whl  pypi
+08beddf13648eb95f8d867350f6a018a4be2e5ad54c8d8caed89ebca558b2818  numpy-1.26.4-cp312-cp312-win_amd64.whl  pypi
+72972ebdcf504d69462d3bcd67e7b81edd25d0fb85a2c46d3ea3517666636349  nvidia_cuda_nvrtc_cu12-12.9.86-py3-none-win_amd64.whl  pypi
+8e018af8fa02363876860388bd10ccb89eb9ab8fb0aa749aaf58430a9f7c4891  nvidia_cuda_runtime_cu12-12.9.79-py3-none-win_amd64.whl  pypi
+ea2f61b0bc12f3592288503961b764579dea0658852d96a0b3d823614d808821  pydantic_core-2.50.4-cp312-cp312-win_amd64.whl  pypi
+3f7b347782ab7e4cf4c798496ae3a82787d9f21ec12676a9c564355eeef8daa8  pydantic-2.14.3-py3-none-any.whl  pypi
+44cedb2b7c77a9de33a8b74b2b90e9f50d11fcf25d8270ea525ad71a25374ff7  starlette-0.41.3-py3-none-any.whl  pypi
+481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8  typing_extensions-4.16.0-py3-none-any.whl  pypi
+bc210535442b39e1bf2805e0c7a17dfd6a4ace760c84c7f7d16245d23a6b1c39  typing_inspection-0.4.5-py3-none-any.whl  pypi
+82ad92fd58da0d12af7482ecdb5f2470a04c9c9a53ced65b9bbb4a205377602e  uvicorn-0.32.1-py3-none-any.whl  pypi

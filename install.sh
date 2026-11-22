@@ -19,7 +19,10 @@
 # password or a key. Copyright (c) 2026 Amir Husain. SPDX-License-Identifier: AGPL-3.0-only.
 set -euo pipefail
 
-KINDI_VERSION="0.6.1"
+KINDI_VERSION="0.7.0"
+# the image tag (kindi:TAG); KINDI_IMAGE_TAG sets another one, so a test install never replaces an image that other
+# containers on the machine use
+IMAGE_TAG="${KINDI_IMAGE_TAG:-$KINDI_VERSION}"
 SOURCE_URL="https://github.com/ahtx/kindi/archive/refs/tags/v${KINDI_VERSION}.tar.gz"
 HF="https://huggingface.co/prism-ml"
 # model: GGUF file, sha256 (= the Hugging Face file hash), size in bytes
@@ -74,6 +77,10 @@ LAN=0             # --lan: serve the local network (0.0.0.0), with an API key
 APIKEY=""         # --api-key K: the key clients must send; "none" = no key (not recommended with --lan)
 BRIDGE=ask        # Kindi Bridge (optional): ask | yes (--with-bridge) | no (--no-bridge); --yes/--auto alone never adds it
 BRIDGE_SOURCE=""  # --bridge-source: a Kindi Bridge folder (default: bridge/ in the Kindi source)
+PLACE=()          # --place MODEL:CARDS ...: the user's own placement (kindi plan, docs/dev/F6-PLACEMENT.md)
+PLAN_IN=""        # --plan FILE: install the servers of this plan file
+PLAN_MODE=0       # 1: the servers come from a plan (--place or --plan), not from the setup list
+ROUTE_PORT=8090   # the front door (kindi route): one OpenAI endpoint for all servers, when there are two or more
 PI_VERSION="1.3.0"   # the pi coding agent that Bridge is tested with
 
 usage() {
@@ -87,13 +94,14 @@ Kindi ${KINDI_VERSION} installer
 Options:
   --dry-run        print every step and command, change nothing
   --no-dspine      the 27B on tensor-core cards drafts with the 2B, not Tencent's DSpine (4 GB, Apache-2.0)
+  --no-mtp         Flash-Next: leave out the MTP head (the drafter; fetched from Qwen's release and converted here)
   --yes, -y        answer yes to every question (for scripts); takes the recommended setup
   --auto           choose the recommended setup and continue without questions (kernel changes are only
                    described, never made)
   --config N       take setup N of the list that the installer prints (see --dry-run); N,M runs several setups
                    side by side, one server each (for example a 27B on each of two cards); NxK runs setup N on
                    K cards of that kind. Each server gets its own container (kindi, kindi-2, ...) and port.
-  --model M        2b | 4b | 9b | 27b | lightning | nemotron | nanbeige (default: the recommended model for the
+  --model M        2b | 4b | 9b | 27b | lightning | nemotron | nanbeige | flashnext (default: the recommended model for the
                    card; lightning = Nemotron 3.5 Lightning 30B-A3B, a mixture of experts, on NVIDIA cards with 6 GB
                    or more)
   --ctx N          context length in tokens (default: the profile's; the engine fits it to the free memory)
@@ -111,6 +119,14 @@ Options:
                    asks when it has a terminal)
   --no-bridge      do not ask about Kindi Bridge
   --bridge-source D   install Kindi Bridge from folder D (default: bridge/ in the Kindi source)
+  --place P ...    place the servers yourself, one argument per server: MODEL:CARDS[@PORT] (MODEL: 2b 4b 9b 27b
+                   nemotron lightning nanbeige dsv41; CARDS: card numbers of kindi cards / nvidia-smi, or UUIDs;
+                   27b:2,3 splits one 27B over two cards by free memory; dsv41:0+1,2 = DeepSeek with card 0 as the
+                   main card and cards 1 and 2 as expert cards, dsv41:0+ = every card that no other server takes).
+                   Example: --place "dsv41:0+" "27b:3". The plan goes to ${DIR}/plan.json; no card is in two servers
+  --plan FILE      install the servers of a plan file (kindi plan --out FILE); it is checked against the cards
+  --route-port P   with two or more servers, the front door (one OpenAI endpoint that routes by "model") listens on
+                   P (default ${ROUTE_PORT}); 0 = no front door
 EOF
 }
 
@@ -118,12 +134,13 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
     --no-dspine) NO_DSPINE=1 ;;
+    --no-mtp) NO_MTP=1 ;;
     --yes|-y) YES=1 ;;
     --auto) AUTO=1; YES=1 ;;
     --config) CHOICE="$2"; shift ;;
     --uninstall) MODE=uninstall ;;
     --purge) PURGE=1 ;;
-    --model) MODEL="$2"; shift ;;
+    --model) MODEL="${2,,}"; shift ;;   # case does not matter: --model 4B = --model 4b (#45)
     --ctx) CTX="$2"; shift ;;
     --gpu) GPU="$2"; shift ;;
     --port) PORT="$2"; shift ;;
@@ -137,6 +154,10 @@ while [ $# -gt 0 ]; do
     --with-bridge) BRIDGE=yes ;;
     --no-bridge) BRIDGE=no ;;
     --bridge-source) BRIDGE_SOURCE="$2"; BRIDGE=yes; shift ;;
+    --place) while [ $# -gt 1 ] && [[ "$2" != -* ]]; do PLACE+=("$2"); shift; done
+             [ "${#PLACE[@]}" -gt 0 ] || { echo "--place needs MODEL:CARDS (see --help)"; exit 2; }; PLAN_MODE=1 ;;
+    --plan) PLAN_IN="$2"; PLAN_MODE=1; shift ;;
+    --route-port) ROUTE_PORT="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1 (see --help)"; exit 2 ;;
   esac
@@ -152,6 +173,9 @@ info() { echo "    $*"; }
 ok() { echo "    ${G}ok${N}  $*"; }
 warn() { echo "    ${Y}note${N} $*"; }
 die() { echo; echo "${R}stopped:${N} $*"; exit 1; }
+# apt-get failed: say which package we wanted and that an unrelated half-configured package (a kernel or DKMS build the
+# machine began itself) is the usual cause, instead of ending with apt's bare exit code 100
+apt_fail() { die "apt-get could not install $1. The lines above name the failing package; if it is not ours (for example a half-configured kernel or NVIDIA DKMS build), run 'sudo dpkg --configure -a' and 'sudo apt-get -f install', then rerun this installer"; }
 exec 3>&1         # run() prints to the terminal also when the command's output goes to /dev/null
 run() {   # print, then run unless --dry-run
   echo "    \$ $*" >&3
@@ -187,24 +211,42 @@ BRIDGE_RECORD="$DIR/bridge.json"
 
 ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }   # ver_ge 3.11.2 3.10 -> true
 
+# What Kindi Bridge needs on the host: python3 3.10+ with venv, and tmux 3.2+. Sets BRIDGE_MISSING (empty = all there)
+# and BRIDGE_HINT (the install command for this system's package manager). Every probe tolerates a missing program:
+# under `set -euo pipefail` a failed `tmux -V` in a command substitution ended the installer with no message (#41).
+bridge_prereqs() {
+  local py pyv tmv
+  py=$(command -v python3 || true)
+  pyv=$([ -n "$py" ] && "$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 0)
+  tmv=$( { tmux -V 2>/dev/null || true; } | sed -n 's/^tmux \([0-9.]*\).*/\1/p'); tmv=${tmv:-0}
+  BRIDGE_MISSING=""
+  ver_ge "$pyv" 3.10 || BRIDGE_MISSING="$BRIDGE_MISSING python3 (3.10 or later)"
+  if [ -n "$py" ] && ! "$py" -c 'import venv, ensurepip' 2>/dev/null; then BRIDGE_MISSING="$BRIDGE_MISSING python3-venv"; fi
+  if [ "$tmv" = 0 ]; then BRIDGE_MISSING="$BRIDGE_MISSING tmux (not installed)"
+  elif ! ver_ge "$tmv" 3.2; then BRIDGE_MISSING="$BRIDGE_MISSING tmux (3.2 or later; this tmux is $tmv)"; fi
+  if command -v apt-get >/dev/null; then BRIDGE_HINT="sudo apt-get install python3 python3-venv tmux"
+  elif command -v dnf >/dev/null; then BRIDGE_HINT="sudo dnf install python3 tmux"
+  elif command -v pacman >/dev/null; then BRIDGE_HINT="sudo pacman -S python tmux"
+  elif command -v zypper >/dev/null; then BRIDGE_HINT="sudo zypper install python3 tmux"
+  else BRIDGE_HINT="install python3 (3.10+, with venv) and tmux (3.2+) with your package manager"; fi
+  return 0
+}
+
 bridge_install() {   # $1 = the port of the first Kindi server
   local src="${BRIDGE_SOURCE:-${SRC:-}/bridge}" py pyv tmv knowledge=0 unit=0
   step "Install Kindi Bridge" "A terminal workspace for agents on Kindi: conversations, scheduled prompts, completion checks, local knowledge folders and live Kindi telemetry. It runs on this computer, not in a container."
   [ -f "$src/pyproject.toml" ] || { warn "no Kindi Bridge source in ${src} (use --bridge-source DIR): Bridge is not installed"; return 0; }
-  py=$(command -v python3 || true)
-  pyv=$([ -n "$py" ] && "$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 0)
-  tmv=$(tmux -V 2>/dev/null | sed -n 's/^tmux \([0-9.]*\).*/\1/p'); tmv=${tmv:-0}
-  local missing=""
-  ver_ge "$pyv" 3.10 || missing="$missing python3 (3.10 or later)"
-  [ -n "$py" ] && ! "$py" -c 'import venv, ensurepip' 2>/dev/null && missing="$missing python3-venv"
-  ver_ge "$tmv" 3.2 || missing="$missing tmux (3.2 or later)"
+  bridge_prereqs
+  local missing="$BRIDGE_MISSING"
   if [ -n "$missing" ]; then
     info "Bridge needs:${missing}."
     if command -v apt-get >/dev/null && ask "Install python3, python3-venv and tmux with apt-get (needs sudo)?"; then
       need_sudo; run $SUDO apt-get update -qq; run $SUDO apt-get install -y -qq python3 python3-venv tmux >/dev/null
-      py=$(command -v python3)
-    else warn "Bridge is not installed. Install${missing}, then run this installer again with --with-bridge."; return 0; fi
+      bridge_prereqs
+      [ -z "$BRIDGE_MISSING" ] || [ "$DRY" = 1 ] || { warn "Bridge is not installed: still missing${BRIDGE_MISSING}. Install it (${BRIDGE_HINT}), then run this installer again with --with-bridge."; return 0; }
+    else warn "Bridge is not installed. It needs${missing}. Install it (${BRIDGE_HINT}), then run this installer again with --with-bridge."; return 0; fi
   fi
+  py=$(command -v python3)
   ok "python $("$py" -c 'import platform; print(platform.python_version())' 2>/dev/null || echo "?"), $(tmux -V 2>/dev/null || echo tmux)"
   local pibin; pibin=$(command -v pi || ls "$HOME"/.nvm/versions/node/*/bin/pi 2>/dev/null | tail -1 || true)
   [ -z "$pibin" ] && [ -x "$HOME/.local/bin/pi" ] && pibin="$HOME/.local/bin/pi"
@@ -316,7 +358,7 @@ if [ "$MODE" = uninstall ]; then
   step "Remove the Kindi servers" "Stops and removes this installer's containers. The models in ${DIR} stay unless --purge."
   command -v docker >/dev/null || die "Docker is not installed: nothing to remove"
   docker info >/dev/null 2>&1 || DOCKER="sudo docker"
-  names="$NAME"; imgs="kindi:${KINDI_VERSION}"   # only what this installer made (other Kindi containers and images stay)
+  names="$NAME"; imgs="kindi:${IMAGE_TAG}"   # only what this installer made (other Kindi containers and images stay)
   if [ -f "$STATE" ]; then
     names=$(sed -n 's/.*"container": "\([^"]*\)".*/\1/p' "$STATE" | tr '\n' ' ')
     imgs=$(sed -n 's/.*"image": "\([^"]*\)".*/\1/p' "$STATE" | sort -u | tr '\n' ' ')
@@ -329,6 +371,7 @@ if [ "$MODE" = uninstall ]; then
     if $DOCKER image inspect "$img" >/dev/null 2>&1 && [ -z "$($DOCKER ps -a --filter ancestor="$img" --format '{{.Names}}')" ] \
        && ask "Remove the image ${img}?"; then if run $DOCKER rmi "$img" >/dev/null 2>&1; then ok "image removed"; else warn "could not remove the image ${img}"; fi; fi
   done
+  if [ -f "$DIR/plan.json" ]; then run rm -f "$DIR/plan.json"; ok "the plan file ${DIR}/plan.json removed"; fi
   if [ "$PURGE" = 1 ] && [ -d "$DIR" ]; then
     info "${DIR} holds $(du -sh "$DIR" 2>/dev/null | cut -f1): the models, the converted packs and the cache."
     if ask "Delete ${DIR}?"; then run rm -rf "$DIR"; ok "deleted"; fi
@@ -342,7 +385,7 @@ PREV=""
 [ -f "$STATE" ] && PREV=$(cat "$STATE") && info "found an earlier install (${STATE}): this run upgrades or repairs it"
 
 # ------------------------------------------------------------------------------------------------ 1. machine
-step "Check the machine" "Kindi runs on 64-bit Linux: on an NVIDIA GPU from the Quadro K420 (Kepler) up, on an AMD RDNA3 or RDNA 3.5 GPU, or on the CPU."
+step "Check the machine" "Kindi runs on 64-bit Linux: on an NVIDIA GPU from the Quadro K420 (Kepler) up, on an AMD RDNA2, RDNA3 or RDNA 3.5 GPU, or on the CPU."
 [ "$(uname -s)" = Linux ] || die "Kindi needs Linux (found $(uname -s))"
 [ "$(uname -m)" = x86_64 ] || die "Kindi needs an x86-64 CPU (found $(uname -m))"
 OS_ID=$(. /etc/os-release 2>/dev/null && echo "${ID:-unknown}") || OS_ID=unknown
@@ -362,39 +405,74 @@ if [ "$IS_WSL" = 1 ]; then
 fi
 
 # GPUs: index, name, memory (MiB), compute capability
+# the compute capability from the card name: older drivers (Kepler's 470) do not report it, and a card whose query
+# fails (a corrupt infoROM) is named from the card list
+cc_from_name() {
+  local n="$1" c=
+    case "$n" in
+      *"GTX TITAN X"*) c=5.2 ;;                                                      # GM200 (Maxwell): before "GTX TITAN"
+      # data-centre parts first: "SXM4" in a name would match the Maxwell M[0-9] pattern below
+      *"Tesla P100"*|*"Quadro GP100"*) c=6.0 ;;                                       # GP100: no dp4a
+      *V100*|*"TITAN V"*|*"Quadro GV100"*) c=7.0 ;;                                   # GV100
+      *A100*|*A30*|*"CMP 170HX"*) c=8.0 ;;                                            # GA100: before A[0-9]
+      *H100*|*H200*|*GH200*) c=9.0 ;;
+      # the K20 and K40 patterns must not match the K2000 and the K4000: a digit after "K20" or "K40" is another card
+      *K6000*|*K5200*|*K40[!0-9]*|*K40|*K20[!0-9]*|*K20|*"GTX TITAN"*|*"GTX 780"*) c=3.5 ;;   # GK110
+      *K80*) c=3.7 ;;                                                                # GK210
+      *K420*|*K600*|*K2000*|*K4000*|*K4200*|*K5000*|*K520*|*K10[!0-9]*|*K10|*"GTX 6"*|*"GTX 7"[0-4]*|*"GT 7"*) c=3.0 ;;   # GK104, GK106, GK107
+      # Maxwell 2 (GM200, GM204, GM206) is sm_52: before the M[0-9] line below (issue #30: the M5000 showed sm_50)
+      *"Quadro M2000"|*"Quadro M4000"|*"Quadro M5000"|*"Quadro M6000"*|*"Quadro M3000M"*|*"Quadro M4000M"*|*"Quadro M5000M"*|*"Tesla M4"|*"Tesla M40"*|*"Tesla M6"|*"Tesla M60"*|*"GTX 950"|*"GTX 960"|*"GTX 970"*|*"GTX 980"*|*"GTX 965M"*) c=5.2 ;;
+      *K620*|*K1200*|*K2200*|*"GTX 75"*|*"GTX 9"*|*M[0-9]*) c=5.0 ;;
+      *"GTX 10"*|*"Quadro P"*|*"TITAN X"*|*Tesla\ P*) c=6.1 ;;
+      *"RTX 20"*|*"GTX 16"*|*"Quadro RTX"*|*T4*) c=7.5 ;;
+      *"RTX 30"*|*A[0-9]*) c=8.6 ;;
+      *"RTX 40"*|*L4*) c=8.9 ;;
+      *) c=6.1 ;;
+    esac
+  echo "$c"
+}
 GIDX=(); GNAME=(); GMEM=(); GCC=()
 DRIVER=""
-if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
-  DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | sed -n 1p)
-  if out=$(nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv,noheader,nounits 2>/dev/null); then :; else
-    out=$(nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits | sed 's/$/, ?/'); fi
-  while IFS=',' read -r i n m c; do
-    n=$(echo "$n" | sed 's/^ *//; s/ *$//'); c=$(echo "$c" | tr -d ' ')
-    if [ "$c" = "?" ] || [ -z "$c" ]; then   # older drivers (Kepler's 470) do not report it: from the name
-      case "$n" in
-        *"GTX TITAN X"*) c=5.2 ;;                                                      # GM200 (Maxwell): before "GTX TITAN"
-        # data-centre parts first: "SXM4" in a name would match the Maxwell M[0-9] pattern below
-        *"Tesla P100"*|*"Quadro GP100"*) c=6.0 ;;                                       # GP100: no dp4a
-        *V100*|*"TITAN V"*|*"Quadro GV100"*) c=7.0 ;;                                   # GV100
-        *A100*|*A30*|*"CMP 170HX"*) c=8.0 ;;                                            # GA100: before A[0-9]
-        *H100*|*H200*|*GH200*) c=9.0 ;;
-        # the K20 and K40 patterns must not match the K2000 and the K4000: a digit after "K20" or "K40" is another card
-        *K6000*|*K5200*|*K40[!0-9]*|*K40|*K20[!0-9]*|*K20|*"GTX TITAN"*|*"GTX 780"*) c=3.5 ;;   # GK110
-        *K80*) c=3.7 ;;                                                                # GK210
-        *K420*|*K600*|*K2000*|*K4000*|*K4200*|*K5000*|*K520*|*K10[!0-9]*|*K10|*"GTX 6"*|*"GTX 7"[0-4]*|*"GT 7"*) c=3.0 ;;   # GK104, GK106, GK107
-        # Maxwell 2 (GM200, GM204, GM206) is sm_52: before the M[0-9] line below (issue #30: the M5000 showed sm_50)
-        *"Quadro M2000"|*"Quadro M4000"|*"Quadro M5000"|*"Quadro M6000"*|*"Quadro M3000M"*|*"Quadro M4000M"*|*"Quadro M5000M"*|*"Tesla M4"|*"Tesla M40"*|*"Tesla M6"|*"Tesla M60"*|*"GTX 950"|*"GTX 960"|*"GTX 970"*|*"GTX 980"*|*"GTX 965M"*) c=5.2 ;;
-        *K620*|*K1200*|*K2200*|*"GTX 75"*|*"GTX 9"*|*M[0-9]*) c=5.0 ;;
-        *"GTX 10"*|*"Quadro P"*|*"TITAN X"*|*Tesla\ P*) c=6.1 ;;
-        *"RTX 20"*|*"GTX 16"*|*"Quadro RTX"*|*T4*) c=7.5 ;;
-        *"RTX 30"*|*A[0-9]*) c=8.6 ;;
-        *"RTX 40"*|*L4*) c=8.9 ;;
-        *) c=6.1 ;;
-      esac
+# Each card is queried on its own. One card with a corrupt infoROM makes nvidia-smi exit 14 for every query that
+# touches it; a query of all cards at once then lost every card and the installer went CPU-only. A failed query
+# now leaves out that card's compute capability only (from the name instead), or that card only.
+nv_row() { grep -E '^ *[0-9]+ *,' | sed -n 1p; }    # the first CSV row of an nvidia-smi query (no warning lines)
+detect_nvidia() {
+  command -v nvidia-smi >/dev/null || return 0
+  local ids i row rc rc2 n m c
+  local smi_out smi_rc=0
+  smi_out=$(nvidia-smi -L 2>&1) || smi_rc=$?
+  ids=$(printf '%s\n' "$smi_out" | sed -n 's/^GPU \([0-9][0-9]*\):.*/\1/p' || true)
+  if [ -z "$ids" ] && [ "$smi_rc" != 0 ]; then
+    warn "nvidia-smi failed (exit $smi_rc): $(printf '%s' "$smi_out" | head -n 3 | tr '\n' ' ')"
+    case "$smi_out" in
+      *"Driver/library version mismatch"*)
+        die "NVIDIA driver and library versions differ (often after an automatic update): reboot, then rerun this installer" ;;
+    esac
+  fi
+  [ -n "$ids" ] || return 0
+  DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | grep -E '^ *[0-9]+\.' | sed -n '1{s/ //g;p}' || true)
+  for i in $ids; do
+    rc=0; row=$(nvidia-smi -i "$i" --query-gpu=index,name,memory.total,compute_cap --format=csv,noheader,nounits 2>/dev/null) || rc=$?
+    row=$(nv_row <<<"$row" || true)
+    if [ "$rc" != 0 ] || [ -z "$row" ]; then
+      # the 470 driver has no compute_cap field: the name gives it, quietly. A failure of this query too is the card's
+      rc2=0; row=$(nvidia-smi -i "$i" --query-gpu=index,name,memory.total --format=csv,noheader,nounits 2>/dev/null) || rc2=$?
+      row=$(nv_row <<<"$row" || true)
+      if [ -z "$row" ]; then
+        warn "GPU $i: nvidia-smi exited with code $rc and gave no name: this card is left out"
+        continue
+      fi
+      [ "$rc2" = 0 ] || warn "GPU $i: nvidia-smi exited with code $rc2$([ "$rc2" = 14 ] && echo " (infoROM is corrupted)"); its compute capability is taken from its name"
+      row="$row, ?"
     fi
-    GIDX+=("$(echo "$i" | tr -d ' ')"); GNAME+=("$n"); GMEM+=("$(echo "$m" | tr -d ' ')"); GCC+=("$c")
-  done <<< "$out"
-fi
+    IFS=',' read -r _ n m c <<<"$row"
+    n=$(echo "$n" | sed 's/^ *//; s/ *$//'); c=$(echo "$c" | tr -d ' ')
+    case "$c" in [0-9].[0-9]) ;; *) c=$(cc_from_name "$n") ;; esac
+    GIDX+=("$i"); GNAME+=("$n"); GMEM+=("$(echo "$m" | tr -d ' ')"); GCC+=("$c")
+  done
+}
+detect_nvidia
 NG=${#GIDX[@]}
 if [ "$NG" = 0 ]; then
   info "no NVIDIA GPU found (or no NVIDIA driver)"
@@ -420,9 +498,10 @@ for p in /sys/class/kfd/kfd/topology/nodes/*/properties; do
   [ "$gfx" = gfx1152 ] && name="Radeon 840M/860M, ${name:-Krackan}"
   [ "$gfx" = gfx1151 ] && name="Radeon 8060S/8050S, ${name:-Strix Halo}"
   [ "$gfx" = gfx1150 ] && name="Radeon 890M/880M, ${name:-Strix Point}"
+  [ "$gfx" = gfx1030 ] && name="${name:-Radeon RX 6800/6900, PRO W6800 (Navi 21)}"
   case "$gfx" in
-    gfx110[0-3]|gfx115[0-2]) ;;
-    *) warn "AMD GPU ${bus} (${name:-$gfx}, ${gfx}): Kindi supports AMD RDNA3 (gfx1100-gfx1103) and RDNA 3.5 (gfx1150-gfx1152) GPUs only"; continue ;;
+    gfx103[0-6]|gfx110[0-3]|gfx115[0-2]) ;;
+    *) warn "AMD GPU ${bus} (${name:-$gfx}, ${gfx}): Kindi supports AMD RDNA2 (gfx1030-gfx1036), RDNA3 (gfx1100-gfx1103) and RDNA 3.5 (gfx1150-gfx1152) GPUs only"; continue ;;
   esac
   # an APU (the 780M) has a small carve-out and uses system memory (GTT): count the larger one
   m=$vram; [ "$gtt" -gt "$m" ] && [ "$vram" -lt 8192 ] && m=$gtt
@@ -430,7 +509,7 @@ for p in /sys/class/kfd/kfd/topology/nodes/*/properties; do
 done
 NA=${#AGFX[@]}
 for k in $(seq 0 $((NA - 1))); do
-  case "${AGFX[$k]}" in gfx1103|gfx1151|gfx1152) nm="" ;; *) nm=" (not yet measured with Kindi; the Radeon 780M, 840M and 8060S are)" ;; esac
+  case "${AGFX[$k]}" in gfx1030|gfx1103|gfx1151|gfx1152) nm="" ;; *) nm=" (not yet measured with Kindi; the Radeon PRO W6800, 780M, 840M and 8060S are)" ;; esac
   ok "AMD GPU ${k}: ${ANAME[$k]}, ${AGFX[$k]}, ${AMEM[$k]} MiB usable${nm}"
 done
 if [ "$IS_WSL" = 1 ] && [ "$NA" = 0 ] && [ "$NG" = 0 ]; then
@@ -498,6 +577,12 @@ check_unlock() {
   ok "gpu-unlock installed; reboot to unlock the card(s), then run this installer again to check"
 }
 check_unlock
+if [ "$BRIDGE" = yes ] || { [ "$BRIDGE" = ask ] && [ -f "$BRIDGE_RECORD" ]; }; then   # Bridge asked for, or an upgrade of it
+  bridge_prereqs
+  if [ -n "$BRIDGE_MISSING" ]; then
+    warn "Kindi Bridge needs:${BRIDGE_MISSING}. Install it now (${BRIDGE_HINT}), or the Bridge step at the end offers it (apt only)."
+  else ok "Kindi Bridge can install: python3 and tmux are there"; fi
+fi
 
 # ------------------------------------------------------------------------------------------------ 2. docker
 step "Check Docker and GPU access" "Kindi runs in a Docker container with CUDA 10.2 (NVIDIA) or ROCm 6.3 / 7 (AMD) inside, so the host needs only the driver."
@@ -506,7 +591,7 @@ if ! command -v docker >/dev/null; then
   case "$OS_ID" in
     ubuntu|debian|linuxmint|pop)
       if ask "Install Docker (apt package docker.io) and add ${USER} to the docker group?"; then
-        need_sudo; run $SUDO apt-get update -qq; run $SUDO apt-get install -y -qq docker.io
+        need_sudo; run $SUDO apt-get update -qq; run $SUDO apt-get install -y -qq docker.io || apt_fail docker.io
         run $SUDO usermod -aG docker "$USER"; [ "$DRY" = 1 ] || DOCKER="$SUDO docker"   # a dry run must not wait for a sudo password
       else die "Kindi needs Docker: https://docs.docker.com/engine/install/"; fi ;;
     *) die "install Docker for ${OS_ID} (https://docs.docker.com/engine/install/), then run this again" ;;
@@ -533,7 +618,9 @@ GPU_MODE=none
 if [ "$NG" -gt 0 ] && [ "$GPU" != cpu ]; then
   if [ "$IS_WSL" = 1 ] && [ "$DRY" = 0 ] && $DOCKER info -f '{{.OperatingSystem}}' 2>/dev/null | grep -q 'Docker Desktop'; then
     GPU_MODE=toolkit; ok "Docker Desktop (WSL2): the container gets the GPUs with --gpus"
-  elif $DOCKER info 2>/dev/null | grep -i 'runtimes.*nvidia' >/dev/null || command -v nvidia-ctk >/dev/null || command -v nvidia-container-toolkit >/dev/null; then
+  # the toolkit binaries must be present: a daemon.json that only names an nvidia runtime (some VM images) is not enough,
+  # and --gpus then fails with 'could not select device driver "" with capabilities: [[gpu]]' (0.7 RC test)
+  elif command -v nvidia-ctk >/dev/null || command -v nvidia-container-runtime >/dev/null || command -v nvidia-container-toolkit >/dev/null; then
     GPU_MODE=toolkit; ok "NVIDIA container toolkit found: the container gets the GPUs with --gpus"
   else
     warn "the NVIDIA container toolkit is not installed"
@@ -542,7 +629,7 @@ if [ "$NG" -gt 0 ] && [ "$GPU" != cpu ]; then
         need_sudo
         run sh -c "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | $SUDO gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
         run sh -c "curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | $SUDO tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null"
-        run $SUDO apt-get update -qq; run $SUDO apt-get install -y -qq nvidia-container-toolkit
+        run $SUDO apt-get update -qq; run $SUDO apt-get install -y -qq nvidia-container-toolkit || apt_fail nvidia-container-toolkit
         if [ "$ROOTLESS" = 1 ]; then run nvidia-ctk runtime configure --runtime=docker --config="$HOME/.config/docker/daemon.json"
         else run $SUDO nvidia-ctk runtime configure --runtime=docker; fi
         restart_docker
@@ -639,8 +726,8 @@ pair_ok() {       # two NVIDIA card positions -> 0 if they run a model split ove
 }
 amd_models() {    # AMD GPU position -> the models that run on it, the best first
   local V=${AMEM[$1]} m=""
-  if [[ "${AGFX[$1]}" == gfx115* ]]; then
-    # RDNA 3.5 (the Radeon 840M): the Ternary-Bonsai-2 models were measured; Nemotron was not
+  if [[ "${AGFX[$1]}" == gfx115* || "${AGFX[$1]}" == gfx103* ]]; then
+    # RDNA 3.5 (the Radeon 840M) and RDNA2 (the Radeon PRO W6800): the Ternary-Bonsai-2 models were measured; Nemotron was not
     [ "$V" -ge 12000 ] && m="27b"
     [ "$V" -ge 4000 ] && m="$m 9b"
     [ "$V" -ge 2500 ] && m="$m 4b"
@@ -718,10 +805,19 @@ if [ "$GPU" != cpu ]; then
     done
   fi
 fi
-if [ "$MODEL" = auto ] || [ "$MODEL" = 2b ]; then
-  add_cfg "cpu|2b|" "$(model_label 2b) on the CPU ($CORES threads; slow, no GPU needed)"
-fi
-[ "${#CFG[@]}" -gt 0 ] || die "model '${MODEL}' does not run on the selected hardware (run without --model to see what does)"
+# The CPU engine runs the 2B, 4B and 9B (kindi/cpu.py). The 2B is listed first (the fastest); the 4B needs about
+# 6 GB of RAM for the server and the 9B about 12 GB (the weights, the K/V cache and the prompt cache). The 27B and
+# the MoE models have no CPU engine.
+for m in 2b 4b 9b; do
+  want "$m" || continue
+  need=$(case "$m" in 2b) echo 4 ;; 4b) echo 6 ;; 9b) echo 12 ;; esac)
+  if [ "$((RAM_MB / 1024))" -lt "$need" ]; then
+    [ "$MODEL" = "$m" ] && warn "the $(model_label "$m") on the CPU needs about ${need} GB of RAM; this machine has $((RAM_MB / 1024)) GB"
+    continue
+  fi
+  add_cfg "cpu|$m|" "$(model_label "$m") on the CPU ($CORES threads; slow, no GPU needed)"
+done
+[ "${#CFG[@]}" -gt 0 ] || [ "$MODEL" = flashnext ] || [ "$PLAN_MODE" = 1 ] || die "model '${MODEL}' does not run on the selected hardware$([ "$GPU" = cpu ] && echo " (the CPU engine runs the 2B, 4B and 9B)") (run without --model to see what does)"
 # the all-cards setup: the best model on every card (a pair that runs one model together counts as one); first
 # when the machine has more than one GPU that is not in such a pair
 if [ "$GPU" = auto ] || [ "$GPU" = all ]; then
@@ -741,8 +837,10 @@ if [ "$GPU" = auto ] || [ "$GPU" = all ]; then
 fi
 
 SEL=1
+[ "$PLAN_MODE" = 1 ] && CHOICE=skip
 show_list() { for i in "${!CFG[@]}"; do info "$([ "$i" = 0 ] && echo "${G}" )$((i + 1))) ${CFG_N[$i]}$([ "$i" = 0 ] && echo " (recommended)${N}")"; done; }
-if [ -n "$CHOICE" ]; then SEL=$CHOICE; show_list
+if [ "$CHOICE" = skip ]; then :                 # the servers come from the plan
+elif [ -n "$CHOICE" ]; then SEL=$CHOICE; show_list
 elif [ "${#CFG[@]}" -gt 1 ] && [ "$AUTO" = 0 ] && [ "$YES" = 0 ] && [ "$DRY" = 0 ] && [ -r /dev/tty ]; then
   show_list
   info "One number for one server, or several for several servers: \"3,8\" runs setups 3 and 8 side by side,"
@@ -764,6 +862,80 @@ port_ok() {       # free, or held by one of this installer's servers (it is repl
 }
 OURS=""; [ -f "$STATE" ] && OURS=$(sed -n 's/.*"container": "\([^"]*\)".*/\1/p' "$STATE" | tr '\n' ' ')
 next_port=$PORT
+PLAN="$DIR/plan.json"; DSV_PLAN=0
+if [ "$PLAN_MODE" = 1 ] && [ "$DRY" = 1 ]; then      # --dry-run: the plan goes to a temporary file
+  PLAN=$(mktemp "${TMPDIR:-/tmp}/kindi-plan.XXXXXX.json"); trap 'rm -f "$PLAN"' EXIT
+fi
+# the Kindi source, early: kindi plan runs from it (in step 4 the image is built from the same folder)
+src_dir() {
+  if [ -n "$SOURCE" ] && [ -d "$SOURCE" ]; then SRC="$SOURCE"; return 0; fi
+  SRC="$DIR/src-${KINDI_VERSION}"
+  local tarball="${SOURCE:-$SOURCE_URL}"
+  if [ ! -f "$SRC/kindi/place.py" ]; then
+    mkdir -p "$SRC"
+    if [ -f "$tarball" ]; then tar -xzf "$tarball" -C "$SRC" --strip-components=1
+    else curl -fsSL "$tarball" | tar -xz -C "$SRC" --strip-components=1; fi
+  fi
+}
+kplan() { PYTHONPATH="$SRC" python3 -m kindi.place "$@"; }
+if [ "$MODEL" = flashnext ] && [ "$PLAN_MODE" = 0 ]; then
+  PLAN_MODE=1; FN_AUTO=1           # Flash-Next: kindi plan picks its cards (docs/FLASHNEXT.md)
+fi
+if [ "$PLAN_MODE" = 1 ]; then
+  command -v python3 >/dev/null || die "--place, --plan and Flash-Next need python3 on this machine"
+  src_dir
+  [ -f "$SRC/kindi/place.py" ] || die "the Kindi source in ${SRC} has no kindi/place.py (a Kindi 0.7.0 source is needed for --place)"
+  mkdir -p "$DIR"
+  if [ -n "$PLAN_IN" ]; then
+    [ -f "$PLAN_IN" ] || die "no plan file ${PLAN_IN}"
+    [ "$(cd "$(dirname "$PLAN_IN")" && pwd)/$(basename "$PLAN_IN")" = "$PLAN" ] || cp "$PLAN_IN" "$PLAN"
+    [ "$DRY" = 1 ] || mkdir -p "$DIR"
+    kplan --check "$PLAN" || die "the plan ${PLAN_IN} does not fit the cards in this machine (see above; kindi plan makes a new one)"
+    kplan --show "$PLAN" | sed 's/^/    /'
+  else
+    if [ "${FN_AUTO:-0}" = 1 ]; then where=(--model flashnext); else where=(--place "${PLACE[@]}"); fi
+    kplan "${where[@]}" --name "$NAME" --port-base "$PORT" --front-port "$ROUTE_PORT" --out "$PLAN.new" > "$PLAN.log" 2>&1 || { sed 's/^/    /' "$PLAN.log"; rm -f "$PLAN.log"; die "--place: see above"; }
+    sed 's/^/    /' "$PLAN.log"; rm -f "$PLAN.log"
+    mv "$PLAN.new" "$PLAN"
+  fi
+  # the plan's servers -> the installer's server list (the card numbers of nvidia-smi now, from the UUIDs)
+  while IFS='|' read -r m c nm pt; do
+    [ -n "$m" ] || continue
+    if [ "$m" = dsv41 ]; then DSV_PLAN=1; continue; fi
+    if [ "$m" = flashnext ]; then FN_PLAN=1; continue; fi
+    SV_B+=("cuda"); SV_M+=("$m"); SV_C+=("$c"); SV_NAME+=("$nm"); SV_PORT+=("$pt")
+    for x in ${c//,/ }; do USED="$USED$x|"; done
+  done < <(python3 -c '
+import json, subprocess, sys
+p = json.load(open(sys.argv[1]))
+now = {}
+try:
+    out = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"], stdout=subprocess.PIPE,
+                         universal_newlines=True).stdout
+    for line in out.splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) >= 2:
+            now[f[1]] = f[0]
+except OSError:
+    pass
+for s in p["servers"]:
+    cards = [s["main"]] + s["experts"] if s["engine"] == "dsv41" else s["cards"]
+    print("%s|%s|%s|%d" % (s["model"], ",".join(now.get(u, u) for u in cards), s["name"], s["port"]))
+' "$PLAN")
+  [ "${#SV_B[@]}" -gt 0 ] || [ "$DSV_PLAN" = 1 ] || [ "${FN_PLAN:-0}" = 1 ] || die "the plan has no server"
+  if [ "${#SV_B[@]}" = 0 ] && [ "${FN_PLAN:-0}" = 1 ] && [ "$DSV_PLAN" = 0 ]; then
+    step "Qwen3.8-Flash-Next (native install)" "The plan has only the Flash-Next server: tools/install_flashnext.sh installs it with the plan's cards."
+    bash "$SRC/tools/install_flashnext.sh" --plan "$PLAN" --dir "$DIR/flashnext" $([ "$YES" = 1 ] && echo --yes) \
+      $([ "$DRY" = 1 ] && echo --dry-run) $([ "${NO_MTP:-0}" = 1 ] && echo --no-mtp)
+    exit $?
+  fi
+  if [ "${#SV_B[@]}" = 0 ]; then
+    step "DeepSeek V4.1 Flash (native install)" "The plan has only the DeepSeek server: tools/install_dsv41.sh installs it with the plan's cards."
+    bash "$SRC/tools/install_dsv41.sh" --plan "$PLAN" $([ "$YES" = 1 ] && echo --yes) $([ "$DRY" = 1 ] && echo --dry-run)
+    exit $?
+  fi
+  SEL=""
+fi
 for part in ${SEL//,/ }; do
   num=${part%%x*}; times=1; [[ "$part" == *x* ]] && times=${part##*x}
   [[ "$num" =~ ^[0-9]+$ ]] && [[ "$times" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#CFG[@]}" ] && [ "$times" -ge 1 ] \
@@ -798,7 +970,7 @@ profile_of() {
     th=$(lscpu -p=CORE,SOCKET 2>/dev/null | grep -v '^#' | awk -F, '$2 == 0' | sort -u | wc -l); [ "$th" -gt 0 ] || th=$CORES
     [ -n "$THREADS" ] && th=$THREADS
     ENV+=(-e KINDI_DEVICE=cpu -e OMP_NUM_THREADS="$th" -e OMP_PROC_BIND=close -e OMP_PLACES=cores)
-    C=${CTX/auto/24576}; MEM=8g; CPUS="$th"
+    C=${CTX/auto/24576}; MEM=$([ "$M" = 9b ] && echo 14g || echo 8g); CPUS="$th"
   elif [ "$B" = rocm ]; then
     PROFILE="rocm-${AGFX[$CARDS]}"; C=${CTX/auto/24576}
     ENV+=(-e HIP_VISIBLE_DEVICES="$CARDS" -e ROCR_VISIBLE_DEVICES="$CARDS" -e KINDI_REPEAT_STOP=1)
@@ -846,9 +1018,10 @@ profile_of() {
       esac
     fi
     ENV+=(-e CUDA_DEVICE_ORDER=PCI_BUS_ID -e CUDA_VISIBLE_DEVICES="$CARDS")   # the card numbers of nvidia-smi
-    # blocking sync frees a CPU core per busy server but costs ~2.5% decode (GTX 1080): only the tc profile (many
-    # servers per host on the cluster) keeps it; one server on its own card waits in a loop
-    [ "$PROFILE" = tc ] || ENV+=(-e KINDI_BLOCKING_SYNC=0)
+    # blocking sync frees a CPU core per busy server but costs ~2.5% decode (GTX 1080), 5-15% on the 580 driver:
+    # only the tc profile (many servers per host on the cluster) keeps it, set explicitly (Kindi's own default is off
+    # on 580+ drivers); one server on its own card waits in a loop
+    if [ "$PROFILE" = tc ]; then ENV+=(-e KINDI_BLOCKING_SYNC=1); else ENV+=(-e KINDI_BLOCKING_SYNC=0); fi
   fi
   [ "$M" = nemotron ] && C=${CTX/auto/24576}
   # Lightning: 32K by default (more context takes card memory from the experts on 6 to 8 GB cards); the host
@@ -908,11 +1081,11 @@ gpu_args() {
   return 0
 }
 # AMD: ROCm 6.3 for RDNA3 (gfx110x, the measured 780M setup), ROCm 7 (HIP 7.16) for RDNA 3.5 (gfx115x), which ROCm 6.3
-# does not know. image_of BACKEND [SERVER]
-rocm_image() { case "$1" in gfx115*) echo "kindi-rocm7:${KINDI_VERSION}" ;; *) echo "kindi-rocm:${KINDI_VERSION}" ;; esac; }
+# does not know, and for RDNA2 (gfx103x, measured on HIP 7.16). image_of BACKEND [SERVER]
+rocm_image() { case "$1" in gfx115*|gfx103*) echo "kindi-rocm7:${IMAGE_TAG}" ;; *) echo "kindi-rocm:${IMAGE_TAG}" ;; esac; }
 image_of() {
   if [ "$1" = rocm ]; then rocm_image "${AGFX[${SV_C[${2:-0}]}]:-gfx1100}"
-  else echo "kindi:${KINDI_VERSION}"; fi
+  else echo "kindi:${IMAGE_TAG}"; fi
 }
 UIDGID="$(id -u):$(id -g)"
 # the images run as a fixed user (1000:1000); rootful Docker runs them as this user, rootless Docker as the
@@ -970,7 +1143,7 @@ done
 # the daemon finds the NVIDIA toolkit only when it starts: check '--gpus' before convert and verify
 nv=0; for b in $BACKENDS; do [ "$b" != cpu ] && [ "$b" != rocm ] && nv=1; done
 if [ "$GPU_MODE" = toolkit ] && [ "$nv" = 1 ] && [ "$DRY" = 0 ]; then
-  gpu_ok() { $DOCKER run --rm --gpus all --entrypoint true "kindi:${KINDI_VERSION}" >/dev/null 2>&1; }
+  gpu_ok() { $DOCKER run --rm --gpus all --entrypoint true "kindi:${IMAGE_TAG}" >/dev/null 2>&1; }
   if ! gpu_ok; then
     warn "Docker cannot give the container the GPUs ('could not select device driver'): restart the Docker daemon after the toolkit install"
     if ask "Restart the Docker daemon now?"; then [ "$ROOTLESS" = 1 ] || need_sudo; restart_docker; fi
@@ -1164,12 +1337,56 @@ for i in $(seq 0 $((NS - 1))); do
 }  {\"container\": \"${nm}\", \"image\": \"${IMAGE}\", \"port\": ${pt}, \"backend\": \"${b}\", \"profile\": \"${PROFILE}\", \"model\": \"${M}\", \"ctx\": ${GOT_CTX[$i]}, \"gpus\": \"${SV_C[$i]}\"}"
 done
 
+if [ "$PLAN_MODE" = 0 ] && [ "$DRY" = 0 ] && command -v python3 >/dev/null && [ -f "$SRC/kindi/place.py" ]; then
+  # the setup chosen from the list as a plan file too: the cards each server holds (the DeepSeek installer and
+  # kindi plan --check read it, so no card is claimed twice)
+  pl=(); for i in $(seq 0 $((NS - 1))); do [ "${SV_B[$i]}" = cuda ] && pl+=("${SV_M[$i]}:${SV_C[$i]}@${SV_PORT[$i]}"); done
+  if [ "${#pl[@]}" -gt 0 ]; then
+    if PYTHONPATH="$SRC" python3 -m kindi.place --place "${pl[@]}" --out "$DIR/plan.json" >/dev/null 2>&1; then
+      ok "the cards of each server: ${DIR}/plan.json"
+    else
+      warn "the plan file was not written (kindi plan --place ${pl[*]} says why)"
+    fi
+  fi
+fi
+ROUTE=0
+if [ "$ROUTE_PORT" != 0 ] && [ $((NS + ${DSV_PLAN:-0})) -ge 2 ] && [ "$DRY" = 0 ] && [ -f "$DIR/plan.json" ]; then
+  ROUTE=1
+  JSON="${JSON:+$JSON,
+}  {\"container\": \"${NAME}-route\", \"image\": \"$(image_of cuda)\", \"port\": ${ROUTE_PORT}, \"backend\": \"route\", \"profile\": \"route\", \"model\": \"\", \"ctx\": 0, \"gpus\": \"\"}"
+fi
 [ "$DRY" = 1 ] || cat > "$STATE" <<EOF
 {"version": "${KINDI_VERSION}", "source": "${src_id}", "gpu_access": "${GPU_MODE}", "installed": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
  "servers": [
 ${JSON}
  ]}
 EOF
+
+if [ "$PLAN_MODE" = 1 ] && [ "${FN_PLAN:-0}" = 1 ]; then
+  step "Qwen3.8-Flash-Next (native install)" "The plan's Flash-Next server: tools/install_flashnext.sh with the plan's cards and port."
+  run bash "$SRC/tools/install_flashnext.sh" --plan "$PLAN" --dir "$DIR/flashnext" $([ "$YES" = 1 ] && echo --yes) \
+    $([ "$DRY" = 1 ] && echo --dry-run) $([ "${NO_MTP:-0}" = 1 ] && echo --no-mtp) \
+    || warn "the Flash-Next install stopped (see above); the other servers run"
+fi
+if [ "$PLAN_MODE" = 1 ] && [ "$DSV_PLAN" = 1 ]; then
+  step "DeepSeek V4.1 Flash (native install)" "The plan's DeepSeek server: tools/install_dsv41.sh with the plan's main card, expert cards and port."
+  run bash "$SRC/tools/install_dsv41.sh" --plan "$PLAN" $([ "$YES" = 1 ] && echo --yes) $([ "$DRY" = 1 ] && echo --dry-run) \
+    || warn "the DeepSeek install stopped (see above); the other servers run"
+fi
+
+if [ "$ROUTE" = 1 ]; then
+  step "Start the front door" "kindi route on port ${ROUTE_PORT}: one OpenAI endpoint for all servers; the request's \"model\" picks the server."
+  $DOCKER ps -a --format '{{.Names}}' 2>/dev/null | grep -x "${NAME}-route" >/dev/null && run $DOCKER rm -f "${NAME}-route" >/dev/null
+  RARGS=(-d --name "${NAME}-route" --restart unless-stopped --network host -u "$UIDGID" -v "$DIR/plan.json:/plan.json:ro" --memory 256m)
+  [ -n "$KEY" ] && RARGS+=(--env-file "$KEYENV")
+  run $DOCKER run "${RARGS[@]}" "$(image_of cuda)" route --plan /plan.json --host "$BIND" --port "$ROUTE_PORT" >/dev/null
+  for t in $(seq 1 20); do curl -fs -m 2 "http://127.0.0.1:${ROUTE_PORT}/v1/models" ${KEY:+-H "Authorization: Bearer $KEY"} >/dev/null 2>&1 && break; sleep 1; done
+  if curl -fs -m 2 "http://127.0.0.1:${ROUTE_PORT}/v1/models" ${KEY:+-H "Authorization: Bearer $KEY"} >/dev/null 2>&1; then
+    ok "front door: http://127.0.0.1:${ROUTE_PORT}/v1 (\"model\": $(python3 -c 'import json,sys; print(", ".join(sorted(json.load(open(sys.argv[1]))["front"]["models"])))' "$DIR/plan.json" 2>/dev/null))"
+  else
+    warn "the front door does not answer ($DOCKER logs ${NAME}-route); each server still answers on its own port"
+  fi
+fi
 
 # ------------------------------------------------------------------------------------------------ Kindi Bridge (optional)
 BRIDGE_DONE=0

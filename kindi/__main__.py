@@ -78,6 +78,10 @@ def cmd_bench(cfg, a):
 
 def cmd_serve(cfg, a):
     _setup_gpu_env(cfg)
+    if getattr(a, "slots", None):
+        cfg["slots"] = a.slots
+    if int(cfg.get("slots") or 1) > 1:                  # decode slots: the engine reads KINDI_SLOTS (kindi/slots.py)
+        os.environ["KINDI_SLOTS"] = str(int(cfg["slots"]))
     from .server import serve
     serve(cfg, log=log)
     return 0
@@ -129,13 +133,28 @@ def cmd_head(cfg, a):
 
 def cmd_models(cfg, a):
     from .catalog import list_models
-    list_models(cfg, log=log)
+    list_models(cfg, log=log, as_json=getattr(a, "json", False))
     return 0
 
 
 def cmd_use(cfg, a):
     from .catalog import use
     return use(cfg, a.model, gguf=a.gguf, log=log)
+
+
+def cmd_cards(cfg, a):
+    from . import cards
+    return cards.main(["--json"] if a.json else [])
+
+
+def cmd_plan(cfg, a):
+    from . import place
+    return place.main(a.rest)
+
+
+def cmd_route(cfg, a):
+    from . import route
+    return route.main(a.rest)
 
 
 def cmd_info(cfg, a):
@@ -148,7 +167,9 @@ def cmd_info(cfg, a):
     if os.path.exists(man):
         m = json.load(open(man))
         print("pack: %s - %s, from %s" % (cfg["pack"], m.get("model"), m.get("source_file")))
-        if m.get("backend") == "kindi_lightning":
+        if m.get("backend") == "kindi_qwen4exp":
+            print("backend: Kindi Flash-Next (qwen4exp: card engine, CPU experts, MTP head)")
+        elif m.get("backend") == "kindi_lightning":
             print("backend: Kindi Lightning CUDA (Nemotron-H MoE), exact head")
         elif m.get("backend") == "kindi_gemma4":
             print("backend: Kindi Gemma 4 CUDA")
@@ -183,6 +204,13 @@ def _malloc_tuning():
 
 
 def main(argv=None):
+    args = sys.argv[1:] if argv is None else list(argv)
+    if args and args[0] in ("plan", "route"):       # their own options (kindi plan --help), no config needed
+        if args[0] == "plan":
+            from . import place
+            return place.main(args[1:])
+        from . import route
+        return route.main(args[1:])
     _malloc_tuning()
     p = argparse.ArgumentParser(prog="kindi", description="Kindi %s - native CUDA inference for ternary models and Gemma 4" % __version__)
     p.add_argument("--config")
@@ -205,6 +233,7 @@ def main(argv=None):
     s.add_argument("--port", type=int)
     s.add_argument("--api-key", dest="api_key")
     s.add_argument("--head", choices=("exact", "fast"))
+    s.add_argument("--slots", type=int, help="requests written at the same time (decode slots; one card, KINDI_TC=1)")
     s = sub.add_parser("chat", help="chat in the terminal")
     s.add_argument("--system", default="")
     s.add_argument("--temperature", type=float, default=0.7)
@@ -212,7 +241,14 @@ def main(argv=None):
     s = sub.add_parser("head", help="exact or fast output head for a running server")
     s.add_argument("mode", choices=("exact", "fast"))
     sub.add_parser("info", help="show configuration, pack and GPU")
-    sub.add_parser("models", help="list the models and what fits this machine")
+    s = sub.add_parser("models", help="list the models and what fits this machine")
+    s.add_argument("--json", action="store_true", help="one JSON list (id, what, size_gb, fits, downloaded)")
+    s = sub.add_parser("cards", help="list every GPU: VRAM, free memory, PCIe link, bandwidth, supported or not")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("plan", help="place models on the cards and write the plan file (kindi plan --help)", add_help=False)
+    s.add_argument("rest", nargs=argparse.REMAINDER)
+    s = sub.add_parser("route", help="one OpenAI endpoint in front of the plan's servers (kindi route --help)", add_help=False)
+    s.add_argument("rest", nargs=argparse.REMAINDER)
     s = sub.add_parser("use", help="download a model, build its pack and select it")
     s.add_argument("model")
     s.add_argument("--gguf", help="use this GGUF file instead of downloading it")
@@ -224,7 +260,7 @@ def main(argv=None):
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
-            "models": cmd_models, "use": cmd_use}[a.cmd](cfg, a)
+            "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route}[a.cmd](cfg, a)
 
 
 if __name__ == "__main__":

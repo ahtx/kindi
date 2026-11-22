@@ -1,4 +1,4 @@
-Kindi 0.6.1 - third-party notices
+Kindi 0.7.0 - third-party notices
 
 Kindi is licensed under the GNU Affero General Public License v3.0 (see LICENSE). Commercial licenses are
 available (see COMMERCIAL-LICENSE.md).
@@ -35,6 +35,17 @@ stages for DSpark and encoding/encoding.py)
   https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
   https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF
   tools/install_dsv41.sh downloads the files. Kindi reads the weights as they are.
+
+Qwen3.8-Flash-Next GSQ-RCO IQ3_S (model weights,    Apache License 2.0 (the GGUF repository's card)
+GGUF)
+  Qwen3.8-Flash-Next by the Qwen team (Alibaba Cloud). GSQ-RCO IQ3_S GGUF by ISTA-DASLab.
+  https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
+  tools/install_flashnext.sh downloads the file. Kindi reads the weights as they are.
+
+Qwen3.8-Flash-Next MTP head (drafter weights)        Qwen Community License 1.0
+  Qwen team. https://huggingface.co/Qwen/Qwen3.8-Flash-Next
+  The installer fetches the head's tensors by byte range and converts them on the user's computer; the converted
+  file keeps the license notice in its general.license field. `--no-mtp` leaves it out.
 
 Kindi Bridge (bridge/ in the release archive)       GNU AGPL v3.0, the same as Kindi
   Amir Husain. The full source is in bridge/.

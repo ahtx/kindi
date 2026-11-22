@@ -54,6 +54,100 @@ def _host_ckpt(a):
     return h
 
 
+# state copies on a side stream into pinned buffers (KINDI_CKPT_STREAM=1; default on with decode slots): the copy of
+# one slot's checkpoint or turn no longer holds the stream of the other slots' passes. The host thread waits for its
+# own copy; a non-blocking stream does not wait for the legacy default stream, so the copy is ordered after the work
+# queued before it by an event.
+_sv = os.environ.get("KINDI_CKPT_STREAM", "")
+STREAM = _sv == "1" or (_sv == "" and (os.environ.get("KINDI_SLOTS", "1") or "1") not in ("0", "1"))
+_SIDE = {}
+
+
+def _side(card):
+    st = _SIDE.get(card)
+    if st is None:
+        with cp.cuda.Device(card):
+            st = _SIDE[card] = cp.cuda.Stream(non_blocking=True)
+    return st
+
+
+def _pinned(nbytes):
+    try:
+        mem = cp.cuda.alloc_pinned_memory(max(int(nbytes), 1))
+    except Exception:  # noqa: BLE001 - no pinned memory left
+        return None
+    return np.frombuffer(mem, dtype=np.uint8, count=int(nbytes))   # (keeps mem alive)
+
+
+def _parts(a, lo=0, hi=None):
+    """[(card, cupy array to copy)] and the host shape of a, in _host's format, or None (not handled here)"""
+    if isinstance(a, cp.ndarray):
+        return [(a.device.id, a[lo:hi] if hi is not None else a)], None
+    parts = getattr(a, "parts", None)
+    if not parts:
+        return None, None
+    if not getattr(a, "rows", False):
+        return [(c, x) for c, x in parts], "flat"
+    if len(parts) != 1:                       # a multi-card K/V block: the rows interleave the cards (host copy)
+        return None, None
+    c, x = parts[0]
+    hi = (x.shape[0] if a.p is None else a.p) if hi is None else hi
+    return [(c, x[lo:hi])], "rows"
+
+
+def _host_many(arrs, lo=0, hi=None):
+    """host copies of arrs (CuPy arrays or tp.Dist views; with lo/hi: rows lo .. hi of K/V blocks), in the format of
+    _host: the side-stream pinned copies when STREAM is on, else plain copies"""
+    if cp is None or not STREAM:
+        return [_host_rows(a, lo, hi) if hi is not None else _host(a) for a in arrs]
+    plan, out = [], [None] * len(arrs)
+    for i, a in enumerate(arrs):
+        ps, kind = _parts(a, lo, hi)
+        if ps is None or not all(x.flags.c_contiguous for _, x in ps):
+            out[i] = _host_rows(a, lo, hi) if hi is not None else _host(a)
+            continue
+        plan.append((i, ps, kind))
+    if not plan:
+        return out
+    cards = sorted(set(c for _, ps, _ in plan for c, _ in ps))
+    for c in cards:                           # the side stream starts after the work queued so far
+        with cp.cuda.Device(c):
+            ev = cp.cuda.Event(disable_timing=True)
+            ev.record(cp.cuda.Stream.null)
+            _side(c).wait_event(ev)
+    bufs = []
+    for i, ps, kind in plan:
+        tot = sum(int(x.nbytes) for _, x in ps)
+        buf = _pinned(tot)
+        if buf is None:
+            out[i] = _host_rows(arrs[i], lo, hi) if hi is not None else _host(arrs[i])
+            continue
+        o = 0
+        for c, x in ps:
+            with cp.cuda.Device(c):
+                dst = buf[o:o + x.nbytes].view(x.dtype).reshape(x.shape)
+                x.get(stream=_side(c), out=dst)
+            o += int(x.nbytes)
+        bufs.append((i, ps, kind, buf))
+    for c in cards:
+        _side(c).synchronize()
+    for i, ps, kind, buf in bufs:
+        if kind is None:                      # a CuPy array: its own shape and type
+            x = ps[0][1]
+            out[i] = buf.view(x.dtype).reshape(x.shape)
+        elif kind == "flat":
+            out[i] = buf
+        else:
+            x = ps[0][1]
+            out[i] = buf.reshape(x.shape[0], -1)
+    return out
+
+
+def _host_state(Ms, Cs):
+    h = _host_many(list(Ms) + list(Cs))
+    return h[:len(Ms)], h[len(Ms):]
+
+
 def _to_dev(dst, pos, src):
     """dst[:pos] = src[:pos] (a parked K/V block back into the engine), in place. A plain CuPy assignment from a
     host array first makes a temporary device copy, and on a full card there is no room for it (GTX 1080, 27B at
@@ -337,14 +431,35 @@ class Turns(object):
         with self.cv:
             have = set(self.blocks) | (set(self.job["new_blocks"]) if self.job else set())
         need = [i for i, k in enumerate(keys) if k not in have]
+        # The copy is made at once, so it must fit in host RAM next to everything else: a 73K-token turn with no
+        # shared prefix needed about 10 GB and a container with --memory 14g was ended by the kernel (#40). A turn
+        # that does not fit in half of the free RAM (hostram.available: the container's room since PR #48) is not saved.
+        rows = len(need) * self.B + max(0, p - len(keys) * self.B)
+        try:   # every K/V array holds the context's rows (q8_0 too: its scales are part of nbytes)
+            per_row = sum(int(a.nbytes) for a in list(eng.Kc) + list(eng.Vc)) // max(1, int(eng.ctx))
+        except (AttributeError, TypeError):
+            per_row = 0
+        need_bytes = rows * per_row
+        from kindi import hostram
+        free = hostram.available()
+        if free is not None and need_bytes > free // 2:
+            self.log("saved turns: this turn is not saved: its K/V needs %.1f GB of host RAM and %.1f GB is free%s"
+                     % (need_bytes / 2 ** 30, free / 2 ** 30,
+                        " in the container" if hostram._cgroup_limit() else ""))
+            return False
         new_blocks = {}
+        nk = len(eng.Kc)
         for i in need:
             lo, hi = i * self.B, (i + 1) * self.B
-            new_blocks[keys[i]] = ([_host_rows(k, lo, hi) for k in eng.Kc], [_host_rows(v, lo, hi) for v in eng.Vc])
+            kv = _host_many(list(eng.Kc) + list(eng.Vc), lo, hi)
+            new_blocks[keys[i]] = (kv[:nk], kv[nk:])
         lo = len(keys) * self.B
-        tail = ([_host_rows(k, lo, p) for k in eng.Kc], [_host_rows(v, lo, p) for v in eng.Vc]) if p > lo else None
+        tail = None
+        if p > lo:
+            kv = _host_many(list(eng.Kc) + list(eng.Vc), lo, p)
+            tail = (kv[:nk], kv[nk:])
         if state is None:
-            state = ([_host(m) for m in eng.M], [_host(c) for c in eng.conv])
+            state = _host_state(eng.M, eng.conv)
         else:
             state = ([np.array(m) for m in state[0]], [np.array(c) for c in state[1]])
         job = {"tokens": T, "blocks": keys, "new_blocks": new_blocks, "tail": tail, "state": state}
@@ -703,6 +818,8 @@ class Runner(object):
         t0 = time.time()
         self._save_ckpt1(pos)
         self._tsave = getattr(self, "_tsave", 0.0) + time.time() - t0
+        if os.environ.get("KINDI_CACHE_TIMING") == "2":
+            self.log("cache timing: checkpoint at %d, %.3fs (%.3f .. %.3f)" % (pos, time.time() - t0, t0, time.time()))
 
     def _save_ckpt1(self, pos):
         if pos not in self.ckpt:
@@ -716,7 +833,10 @@ class Runner(object):
                     del self.ckpt[key]
                 self.ckpt[pos] = sl.save(drop or key is None)
             else:
-                self.ckpt[pos] = ([_host_ckpt(m) for m in self.eng.M], [_host_ckpt(c) for c in self.eng.conv])
+                if STREAM:                     # (pinned, on the side stream)
+                    self.ckpt[pos] = _host_state(self.eng.M, self.eng.conv)
+                else:
+                    self.ckpt[pos] = ([_host_ckpt(m) for m in self.eng.M], [_host_ckpt(c) for c in self.eng.conv])
             # besides the evenly spaced checkpoints, every request adds two (its generation prompt and its end): keep
             # only the two latest of those, or a long agent session collects one state copy per turn (a leak of
             # ~100 MB per turn on the 9B)
@@ -818,7 +938,7 @@ class Runner(object):
         while len(self.parked) > self.park_max - 1:         # make room first: never two parked K/V copies at once
             self._drop_parked()
         P = {"tokens": toks, "ckpt": dict(self.ckpt), "kv_bytes": kvb, "session": self.session,
-             "end": ([_host(m) for m in self.eng.M], [_host(c) for c in self.eng.conv]),
+             "end": _host_state(self.eng.M, self.eng.conv),
              "K": [_host(k[:n]) for k in self.eng.Kc], "V": [_host(v[:n]) for v in self.eng.Vc]}
         self.parked.insert(0, P)
         del self.parked[self.park_max:]
@@ -1010,8 +1130,8 @@ class Runner(object):
         if b < self.turn_min or toks == self._turn_saved:
             return
         try:
-            self.turns.capture(toks, st)
-            self._turn_saved = list(toks)
+            if self.turns.capture(toks, st) is not False:   # False: skipped (no room); the next turn_end tries again
+                self._turn_saved = list(toks)
         except Exception as e:  # noqa: BLE001 - saving is a convenience; serving goes on
             self.log("could not copy the turn for saving: %s" % e)
 

@@ -49,6 +49,30 @@ int moe_forward_parts(const moe_layer* L, int T, const float* x, int nsel, const
 int moe_combine(int T, int nsel, const float* w, const float* parts, int K, float* out);
 int moe_combine_alt(int T, int nsel, const float* w, const float* parts, const int* row, const float* alt, int K,
                     float* out);
+int moe_layer_set_stream(moe_layer* L, int (*fetch)(int, int, const int*, const uint8_t**),
+                         void (*release)(int, int, const int*), int sid);
+/* xstore.c (separate object): the routed experts streamed from the model file (KINDI_DSV_EXPERTS=stream) */
+int xs_add_file(const void* base, long size, const char* path);
+int xs_add_layer(int E, const void* gate, const void* up, const void* down, long gb, long db);
+void xs_mark_oncard(int l, int e);
+void xs_seed(int l, int e, float uses);
+int xs_start(double budget, int threads, long chunk);
+int xs_pin(int l, int e);
+int xs_acquire(int l, int n, const int* ids, const uint8_t** ptr);
+void xs_release(int l, int n, const int* ids);
+int xs_prefetch(int l, int n, const int* ids);
+int xs_write_misses(const char* path);
+int xs_demand(int l, int n, const int* ids, uint8_t* ready);
+void xs_print_stats(const char* tag);
+void xs_stats(long long* out, double* sec);
+void xs_stats2(double* out);
+void xs_pf_counts(long long* out);
+int xs_add_mirror_file(const char* path, int drive);
+int xs_set_mirror(int l, int e, int file, long og, long ou, long od);
+int xs_on(void);
+void xs_thread_cpus(cpu_set_t* cs);
+int xs_file_range(const void* p, const void** base, long* size);
+#include "moeaccel.h"
 
 /* ---------------------------------------------------------------- model shape */
 #define D 5120
@@ -605,6 +629,9 @@ static struct {
     size_t (*state_size)(int);
     int (*state_save)(int, void*);
     int (*state_load)(int, const void*);
+    size_t (*ring_size)(void);
+    int (*ring_save)(int, void*);
+    int (*ring_load)(int, const void*);
     int (*hot_add)(int, int, const uint8_t*, const uint8_t*, const uint8_t*, size_t);
     int (*hot_commit)(int (*)(int, int, const float*, const int*, const uint8_t*, float*));
     size_t (*hot_bytes)(void);
@@ -624,6 +651,7 @@ static int gpu_open(void) {
     GPU.set_combine_alt = dlsym(h, "dg_set_combine_alt");
     GPU.state_size = dlsym(h, "dg_state_size"); GPU.state_save = dlsym(h, "dg_state_save");
     GPU.state_load = dlsym(h, "dg_state_load");
+    GPU.ring_size = dlsym(h, "dg_ring_size"); GPU.ring_save = dlsym(h, "dg_ring_save"); GPU.ring_load = dlsym(h, "dg_ring_load");
     GPU.hot_add = dlsym(h, "dg_hot_add"); GPU.hot_commit = dlsym(h, "dg_hot_commit"); GPU.hot_bytes = dlsym(h, "dg_hot_bytes");
     if (!GPU.init || !GPU.mat_q8 || !GPU.mat_f32 || !GPU.gemv || !GPU.vram_used) return -1;
     return 0;
@@ -642,15 +670,23 @@ static struct {
     int (*start)(int, int, const int8_t*, const float*, const int*, const uint8_t*);
     int (*finish)(float*);
     double (*gpu_ms)(void);
+    int (*swap)(int, int, int, const uint8_t*, const uint8_t*, const uint8_t*);
+    int (*poll)(int*, int);
+    int (*ready)(void);
+    void (*stop)(void);
     int dev, n;
+    int* keys;                    /* l * NE + e of each slot as loaded (the order of dx_add) */
 } XC[MAXXC];
 static int nXC, xc_parts;         /* xc_parts (KINDI_DSV_PARTS=1): the per-pair path even when no card takes a pair */
 static double xc_t_start, xc_t_wait;
-static long xc_pairs, xc_all;
+static long xc_pairs, xc_all, xc_whole_taken, xc_whole_left;
 
 static void xc_report(void) {
     fprintf(stderr, "dsv41: expert cards took %ld of %ld host pairs (%.1f %%); start %.1f s, wait %.1f s\n", xc_pairs, xc_all,
             xc_all ? 100.0 * xc_pairs / xc_all : 0.0, xc_t_start, xc_t_wait);
+    if (xc_whole_taken + xc_whole_left)
+        fprintf(stderr, "dsv41: expert cards took %ld whole experts; %ld held experts stayed on the host (cap)\n",
+                xc_whole_taken, xc_whole_left);
     for (int c = 0; c < nXC; c++)
         if (XC[c].gpu_ms) fprintf(stderr, "dsv41: expert card %d busy %.2f s\n", c, XC[c].gpu_ms() / 1e3);
 }
@@ -669,6 +705,8 @@ static int xc_open(void) {
         XC[nXC].init = dlsym(h, "dx_init"); XC[nXC].add = dlsym(h, "dx_add"); XC[nXC].commit = dlsym(h, "dx_commit");
         XC[nXC].bytes = dlsym(h, "dx_bytes"); XC[nXC].has = dlsym(h, "dx_has"); XC[nXC].start = dlsym(h, "dx_start");
         XC[nXC].finish = dlsym(h, "dx_finish"); XC[nXC].gpu_ms = dlsym(h, "dx_gpu_ms"); XC[nXC].dev = atoi(q);
+        XC[nXC].swap = dlsym(h, "dx_swap"); XC[nXC].poll = dlsym(h, "dx_poll");
+        XC[nXC].ready = dlsym(h, "dx_ready"); XC[nXC].stop = dlsym(h, "dx_stop");
         if (!XC[nXC].init || !XC[nXC].start || XC[nXC].init(XC[nXC].dev)) return -1;
         nXC++;
     }
@@ -745,7 +783,7 @@ static const float* vecf(const char* fmt, int l) {
 }
 
 /* copy a GGUF matrix into node-split memory */
-typedef struct { Mat* m; const uint8_t* src; } CopyJob;
+typedef struct { Mat* m; const uint8_t* src; int nocopy; } CopyJob;
 static CopyJob CJ[1024]; static int nCJ;
 static int load_mat(Mat* m, const char* fmt, int l, int seg_rows, int optional) {
     memset(m, 0, sizeof *m);
@@ -765,6 +803,45 @@ static int load_mat(Mat* m, const char* fmt, int l, int seg_rows, int optional) 
     CJ[nCJ].m = m; CJ[nCJ].src = (const uint8_t*)t->p; nCJ++;
     return 1;
 }
+/* with whole layers on the GPU (KINDI_DSV_GPU>=2), serving never reads the host copies of the matrices the GPU holds
+   (gemv_run takes the GPU's copy; only dsv_compare runs the CPU path): free them. The matrices that stay on the CPU
+   (the hyper-connection mixes, the engram gate: gid1 == 0) are kept. KINDI_DSV_KEEP_HOST=1 keeps everything. */
+static int host_freed;
+/* the matrices with their own CPU code (the hyper-connection mixes, the engram gate): never on the GPU */
+static int cpu_mat(const Mat* m) {
+    for (int l = 0; l < NL; l++)
+        if (m == &M.L[l].hc_attn_fn || m == &M.L[l].hc_ffn_fn || m == &M.L[l].eng_gate) return 1;
+    return 0;
+}
+/* the mapped model files (dsv_map_file), so a range read once at load can leave the page cache right after */
+static struct { const uint8_t* p; size_t n; int fd; } MF[64];
+static int nMF;
+static void release_range(const void* ptr, size_t len) {
+    const uint8_t* a = (const uint8_t*)ptr;
+    for (int i = 0; i < nMF; i++) {
+        if (a < MF[i].p || a >= MF[i].p + MF[i].n) continue;
+        size_t pg = 4096, off = (size_t)(a - MF[i].p), o0 = off & ~(pg - 1), o1 = (off + len + pg - 1) & ~(pg - 1);
+        if (o1 > MF[i].n) o1 = MF[i].n;
+        madvise((void*)(MF[i].p + o0), o1 - o0, MADV_DONTNEED);
+        posix_fadvise(MF[i].fd, (off_t)o0, (off_t)(o1 - o0), POSIX_FADV_DONTNEED);
+        return;
+    }
+}
+static void free_host_dense(void) {
+    size_t freed = 0;
+    for (int j = 0; j < nCJ; j++) {
+        Mat* m = CJ[j].m;
+        if (!m->gid1) continue;
+        for (int nd = 0; nd < 2; nd++) {
+            size_t bytes = (size_t)(nd ? m->rows - m->split : m->split) * m->rb;
+            size_t sz = (bytes + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+            if (sz == 0) sz = 2u << 20;
+            if (m->p[nd]) { munmap(m->p[nd], sz); m->p[nd] = NULL; freed += sz; }
+        }
+    }
+    host_freed = 1;
+    fprintf(stderr, "dsv41: host copies of the GPU's dense matrices freed (%.2f GB)\n", freed / 1e9);
+}
 /* every thread copies its node's rows (first touch on the right node) */
 static void copy_job(int t, void* a) {
     (void)a;
@@ -772,6 +849,7 @@ static void copy_job(int t, void* a) {
     for (int u = 0; u < t; u++) rk += KP.node[u] == nd;
     for (int j = 0; j < nCJ; j++) {
         Mat* m = CJ[j].m;
+        if (CJ[j].nocopy) continue;
         int r0 = nd ? m->split : 0, nr = nd ? m->rows - m->split : m->split;
         if (m->type != TY_Q8) {
             size_t bytes = (size_t)nr * m->rb, a0 = bytes * rk / nn, a1 = bytes * (rk + 1) / nn;
@@ -823,6 +901,305 @@ static int list_tasks(int* out, int cap) {
 
 static void* zalloc(size_t n) { void* p = aligned_alloc(64, (n + 63) & ~(size_t)63); memset(p, 0, n); return p; }
 
+/* F9 adaptive expert card (KINDI_XC_ADAPT=1, one expert card): the card's slots follow the conversation
+   (kindi/moeaccel.c ma_cache). Every verify forward notes its picks; at the end of each forward the cache names up
+   to KINDI_MA_SWAP experts to bring in (window KINDI_MA_WINDOW forwards); the card's copy thread brings each one from
+   the page cache through a small pinned staging buffer into a slot, and the slot is admitted when the copy lands.
+   Nothing of the model is page-locked (page-locking the expert mappings cost the main card about 0.4-0.5 GB of VRAM,
+   11-15). Which card computes a pair never changes its value, so the output is the same bits. */
+static struct {
+    int on;
+    ma_cache* c;
+    const uint8_t* src[NL][3];    /* expert 0 of each layer's gate, up, down */
+    long refused;
+    int* pend;                    /* per slot: layer * NE + expert of the copy in flight (its pages leave when it lands) */
+} XA;
+static int lean_release;          /* streamed experts, lean load: pages read once through the mapping are released */
+static void xa_report(void) {
+    if (XC[0].stop) XC[0].stop();             /* no copy may run while CUDA is torn down */
+    long long st[5];
+    ma_cache_stats(XA.c, st);
+    fprintf(stderr, "dsv41: adaptive expert card: %.1f%% of %lld picks on the card, %lld swaps started, %lld landed, %lld forwards, "
+            "%ld refused\n", st[0] ? 100.0 * st[1] / st[0] : 0.0, st[0], st[2], st[3], st[4], XA.refused);
+}
+static int xa_force;              /* the calibration turned it on (dsv_xc_set) */
+static void xa_init(void) {
+    if (!xa_force && (!getenv("KINDI_XC_ADAPT") || !atoi(getenv("KINDI_XC_ADAPT")))) return;
+    if (XA.on) return;
+    if (nXC != 1 || !XC[0].swap || !XC[0].poll || !XC[0].n) {
+        fprintf(stderr, "dsv41: KINDI_XC_ADAPT needs one expert card with the adaptive library; static\n");
+        return;
+    }
+    XA.c = ma_cache_new(NL, NE, XC[0].n, 1, 24, 0.5f);
+    if (!XA.c) return;
+    int* lay = malloc(sizeof(int) * XC[0].n), *exp = malloc(sizeof(int) * XC[0].n);
+    for (int i = 0; i < XC[0].n; i++) { lay[i] = XC[0].keys[i] / NE; exp[i] = XC[0].keys[i] % NE; }
+    ma_cache_seed(XA.c, lay, exp, XC[0].n);
+    free(lay); free(exp);
+    for (int l = 0; l < NL; l++) {
+        XA.src[l][0] = find("blk.%d.ffn_gate_exps.weight", l)->p;
+        XA.src[l][1] = find("blk.%d.ffn_up_exps.weight", l)->p;
+        XA.src[l][2] = find("blk.%d.ffn_down_exps.weight", l)->p;
+    }
+    XA.pend = malloc(sizeof(int) * XC[0].n);
+    for (int i = 0; i < XC[0].n; i++) XA.pend[i] = -1;
+    XA.on = 1;
+    atexit(xa_report);
+    fprintf(stderr, "dsv41: adaptive expert card on (%d slots)\n", XC[0].n);
+}
+/* the end of a forward: admit the landed copies, start the next swaps */
+static void xa_tick(void) {
+    if (!XA.on) return;
+    int sl[256];
+    const size_t gb = (size_t)FF * (D / 32) * 17, db = (size_t)D * (FF / 32) * 17;
+    for (int n; (n = XC[0].poll(sl, 256)) > 0;)
+        for (int i = 0; i < n; i++) {
+            ma_cache_admit(XA.c, sl[i]);
+            const int k = sl[i] >= 0 && sl[i] < XC[0].n ? XA.pend[sl[i]] : -1;
+            if (k >= 0) {
+                XA.pend[sl[i]] = -1;
+                if (lean_release) {   /* the copy landed: its source pages leave the page cache */
+                    const int l = k / NE, e = k % NE;
+                    release_range(XA.src[l][0] + e * gb, gb); release_range(XA.src[l][1] + e * gb, gb);
+                    release_range(XA.src[l][2] + e * db, db);
+                }
+            }
+        }
+    ma_swap sw[256];
+    const int n = ma_cache_tick(XA.c, sw, 256);
+    for (int i = 0; i < n; i++) {
+        const int l = sw[i].layer, e = sw[i].expert;
+        if (XC[0].swap(sw[i].slot, l, e, XA.src[l][0] + e * gb, XA.src[l][1] + e * gb, XA.src[l][2] + e * db)) {
+            ma_cache_cancel(XA.c, sw[i].slot);
+            XA.refused++;
+        } else if (sw[i].slot >= 0 && sw[i].slot < XC[0].n) XA.pend[sw[i].slot] = l * NE + e;
+    }
+}
+
+/* ---------------------------------------------------------------- streamed experts (KINDI_DSV_EXPERTS=stream) */
+/* The cache budget: KINDI_XS_GB, or 70 % of the available RAM less 8 GB (what is left after the dense weights). */
+static double xs_budget(void) {
+    if (getenv("KINDI_XS_GB")) return atof(getenv("KINDI_XS_GB")) * 1e9;
+    FILE* f = fopen("/proc/meminfo", "r");
+    long kb = 0; char k[64];
+    for (long v; f && fscanf(f, "%63s %ld kB", k, &v) == 2;) if (!strcmp(k, "MemAvailable:")) { kb = v; break; }
+    if (f) fclose(f);
+    double b = kb * 1024.0 * 0.7 - 8e9;
+    return b > 8e9 ? b : 8e9;
+}
+/* Prefetch of the next layers' experts (KINDI_XS_PF_DEPTH layers ahead, default 2; 0 = off): when layer l's experts
+   start, a thread applies the routers of layers l + 1 .. l + depth to layer l's MoE input (the residual stream
+   changes little from one layer to the next), takes each token's top KINDI_XS_PF_K experts (default NS + 2) by the
+   routing score, and asks the store to read them while layer l computes. A verify batch (the token and its DSpark
+   drafts) is predicted as one set, so its tokens share the reads; for a prompt chunk, KINDI_XS_PF_TOK tokens (default
+   16, evenly spaced) stand for the chunk. A wrong guess costs only a read: a call always computes the experts its
+   router chose. */
+#define PF_TOKMAX 64
+static struct {
+    pthread_t th; pthread_mutex_t mu; pthread_cond_t cv;
+    int on, depth, k, ntok, l, T; unsigned gen, seen;
+    float* x;                     /* [ntok][D] */
+    const float* w[NL];           /* routers [NE][D] (F32), NULL: no prediction for that layer */
+} XP = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+/* the experts of layer t that the router of t would pick for the T inputs x (top k each), most votes first */
+static int xs_guess(int t, int T, const float* x, int k, int* list) {
+    int votes[NE], n = 0;
+    float best[NE];
+    memset(votes, 0, sizeof votes);
+    for (int i = 0; i < T; i++) {
+        const float* xi = x + (size_t)i * D;
+        for (int e = 0; e < NE; e++) {
+            const float* w = XP.w[t] + (size_t)e * D;
+            __m256 acc = _mm256_setzero_ps();
+            for (int c = 0; c < D; c += 8) acc = _mm256_fmadd_ps(_mm256_loadu_ps(w + c), _mm256_loadu_ps(xi + c), acc);
+            __m128 h = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+            h = _mm_hadd_ps(h, h); h = _mm_hadd_ps(h, h);
+            const float v = _mm_cvtss_f32(h), sp = v > 20.f ? v : log1pf(expf(v));
+            best[e] = sqrtf(sp) + M.L[t].bias[e];
+        }
+        for (int j = 0; j < k; j++) {
+            int b = -1;
+            for (int e = 0; e < NE; e++) if (best[e] > -1e30f && (b < 0 || best[e] > best[b])) b = e;
+            if (b < 0) break;
+            best[b] = -1e38f;
+            if (!votes[b]++) list[n++] = b;
+        }
+    }
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0 && votes[list[j]] > votes[list[j - 1]]; j--) { int tmp = list[j]; list[j] = list[j - 1]; list[j - 1] = tmp; }
+    return n;
+}
+static void* xp_main(void* a) {
+    (void)a;
+    float* x = malloc(sizeof(float) * PF_TOKMAX * D);
+    int list[NE];
+    for (;;) {
+        pthread_mutex_lock(&XP.mu);
+        while (XP.seen == XP.gen) pthread_cond_wait(&XP.cv, &XP.mu);
+        XP.seen = XP.gen;
+        const int l = XP.l, T = XP.T;
+        memcpy(x, XP.x, sizeof(float) * T * D);
+        pthread_mutex_unlock(&XP.mu);
+        for (int j = 1; j <= XP.depth && l + j < NL; j++) {
+            if (!XP.w[l + j]) continue;
+            const int n = xs_guess(l + j, T, x, XP.k, list);
+            xs_prefetch(l + j, n, list);
+        }
+    }
+    return NULL;
+}
+/* KINDI_XS_PF_AUTO (default 1): the prefetch judges itself every 16 forwards. If fewer than KINDI_XS_PF_MIN (default
+   0.10) of its reads were used (a hit, or a call that waited on one), it stops: an unused read costs a drive read and
+   evicts a cached expert. While stopped it tries again for 16 forwards every 64. (Strata's file tier judges its
+   prefetch the same way; the thresholds are ours.) */
+static struct { int init, auto_on, off; long fw; long long i0, u0; double floor_; long off_n, on_n; } PFG;
+static void xs_pf_report(void) {
+    if (PFG.auto_on) fprintf(stderr, "dsv41: prefetch auto: turned off %ld times, back on %ld times%s\n", PFG.off_n,
+                             PFG.on_n, PFG.off ? " (off at exit)" : "");
+}
+static int xs_pf_gate(int l) {
+    if (!PFG.init) {
+        PFG.init = 1;
+        PFG.auto_on = !getenv("KINDI_XS_PF_AUTO") || atoi(getenv("KINDI_XS_PF_AUTO")) != 0;
+        PFG.floor_ = getenv("KINDI_XS_PF_MIN") ? atof(getenv("KINDI_XS_PF_MIN")) : 0.10;
+        if (PFG.auto_on) atexit(xs_pf_report);
+    }
+    if (!PFG.auto_on) return 1;
+    if (l == 0) {
+        PFG.fw++;
+        if (PFG.off && PFG.fw % 64 == 0) {           /* a 16-forward trial */
+            PFG.off = 0; PFG.on_n++;
+            long long c[2]; xs_pf_counts(c); PFG.i0 = c[0]; PFG.u0 = c[1];
+        } else if (!PFG.off && PFG.fw % 16 == 0) {
+            long long c[2]; xs_pf_counts(c);
+            const long long di = c[0] - PFG.i0, du = c[1] - PFG.u0;
+            if (di >= 32 && du < PFG.floor_ * di) {
+                PFG.off = 1; PFG.off_n++;
+                fprintf(stderr, "dsv41: prefetch off: %lld of %lld reads ahead were used (under %.0f%%)\n", du, di,
+                        100 * PFG.floor_);
+            }
+            PFG.i0 = c[0]; PFG.u0 = c[1];
+        }
+    }
+    return !PFG.off;
+}
+static void xs_predict(int l, int T, const float* x) {
+    if (!XP.on || !xs_pf_gate(l)) return;
+    pthread_mutex_lock(&XP.mu);
+    const int n = T < XP.ntok ? T : XP.ntok;
+    for (int i = 0; i < n; i++) {
+        const int t = n == T ? i : (int)((long)i * T / n);
+        memcpy(XP.x + (size_t)i * D, x + (size_t)t * D, sizeof(float) * D);
+    }
+    XP.l = l; XP.T = n; XP.gen++;
+    pthread_cond_signal(&XP.cv);
+    pthread_mutex_unlock(&XP.mu);
+}
+static void xs_report(void) {
+    xs_print_stats("at exit");
+    const char* ml = getenv("KINDI_XS_MISS_LOG");
+    if (ml && ml[0]) {
+        const int n = xs_write_misses(ml);
+        fprintf(stderr, "xstore: demand reads of %d experts written to %s\n", n, ml);
+    }
+}
+/* KINDI_XS_PF_AFTER=1: the next layer's guess is read ahead after this layer's experts are done (its reads no longer
+   compete with this layer's demand reads; they run while the card does the next layer's attention). Default 0: when
+   this layer's experts start. Only which experts are in RAM changes, never the values. */
+static int pf_after = -1;
+static int xs_pf_after(void) {
+    if (pf_after < 0) pf_after = getenv("KINDI_XS_PF_AFTER") && atoi(getenv("KINDI_XS_PF_AFTER"));
+    return pf_after;
+}
+/* KINDI_XS_MIRROR=INDEX (tools/dsv41_mirror.py): a copy of some experts on a second drive. INDEX: a line "file PATH"
+   and lines "layer expert gate_offset up_offset down_offset"; those experts are read from PATH by the second
+   drive's threads. A missing PATH (a volume not mounted) leaves every expert on the first drive. */
+static void xs_load_mirror(void) {
+    const char* ix = getenv("KINDI_XS_MIRROR");
+    FILE* f = ix && ix[0] ? fopen(ix, "r") : NULL;
+    if (!f) return;
+    char line[1200], path[1200] = "";
+    int file = -1, n = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "file ", 5)) {
+            snprintf(path, sizeof path, "%s", line + 5);
+            path[strcspn(path, "\r\n")] = 0;
+            if (access(path, R_OK)) { fprintf(stderr, "dsv41: mirror %s is not there: every expert from the model file\n", path); break; }
+            file = xs_add_mirror_file(path, 1);
+            continue;
+        }
+        int l, e; long og, ou, od;
+        if (file >= 0 && sscanf(line, "%d %d %ld %ld %ld", &l, &e, &og, &ou, &od) == 5 && !xs_set_mirror(l, e, file, og, ou, od)) n++;
+    }
+    fclose(f);
+    if (n) fprintf(stderr, "dsv41: %d experts read from the second drive (%s)\n", n, path);
+}
+static int xs_stream_start(void) {
+    xs_load_mirror();
+    const int threads = getenv("KINDI_XS_THREADS") ? atoi(getenv("KINDI_XS_THREADS")) : 32;
+    const long chunk = getenv("KINDI_XS_CHUNK") ? atol(getenv("KINDI_XS_CHUNK")) : 2L << 20;
+    const int nslot = xs_start(xs_budget(), threads, chunk);
+    if (nslot < 0) return -1;
+    if (nslot < NE) fprintf(stderr, "dsv41: warning: the expert cache holds %d experts, fewer than one layer has (%d); "
+                             "prompt chunks will read some experts from the mapped file\n", nslot, NE);
+    /* pins and starting counts: KINDI_XS_PIN_LIST, else the hot list ("layer expert [count]", most used first); the
+       experts that the cards hold are skipped */
+    const char* pl = getenv("KINDI_XS_PIN_LIST") ? getenv("KINDI_XS_PIN_LIST") : getenv("KINDI_HOT_LIST");
+    FILE* f = pl && pl[0] ? fopen(pl, "r") : NULL;
+    int npin = 0, nl = 0;
+    if (f) {
+        char line[256]; double top = 0;
+        while (fgets(line, sizeof line, f)) {
+            int l, e; double c = 0;
+            const int k = sscanf(line, "%d %d %lf", &l, &e, &c);
+            if (k < 2 || l < 0 || l >= NL || e < 0 || e >= NE) continue;
+            if (k < 3) c = (double)NL * NE - nl;     /* no counts: the rank */
+            if (top == 0) top = c > 0 ? c : 1;
+            xs_seed(l, e, (float)(8.0 * c / top));   /* about 8 uses for the most used expert */
+            npin += xs_pin(l, e);
+            nl++;
+        }
+        fclose(f);
+    }
+    fprintf(stderr, "dsv41: experts streamed from the model file; %d pinned (%d list entries), loading in the background\n",
+            npin, nl);
+    XP.depth = getenv("KINDI_XS_PF_DEPTH") ? atoi(getenv("KINDI_XS_PF_DEPTH")) : 2;
+    XP.k = getenv("KINDI_XS_PF_K") ? atoi(getenv("KINDI_XS_PF_K")) : NS + 2;
+    XP.ntok = getenv("KINDI_XS_PF_TOK") ? atoi(getenv("KINDI_XS_PF_TOK")) : 16;
+    if (XP.ntok < 1) XP.ntok = 1;
+    if (XP.ntok > PF_TOKMAX) XP.ntok = PF_TOKMAX;
+    if (XP.k > NE) XP.k = NE;
+    if (XP.depth > 0 && XP.k > 0) {
+        int nw = 0;
+        for (int l = 0; l < NL; l++) {
+            const Tensor* t = find("blk.%d.ffn_gate_inp.weight", l);
+            XP.w[l] = t && t->type == TY_F32 && t->ne0 == D && t->ne1 == NE ? (const float*)t->p : NULL;
+            nw += XP.w[l] != NULL;
+        }
+        XP.x = malloc(sizeof(float) * PF_TOKMAX * D);
+        pthread_attr_t at; pthread_attr_init(&at);
+        cpu_set_t cs; xs_thread_cpus(&cs);
+        pthread_attr_setaffinity_np(&at, sizeof cs, &cs);
+        if (nw && !pthread_create(&XP.th, &at, xp_main, NULL)) XP.on = 1;
+        pthread_attr_destroy(&at);
+        fprintf(stderr, "dsv41: expert prefetch %s (%d layers ahead, top %d per token, %d of %d routers)\n",
+                XP.on ? "on" : "off", XP.depth, XP.k, nw, NL);
+    }
+    atexit(xs_report);
+    return 0;
+}
+/* the predictor alone, for tests: the experts of layer t guessed from the inputs x [T][D] (as the prefetch does) */
+int dsv_xs_guess(int t, int T, const float* x, int k, int* list) {
+    if (t < 0 || t >= NL) return 0;
+    if (!XP.w[t]) {
+        const Tensor* w = find("blk.%d.ffn_gate_inp.weight", t);
+        if (!w || w->type != TY_F32) return -1;
+        XP.w[t] = w->p;
+    }
+    if (!M.L[t].bias) M.L[t].bias = vecf("blk.%d.exp_probs_b.bias", t);
+    return xs_guess(t, T, x, k, list);
+}
+
 /* cpus: dense workers (node 0 then node 1); mcpus: expert pool cores (node 0 then node 1); expert_copy = 1 copies the
    experts into node-split memory (fast), 0 reads them in place from the mapped file. */
 int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, const int* mcpus, int m0, int m1,
@@ -845,6 +1222,12 @@ int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, c
     }
     if (kp_init(cpus, n0, n1, share0)) return -2;
     if (tmax < 1 || tmax > TMAXC) return -5;
+    const char* xmode = getenv("KINDI_DSV_EXPERTS");
+    const int stream = xmode && !strcmp(xmode, "stream");
+    if (stream && expert_copy) {
+        fprintf(stderr, "dsv41: KINDI_DSV_EXPERTS=stream reads the experts in place (no copy)\n");
+        expert_copy = 0;
+    }
     if (getenv("KINDI_DSV_GCH")) GCH = atoi(getenv("KINDI_DSV_GCH"));
     M.cap = cap; M.tmax = tmax; M.W = WIN + tmax; M.flags = F_FP8_KV | F_FP8_O | F_FP4_IDX | F_FP4_CKV;
     make_freqs(M.freq_win, 10000.0, 0);
@@ -901,6 +1284,11 @@ int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, c
             EX[l][0] = g->p; EX[l][1] = u->p; EX[l][2] = d->p;
         } else {
             L->moe = moe_layer_direct(D, FF, NE, 10.f, g->p, u->p, d->p);
+            if (stream) {
+                const long gb = (long)FF * (D / 32) * 17, db = (long)D * (FF / 32) * 17;
+                if (xs_add_layer(NE, g->p, u->p, d->p, gb, db) != l) return -8;
+                moe_layer_set_stream(L->moe, xs_acquire, xs_release, l);
+            }
         }
     }
     load_mat(&M.out, "output.weight", 0, 0, 0);
@@ -909,6 +1297,19 @@ int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, c
     const Tensor* pe = find("per_layer_token_embd.weight", 0);
     if (!te || !pe) return -4;
     M.tok_embd = te->p; M.eng_tab = pe->p;
+    if (stream && !(getenv("KINDI_DSV_READAHEAD") && atoi(getenv("KINDI_DSV_READAHEAD")))) {
+        /* the engram table is read a row (264 bytes) at a time at random: no read-ahead, which filled the page cache
+           with GBs of neighbouring rows per prompt (eng_prefetch asks for the rows a forward needs instead) */
+        const size_t bytes = (size_t)pe->ne1 * (pe->ne2 > 0 ? pe->ne2 : 1) * (size_t)(pe->ne0 / 32) * 33;
+        const uintptr_t a0 = (uintptr_t)pe->p & ~(uintptr_t)4095;
+        madvise((void*)a0, (uintptr_t)pe->p + bytes - a0, MADV_RANDOM);
+    }
+    /* lean load (whole layers on the GPU, KINDI_DSV_GPU>=2): the matrices the GPU will hold are uploaded from the
+       mapping and never copied to host memory; only the CPU's own matrices are (KINDI_DSV_KEEP_HOST=1: all) */
+    const int lean = getenv("KINDI_DSV_GPU") && atoi(getenv("KINDI_DSV_GPU")) >= 2 &&
+                     !(getenv("KINDI_DSV_KEEP_HOST") && atoi(getenv("KINDI_DSV_KEEP_HOST")));
+    for (int j = 0; j < nCJ; j++) CJ[j].nocopy = lean && !cpu_mat(CJ[j].m);
+    lean_release = lean && stream;
     kp_run(copy_job, NULL);
     double t1 = now();
     fprintf(stderr, "dsv41: dense weights copied in %.1f s\n", t1 - t0);
@@ -918,13 +1319,12 @@ int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, c
         if (gpu_open() || GPU.init(0, (size_t)64 << 20, (size_t)160 << 20)) return -6;
         for (int j = 0; j < nCJ; j++) {
             Mat* m = CJ[j].m;
-            int skip = 0;
-            for (int l = 0; l < NL; l++) skip |= m == &M.L[l].hc_attn_fn || m == &M.L[l].hc_ffn_fn || m == &M.L[l].eng_gate;
-            if (skip) continue;
+            if (cpu_mat(m)) continue;
             int h = m->type == TY_Q8 ? GPU.mat_q8(CJ[j].src, m->rows, m->cols)
                                      : GPU.mat_f32((const float*)CJ[j].src, m->rows, m->cols);
             if (h < 0) return -6;
             m->gid1 = h + 1;
+            if (lean && stream) release_range(CJ[j].src, (size_t)m->rows * m->rb);
         }
         GPU.on = 1;
         if (atoi(getenv("KINDI_DSV_GPU")) >= 2) {
@@ -974,6 +1374,11 @@ int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, c
                                  *dn = find("blk.%d.ffn_down_exps.weight", l);
                     if (GPU.hot_add(l, e, (const uint8_t*)g->p + e * gb, (const uint8_t*)u->p + e * gb,
                                     (const uint8_t*)dn->p + e * db, reserve)) break;
+                    if (stream) xs_mark_oncard(l, e);
+                    if (lean && stream) {
+                        release_range((const uint8_t*)g->p + e * gb, gb); release_range((const uint8_t*)u->p + e * gb, gb);
+                        release_range((const uint8_t*)dn->p + e * db, db);
+                    }
                     n++;
                 }
                 GPU.hot_commit(gpu_moe_parts);
@@ -988,6 +1393,13 @@ int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, c
                                      *dn = find("blk.%d.ffn_down_exps.weight", l);
                         if (XC[c].add(l, e, (const uint8_t*)g->p + e * gb, (const uint8_t*)u->p + e * gb,
                                       (const uint8_t*)dn->p + e * db, reserve2)) break;
+                        if (stream) xs_mark_oncard(l, e);
+                        if (lean && stream) {
+                            release_range((const uint8_t*)g->p + e * gb, gb); release_range((const uint8_t*)u->p + e * gb, gb);
+                            release_range((const uint8_t*)dn->p + e * db, db);
+                        }
+                        if (!XC[c].keys) XC[c].keys = malloc(sizeof(int) * NL * NE);
+                        XC[c].keys[XC[c].n] = l * NE + e;
                         XC[c].n++;
                     }
                     XC[c].commit();
@@ -997,15 +1409,18 @@ int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, c
                 fclose(hf);
             }
             xc_parts = getenv("KINDI_DSV_PARTS") && atoi(getenv("KINDI_DSV_PARTS"));
+            xa_init();
         }
         fprintf(stderr, "dsv41: dense matrices on the GPU in %.1f s, %.2f GB of VRAM%s\n", now() - t1, GPU.vram_used() / 1e9,
                 GPU.full ? " (whole layers on the GPU)" : "");
         t1 = now();
+        if (GPU.full && !(getenv("KINDI_DSV_KEEP_HOST") && atoi(getenv("KINDI_DSV_KEEP_HOST")))) free_host_dense();
     }
     if (expert_copy) {
         kp_run(expert_job, NULL);
         fprintf(stderr, "dsv41: experts copied in %.1f s\n", now() - t1);
     }
+    if (stream && xs_stream_start()) return -9;
     /* scratch */
     size_t T = tmax;
     M.ctok = zalloc((size_t)(cap + 8) * 4);
@@ -1212,6 +1627,32 @@ static void eng_rows_tok(int t, void* a) {
     quant_q8(e, ENG_COLS * ENG_HD, M.eq + (size_t)t * ENG_COLS * ENG_HD, M.ed + (size_t)t * ENG_COLS * ENG_HD / QK);
 }
 
+/* the engram rows of tokens M.pos .. M.pos + T - 1 (both engram layers) depend only on the tokens: ask the kernel to
+   read their pages now, all at once, so the row reads below find them (the mappings are MADV_RANDOM after a lean
+   load: no read-ahead, so without this each row is one synchronous 4 KB read behind the expert stream).
+   KINDI_DSV_ENG_PF=0: off. Only which pages are in memory changes, never the values. */
+static void eng_prefetch(int T) {
+    static int on = -1;
+    if (on < 0) on = !(getenv("KINDI_DSV_ENG_PF") && !atoi(getenv("KINDI_DSV_ENG_PF")));
+    if (!on) return;
+    const size_t rb = (size_t)(ENG_HD / 32) * 33;
+    for (int s = 0; s < 2; s++)
+        for (int t = 0; t < T; t++) {
+            int p = M.pos + t, blocked = 0;
+            int64_t tk[4];
+            for (int k = 0; k < 4; k++) { blocked |= p < k; tk[k] = blocked ? M.eng_pad : M.ctok[p - k]; }
+            int64_t roll = tk[0] * M.eng_mult[s][0];
+            for (int i = 1; i < 4; i++) {
+                roll ^= tk[i] * M.eng_mult[s][i];
+                for (int hh = 0; hh < 8; hh++) {
+                    const int c = (i - 1) * 8 + hh;
+                    const int64_t row = roll % M.eng_prime[s][c] + M.eng_off[s][c];
+                    const uintptr_t a = (uintptr_t)(M.eng_tab + (size_t)row * rb), a0 = a & ~(uintptr_t)4095;
+                    madvise((void*)a0, ((a + rb + 4095) & ~(uintptr_t)4095) - a0, MADV_WILLNEED);
+                }
+            }
+        }
+}
 static void eng_gate_tok(int t, void* a) {
     const Layer* L = a;
     const Mat* gm = &L->eng_gate;          /* q_weight * k_weight, stored as one [HC][D] matrix */
@@ -1786,6 +2227,7 @@ static void ffn(int l, int T) {
     gemv_run(&od, 1, T);
     double t0 = now();
     kp_park(1);
+    xs_predict(l, T, M.x);
     { int nu_ = moe_forward(L->moe, T, M.x, NS, M.sel, M.wsel, M.mo, 0); if (nu_ > 0) dsv_union_total += nu_; }
     M.t_moe += now() - t0;
     dump("moe_out", l, T, D, M.mo, D);
@@ -1833,15 +2275,36 @@ static void* xh_main(void* a) {
     }
     return NULL;
 }
+static int xc_maxp_v = -9;          /* KINDI_XC_MAXP, else the calibration's value (dsv_xc_set), else 2 */
 static int xc_maxp(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("KINDI_XC_MAXP") ? atoi(getenv("KINDI_XC_MAXP")) : 2;
-    return v;
+    if (xc_maxp_v == -9) xc_maxp_v = getenv("KINDI_XC_MAXP") ? atoi(getenv("KINDI_XC_MAXP")) : 2;
+    return xc_maxp_v;
+}
+/* KINDI_XC_MAXP=-1 (F9, adaptive): the cap per token follows the card. After a call where the host waited for the
+   card (more than 50 us), the cap goes down by 1/4 pair per token; after a call where the cap was reached and the
+   card was done first, it goes up by 1/4 (between 1 and NS). Which pairs the card takes never changes a value. */
+static struct { float cap; int bound; long up, down; } XM = {2.f, 0, 0, 0};
+static void xm_report(void) {
+    fprintf(stderr, "dsv41: adaptive pair cap %.2f per token (%ld up, %ld down)\n", XM.cap, XM.up, XM.down);
+}
+static int xc_cap(int T) {
+    const int v = xc_maxp();
+    static int once = 0;
+    if (v == -1 && !once) { once = 1; atexit(xm_report); }
+    if (v > 0) return v * T;
+    if (v == 0) return 1 << 30;
+    return (int)(XM.cap * T + 0.5f);
+}
+static void xc_adapt(int card_late) {
+    if (xc_maxp() != -1) return;
+    if (card_late) { if (XM.cap > 1.f) { XM.cap -= 0.25f; XM.down++; } }
+    else if (XM.bound && XM.cap < NS) { XM.cap += 0.25f; XM.up++; }
 }
 /* the pairs the expert cards hold (and skip does not exclude) start on the cards; skip2 = skip + those pairs */
 static int xc_start(int l, int T, const float* x, const int* sel, const uint8_t* skip, uint8_t* skip2) {
     static int8_t* xq; static float* xd; static int cap;
     if (!nXC || T > 8) return 0;
+    if (XA.on) ma_cache_note(XA.c, l, sel, T * NS);
     double t0 = now();
     if (T > cap) { free(xq); free(xd); xq = malloc((size_t)8 * D); xd = malloc((size_t)8 * (D / QK) * 4); cap = 8; }
     if (XH.on == 0) {
@@ -1853,11 +2316,44 @@ static int xc_start(int l, int T, const float* x, const int* sel, const uint8_t*
     }
     uint8_t mine[8 * NS], take[8 * NS];
     for (int i = 0; i < T * NS; i++) { skip2[i] = skip ? skip[i] : 0; mine[i] = !skip2[i]; }
-    const int maxp = xc_maxp() > 0 ? xc_maxp() * T : 1 << 30;
+    const int maxp = xc_cap(T);
+    XM.bound = 0;
     int any = 0;
     for (int c = 0; c < nXC; c++) {
+        /* whole experts (F9): when the cap bites, a card that takes only some of an expert's pairs leaves the host
+           reading all of the expert anyway. So an expert's pairs go to the card all or none, the experts with the
+           fewest pairs first (the most experts off the host per card pair). KINDI_XC_WHOLE=0: the pairs in token
+           order up to the cap (before 0.7). Which pairs the card computes never changes a value. */
+        static int whole = -1;
+        if (whole < 0) whole = !getenv("KINDI_XC_WHOLE") || atoi(getenv("KINDI_XC_WHOLE")) != 0;
         int k = 0;
-        for (int i = 0; i < T * NS; i++) { take[i] = mine[i] && k < maxp && XC[c].has(l, sel[i]); k += take[i]; }
+        if (whole) {
+            int ue[8 * NS], uc[8 * NS], nu = 0;
+            for (int i = 0; i < T * NS; i++) {
+                take[i] = 0;
+                if (!mine[i] || !XC[c].has(l, sel[i])) continue;
+                int u = 0;
+                while (u < nu && ue[u] != sel[i]) u++;
+                if (u == nu) { ue[nu] = sel[i]; uc[nu] = 0; nu++; }
+                uc[u]++;
+            }
+            for (int i = 1; i < nu; i++)            /* fewest pairs first (stable) */
+                for (int j = i; j > 0 && uc[j] < uc[j - 1]; j--) {
+                    int te = ue[j]; ue[j] = ue[j - 1]; ue[j - 1] = te;
+                    int tc = uc[j]; uc[j] = uc[j - 1]; uc[j - 1] = tc;
+                }
+            for (int u = 0; u < nu; u++) {
+                if (k + uc[u] > maxp) { XM.bound = 1; xc_whole_left++; continue; }
+                for (int i = 0; i < T * NS; i++) if (mine[i] && sel[i] == ue[u]) take[i] = 1;
+                k += uc[u]; xc_whole_taken++;
+            }
+        } else {
+            for (int i = 0; i < T * NS; i++) {
+                const int h = mine[i] && XC[c].has(l, sel[i]);
+                take[i] = h && k < maxp; k += take[i];
+                XM.bound |= h && !take[i];
+            }
+        }
         if (!k) continue;
         if (XH.on == 1) {           /* one card: the helper thread issues it */
             XH.l = l; XH.T = T; XH.c = c; XH.x = x; XH.sel = sel;
@@ -1881,17 +2377,158 @@ static void xc_finish(int any, float* parts) {
         while (atomic_load_explicit(&XH.done, memory_order_acquire) != r) _mm_pause();
         if (XH.rc) { fprintf(stderr, "dsv41: expert card start failed\n"); exit(1); }
     }
+    int late = 0;                 /* the host is done with its pairs: is the card? */
+    for (int c = 0; c < nXC; c++) if ((any >> c & 1) && XC[c].ready) late |= !XC[c].ready();
     for (int c = 0; c < nXC; c++) if (any >> c & 1) XC[c].finish(parts);
     xc_t_wait += now() - t0;
+    xc_adapt(late);
 }
 
+/* KINDI_MOE_TRACE=FILE (F9): the expert ids of every routed-expert call of the main layers (prompt chunks too), for
+   the hot list and the cache simulator (tools/moe_cache_sim.py reads it). Records: int32 layer, int32 T, then T x NS
+   int16 ids. Only ids are written: no tokens, no text. */
+static void moe_trace(int l, int T, const int* sel) {
+    static FILE* f; static int state = -1; static long n;
+    if (state < 0) {
+        const char* p = getenv("KINDI_MOE_TRACE");
+        f = p && p[0] ? fopen(p, "ab") : NULL;
+        state = f != NULL;
+        if (f) fprintf(stderr, "dsv41: routing trace to %s\n", p);
+    }
+    if (!state) return;
+    int32_t h[2] = {l, T};
+    static int16_t* ids; static int cap;
+    if (T > cap) { free(ids); ids = malloc(sizeof(int16_t) * T * NS); cap = T; }
+    for (int i = 0; i < T * NS; i++) ids[i] = (int16_t)sel[i];
+    fwrite(h, 4, 2, f); fwrite(ids, 2, (size_t)T * NS, f);
+    if (++n % 400 == 0) fflush(f);
+}
+
+/* F9 expert-card calibration (kindi/dsv41_xcal.py decides): out[0] = the card's ms for a call of one pair, out[1] =
+   its ms for each more pair (6 pairs of one token), out[2] = the CPU's ms per distinct expert (a 6-token call over 14
+   experts, the size of a verify forward's CPU part), out[3] = the layer used, out[4] = 1 if the card part ran.
+   Real experts of the model and random inputs; the results are thrown away. Returns 0. */
+static double xc_med(double* v, int n) {
+    for (int i = 1; i < n; i++) for (int j = i; j > 0 && v[j] < v[j - 1]; j--) { double t = v[j]; v[j] = v[j - 1]; v[j - 1] = t; }
+    return v[n / 2];
+}
+int dsv_xc_measure(double* out) {
+    for (int i = 0; i < 5; i++) out[i] = 0;
+    static float x[6 * D]; static int8_t xq[6 * D]; static float xd[6 * (D / QK)];
+    static float parts[6 * NS * D];
+    uint32_t r = 12345;
+    for (int i = 0; i < 6 * D; i++) { r = r * 1664525u + 1013904223u; x[i] = ((r >> 8) / 16777216.f - 0.5f) * 2.f; }
+    for (int t = 0; t < 6; t++) quant_q8(x + (size_t)t * D, D, xq + (size_t)t * D, xd + (size_t)t * (D / QK));
+    /* the card: a layer where it holds at least 6 experts */
+    if (nXC >= 1 && XC[0].keys && XC[0].n >= 6) {
+        int cnt[NL] = {0}, l0 = -1;
+        for (int i = 0; i < XC[0].n; i++) cnt[XC[0].keys[i] / NE]++;
+        for (int l = 0; l < NL; l++) if (cnt[l] >= 6 && (l0 < 0 || cnt[l] > cnt[l0])) l0 = l;
+        if (l0 >= 0) {
+            int sel[NS], k = 0;
+            for (int i = 0; i < XC[0].n && k < NS; i++) if (XC[0].keys[i] / NE == l0) sel[k++] = XC[0].keys[i] % NE;
+            uint8_t mine[NS];
+            double t1[9], t6[9];
+            for (int rep = 0; rep < 12; rep++) {
+                for (int np = 1; np <= 6; np += 5) {
+                    for (int i = 0; i < NS; i++) mine[i] = i < np;
+                    const double a = now();
+                    if (XC[0].start(l0, 1, xq, xd, sel, mine) > 0) XC[0].finish(parts);
+                    const double dt = (now() - a) * 1e3;
+                    if (rep >= 3) { if (np == 1) t1[rep - 3] = dt; else t6[rep - 3] = dt; }
+                }
+            }
+            const double m1 = xc_med(t1, 9), m6 = xc_med(t6, 9);
+            out[0] = m1; out[1] = (m6 - m1) / 5.0; out[3] = l0; out[4] = 1;
+        }
+    }
+    /* the CPU: 6 tokens over 14 experts that no card holds, layer 0 */
+    {
+        const int l = 0;
+        int pool[14], n = 0;
+        for (int e = 0; e < NE && n < 14; e++) {
+            int held = 0;
+            for (int c = 0; c < nXC; c++) held |= XC[c].has && XC[c].has(l, e);
+            if (!held) pool[n++] = e;
+        }
+        int sel[6 * NS];
+        for (int t = 0; t < 6; t++) for (int i = 0; i < NS; i++) sel[t * NS + i] = pool[(t * 5 + i * 3) % n];
+        for (int t = 0; t < 6; t++)            /* distinct within a token */
+            for (int i = 0; i < NS; i++)
+                for (int j = 0; j < i; j++) if (sel[t * NS + j] == sel[t * NS + i]) sel[t * NS + i] = pool[(t * 5 + i * 3 + j + 1) % n];
+        double tc[7];
+        kp_park(1);
+        for (int rep = 0; rep < 10; rep++) {
+            const double a = now();
+            moe_forward_parts(M.L[l].moe, 6, x, NS, sel, NULL, parts);
+            const double dt = (now() - a) * 1e3;
+            if (rep >= 3) tc[rep - 3] = dt;
+        }
+        int u = 0, seen[NE] = {0};
+        for (int i = 0; i < 6 * NS; i++) if (!seen[sel[i]]) { seen[sel[i]] = 1; u++; }
+        out[2] = xc_med(tc, 7) / u;
+    }
+    return 0;
+}
+/* apply the calibration's decisions (an explicit KINDI_XC_MAXP / KINDI_XC_ADAPT always wins: the caller passes -9 /
+   -1 for "leave it") */
+void dsv_xc_set(int maxp, int adapt) {
+    if (maxp != -9 && !getenv("KINDI_XC_MAXP")) xc_maxp_v = maxp;
+    if (adapt == 1 && !getenv("KINDI_XC_ADAPT")) { xa_force = 1; xa_init(); }
+}
+
+/* KINDI_XS_EARLY=1 (streamed experts, calls of at most 8 tokens): the experts already in RAM are computed while the
+   others are read. The absent experts' reads start first (xs_demand), the pairs of the ready experts run as one call,
+   then the pairs of the rest once they have landed. Each pair is computed by the same kernel on the same bytes as in
+   one call, into its own row of parts, so the values are the same bits. Default: on when the experts stream
+   (KINDI_DSV_EXPERTS=stream), off otherwise (with the experts in RAM there is nothing to wait for);
+   KINDI_XS_EARLY=0/1 overrides. */
+int dsv_xs_early(int stream) {
+    const char* v = getenv("KINDI_XS_EARLY");
+    return v && v[0] ? atoi(v) != 0 : stream != 0;
+}
+static int xs_early_v = -1;
+static void early_parts(int l, int T, const float* x, const int* sel, const uint8_t* skip, float* parts) {
+    if (xs_early_v < 0) xs_early_v = dsv_xs_early(xs_on());
+    if (xs_early_v && xs_on() && T <= 8) {
+        int uid[8 * NS], nu = 0, pu[8 * NS];
+        for (int i = 0; i < T * NS; i++) {
+            pu[i] = -1;
+            if (skip && skip[i]) continue;
+            int u = 0;
+            while (u < nu && uid[u] != sel[i]) u++;
+            if (u == nu) uid[nu++] = sel[i];
+            pu[i] = u;
+        }
+        uint8_t rdy[8 * NS];
+        const int nr = nu ? xs_demand(l, nu, uid, rdy) : 0;
+        if (nr > 0 && nr < nu) {
+            uint8_t ska[8 * NS], skb[8 * NS];
+            for (int i = 0; i < T * NS; i++) {
+                const int now_ = pu[i] >= 0 && rdy[pu[i]];
+                ska[i] = pu[i] < 0 || !now_;
+                skb[i] = pu[i] < 0 || now_;
+            }
+            int n1 = moe_forward_parts(M.L[l].moe, T, x, NS, sel, ska, parts);
+            int n2 = moe_forward_parts(M.L[l].moe, T, x, NS, sel, skb, parts);
+            if (n1 > 0) dsv_union_total += n1;
+            if (n2 > 0) dsv_union_total += n2;
+            return;
+        }
+    }
+    int nu_ = moe_forward_parts(M.L[l].moe, T, x, NS, sel, skip, parts);
+    if (nu_ > 0) dsv_union_total += nu_;
+}
 static int gpu_moe_parts(int l, int T, const float* x, const int* sel, const uint8_t* skip, float* parts) {
     double t0 = now();
     kp_park(1);
+    if (!xs_pf_after()) xs_predict(l, T, x);
+    moe_trace(l, T, sel);
     uint8_t skip2[8 * NS];
     int any = xc_start(l, T, x, sel, skip, skip2);
     if (any < 0) return -1;
-    { int nu_ = moe_forward_parts(M.L[l].moe, T, x, NS, sel, any ? skip2 : skip, parts); if (nu_ > 0) dsv_union_total += nu_; }
+    early_parts(l, T, x, sel, any ? skip2 : skip, parts);
+    if (xs_pf_after()) xs_predict(l, T, x);
     if (any) xc_finish(any, parts);
     M.t_moe += now() - t0;
     return 0;
@@ -1914,19 +2551,23 @@ static int gpu_combine_alt(int T, const float* wsel, const float* parts, const i
 static int gpu_moe(int l, int T, const float* x, const int* sel, const float* wsel, float* mo) {
     double t0 = now();
     kp_park(1);
+    if (!xs_pf_after()) xs_predict(l, T, x);
+    moe_trace(l, T, sel);
     if ((nXC || xc_parts) && T <= 8) {     /* per-pair values (cards + host), then the weighted sum in slot order */
         static float* parts;
         if (!parts) parts = aligned_alloc(64, (size_t)8 * NS * D * 4);
         uint8_t skip2[8 * NS];
         int any = xc_start(l, T, x, sel, NULL, skip2);
         if (any < 0) return -1;
-        { int nu_ = moe_forward_parts(M.L[l].moe, T, x, NS, sel, any ? skip2 : NULL, parts); if (nu_ > 0) dsv_union_total += nu_; }
+        early_parts(l, T, x, sel, any ? skip2 : NULL, parts);
+        if (xs_pf_after()) xs_predict(l, T, x);
         if (any) xc_finish(any, parts);
         moe_combine(T, NS, wsel, parts, D, mo);
         M.t_moe += now() - t0;
         return 0;
     }
     { int nu_ = moe_forward(M.L[l].moe, T, x, NS, sel, wsel, mo, 0); if (nu_ > 0) dsv_union_total += nu_; }
+    if (xs_pf_after()) xs_predict(l, T, x);
     M.t_moe += now() - t0;
     return 0;
 }
@@ -1954,6 +2595,7 @@ static int forward_gpu(const int32_t* tok, int T, float* logits, int all_logits,
             for (int j = 0; j < QK; j++) e[b * QK + j] = d * (int8_t)r[b * BQ8 + 2 + j];
         }
     }
+    eng_prefetch(T);
     for (int l = 0; l < NL; l++) {
         Layer* L = &M.L[l];
         if (L->eng < 0) continue;
@@ -1978,6 +2620,7 @@ static int forward_gpu(const int32_t* tok, int T, float* logits, int all_logits,
     int nlog = logits ? (all_logits ? T : 1) : 0;
     int r = GPU.forward(M.pos, T, M.flags, cs, emb, eq2, ed2, csl, lg, nlat, gpu_moe, logits, nlog, dbg);
     if (r) { fprintf(stderr, "dsv41: GPU forward failed (%d)\n", r); return -2; }
+    if (T <= 8) xa_tick();
     M.pos += T;
     double dt = now() - t_start;
     M.t_total += dt;
@@ -2144,7 +2787,7 @@ int dsv_forward(const int32_t* tok, int T, float* logits, int all_logits) {
    chunks); prints per-layer agreement of h and of the last token's logits. Returns the argmax of the GPU logits
    (or -1). */
 int dsv_compare(const int32_t* tok, int T) {
-    if (!GPU.full) return -1;
+    if (!GPU.full || host_freed) return -1;     /* host_freed: run with KINDI_DSV_KEEP_HOST=1 */
     int p0 = M.pos;
     size_t n = (size_t)NL * T * HC * D;
     float *hc = malloc(n * 4), *hg = malloc(n * 4), *lc = malloc((size_t)VOCAB * 4), *lgp = malloc((size_t)VOCAB * 4);
@@ -2295,6 +2938,22 @@ int dsv_state_load(const char* path) {
     return hd[0];
 }
 
+/* ring checkpoints (rewind past the window ring): the window-ring rows before pos and the small rings, saved to / loaded
+   from a host buffer of dsv_ring_size() bytes; the rest of the state at pos is the position-indexed caches on the card.
+   dsv_ring_load(pos) is valid only while the tokens 0 .. pos - 1 are the ones of the save. 0 or < 0. */
+long dsv_ring_size(void) { return GPU.full && GPU.ring_size ? (long)GPU.ring_size() : 0; }
+int dsv_ring_save(void* host) {
+    if (!GPU.full || !GPU.ring_save) return -1;
+    return GPU.ring_save(M.pos, host) ? -2 : 0;
+}
+int dsv_ring_load(int pos, const void* host) {
+    if (!GPU.full || !GPU.ring_load) return -1;
+    if (pos < 0 || pos > M.pos) return -3;
+    if (GPU.ring_load(pos, host)) return -2;
+    M.pos = pos;
+    return 0;
+}
+
 /* ---------------------------------------------------------------- micro-benchmark */
 /* all dense matrices of all layers once per iteration, T tokens of random activations; returns GB/s */
 double dsv_bench_dense(int iters, int T) {
@@ -2344,10 +3003,41 @@ void* dsv_map_file(const char* path, long* size) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
     void* p = mmap(NULL, (size_t)n, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-    if (p == MAP_FAILED) return NULL;
+    if (p == MAP_FAILED) { close(fd); return NULL; }
+    if (nMF < 64) { MF[nMF].p = (const uint8_t*)p; MF[nMF].n = (size_t)n; MF[nMF].fd = fd; nMF++; }
+    else close(fd);
     *size = n;
+    xs_add_file(p, n, path);      /* the expert store reads the experts of streamed layers from here */
     return p;
+}
+/* drop a file's page cache, keeping its mapping (KINDI_XS_DROP=1 after a streamed start: the experts that the
+   cards took at load time and the shards that hold only experts leave the page cache) */
+int dsv_drop_cache(const char* path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int r = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+    return r;
+}
+void dsv_xs_print_stats(const char* tag) { xs_print_stats(tag); }
+/* the store's counters for /health: n[0..15] as xs_stats, d[0..1] its seconds, e[0..14] as xs_stats2 */
+int dsv_xs_stats(long long* n, double* d, double* e) {
+    if (!xs_on()) return -1;
+    xs_stats(n, d); xs_stats2(e);
+    return 0;
+}
+/* the expert cards' share of the CPU's pairs so far: [0] pairs taken, [1] all host pairs */
+void dsv_xc_counts(long long* out) { out[0] = xc_pairs; out[1] = xc_all; }
+/* release what loading left resident from a mapped file: the process's pages of the mapping (they fault in again
+   from the file when read, e.g. engram rows) and the file's clean page cache. For streamed experts with whole layers
+   on the GPU, where the dense weights, the cards' experts and the store's pins were read through the mapping. */
+int dsv_release_pages(void* p, long size, const char* path) {
+    madvise(p, (size_t)size, MADV_DONTNEED);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int r = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+    return r;
 }
 /* unmap a file and drop its page cache (for shards whose tensors were all copied) */
 int dsv_drop_file(void* p, long size, const char* path) {

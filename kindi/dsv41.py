@@ -59,7 +59,8 @@ def gpu_lib(cache):
 def cuda_devices():
     """[(device, name, compute capability major * 10 + minor, total bytes)] in CUDA's default order, or []"""
     try:
-        cu = ctypes.CDLL("libcuda.so.1")
+        from .gpudrv import libcuda
+        cu = libcuda()
     except OSError:
         return []
     if cu.cuInit(0) != 0:
@@ -140,23 +141,25 @@ def stats_line(kind, s0, s1, n_tok, decode_s, draft_s=0.0, steps=0, p0=None, p1=
           % (kind, n_tok, steps, decode_s, moe_s, 100.0 * moe_s / max(decode_s, 1e-9), draft_s,
              decode_s - moe_s - draft_s, d[0], d[1], d[2] / max(d[0], 1), d[4] / max(n_tok, 1) / 1e9),
           file=sys.stderr, flush=True)
+    if _lib is not None and os.environ.get("KINDI_DSV_EXPERTS") == "stream":
+        _lib.dsv_xs_print_stats(("(%s, cumulative)" % kind).encode())
 
 
 def lib():
     global _lib
     if _lib is None:
-        srcs = [open(os.path.join(HERE, f), encoding="utf-8").read() for f in ("dsv41_cpu.c", "moe_cpu.c")]
+        srcs = [open(os.path.join(HERE, f), encoding="utf-8").read() for f in ("dsv41_cpu.c", "moe_cpu.c", "xstore.c", "moeaccel.c", "moeaccel.h")]
         cache = os.environ.get("KINDI_CPU_CACHE") or os.path.join(os.path.expanduser("~"), ".cache", "kindi")
         os.makedirs(cache, exist_ok=True)
         tag = hashlib.sha1(("fpc1" + "".join(srcs)).encode()).hexdigest()[:12]
         so = os.path.join(cache, "dsv41_cpu_%s.so" % tag)
         if not os.path.exists(so):
             objs = []
-            for name, src in zip(("dsv41_cpu", "moe_cpu"), srcs):
+            for name, src in zip(("dsv41_cpu", "moe_cpu", "xstore", "moeaccel"), srcs[:4]):
                 c = os.path.join(cache, "%s_%s.c" % (name, tag))
                 open(c, "w", encoding="utf-8").write(src)
                 # no implicit FMA contraction, so a code change does not move results by an ulp
-                subprocess.check_call(["gcc", "-O3", "-march=native", "-pthread", "-fPIC", "-ffp-contract=off", "-c",
+                subprocess.check_call(["gcc", "-O3", "-march=native", "-pthread", "-fPIC", "-ffp-contract=off", "-I", HERE, "-c",
                                        "-o", c + ".o", c])
                 objs.append(c + ".o")
             subprocess.check_call(["gcc", "-shared", "-pthread", "-o", so + ".tmp"] + objs + ["-lm", "-ldl"])
@@ -184,6 +187,11 @@ def lib():
         L.dsv_get_flags.restype = I
         L.dsv_pos.restype = I
         L.dsv_set_pos.argtypes = [I]
+        L.dsv_ring_size.restype = Lo
+        L.dsv_ring_save.argtypes = [V]
+        L.dsv_ring_save.restype = I
+        L.dsv_ring_load.argtypes = [I, V]
+        L.dsv_ring_load.restype = I
         L.dsv_dump_open.argtypes = [ctypes.c_char_p]
         L.dsv_times.argtypes = [V]
         L.dsv_bench_dense.argtypes = [I, I]
@@ -191,6 +199,13 @@ def lib():
         L.dsv_map_file.restype = V
         L.dsv_drop_file.argtypes = [V, Lo, ctypes.c_char_p]
         L.dsv_drop_file.restype = I
+        L.dsv_drop_cache.argtypes = [ctypes.c_char_p]
+        L.dsv_drop_cache.restype = I
+        L.dsv_release_pages.argtypes = [V, ctypes.c_long, ctypes.c_char_p]
+        L.dsv_release_pages.restype = I
+        L.dsv_xs_print_stats.argtypes = [ctypes.c_char_p]
+        L.dsv_xs_guess.argtypes = [I, I, V, I, V]
+        L.dsv_xs_guess.restype = I
         L.dsv_move_file_pages.argtypes = [ctypes.c_char_p, I, I, Lo]
         L.dsv_move_file_pages.restype = Lo
         L.dsv_place_ranges.argtypes = [ctypes.c_char_p, I, V, V, V]
@@ -198,6 +213,9 @@ def lib():
         L.dsv_interleave_file_pages.argtypes = [ctypes.c_char_p, I, I]
         L.dsv_interleave_file_pages.restype = Lo
         L.dsv_union_count.argtypes = []
+        L.dsv_xc_measure.argtypes = [V]
+        L.dsv_xc_measure.restype = I
+        L.dsv_xc_set.argtypes = [I, I]
         L.dsv_union_count.restype = Lo
         L.moe_stats.argtypes = [V]
         L.moe_stats.restype = None
@@ -325,6 +343,7 @@ class Model(object):
         files = shards(path)
         self.meta = GGUF(files[0]).kv
         expert_only = []
+        mapped = []
         t0 = time.time()
         for f in files:
             g = GGUF(f)
@@ -332,6 +351,7 @@ class Model(object):
             p = L.dsv_map_file(f.encode(), ctypes.byref(size))
             if not p:
                 raise RuntimeError("dsv41: cannot map %s" % f)
+            mapped.append((f, p, size.value))
             base = p + g.data_start
             for name, ne, ty, off in g.tensors:
                 ne = list(ne) + [1] * (3 - len(ne))
@@ -349,6 +369,16 @@ class Model(object):
         d1 = _cpus(os.environ["KINDI_DSV_CPUS1"]) if "KINDI_DSV_CPUS1" in os.environ else (m1 if same else _siblings(m1))
         ms = float(os.environ.get("KINDI_MOE_SHARE0", "0.667"))
         ds = float(os.environ.get("KINDI_DSV_SHARE0", "0.667"))
+        # KINDI_DSV_EXPERTS: "mmap" (the default; the ram profile) reads the experts in place from the mapped file,
+        # or from the copy with KINDI_MOE_COPY=1; "stream" (the nvme profile) reads only the routed experts from the
+        # file with direct I/O into a RAM cache of KINDI_XS_GB (xstore.c)
+        mode = os.environ.get("KINDI_DSV_EXPERTS", "mmap")
+        self.xcal = None
+        self.expert_mode = mode
+        if mode not in ("mmap", "stream"):
+            raise RuntimeError("dsv41: KINDI_DSV_EXPERTS must be mmap or stream, not %r" % mode)
+        if mode == "stream":
+            expert_copy = False
         if expert_copy is None:
             # default: experts read in place from the page cache (fast start, the page cache is shared with other
             # processes); KINDI_MOE_COPY=1 copies them into node-split memory (faster, but the whole model no
@@ -359,6 +389,24 @@ class Model(object):
         r = L.dsv_init(ctx, tmax, dc, len(d0), len(d1), ds, mc, len(m0), len(m1), ms, 1 if expert_copy else 0)
         if r:
             raise RuntimeError("dsv41: init failed (%d)" % r)
+        if (os.environ.get("KINDI_DSV_GPU", "0") not in ("", "0", "1") and os.environ.get("KINDI_XC_CAL", "1") != "0"
+                and os.environ.get("KINDI_DSV_GPU2_LIBS")):
+            # the expert-card settings from the cards and the CPU here (cached per card UUIDs; KINDI_XC_CAL=0: off,
+            # KINDI_XC_RECAL=1: measure again; an explicit KINDI_XC_MAXP / KINDI_XC_ADAPT always wins)
+            from .dsv41_xcal import calibrate
+            self.xcal = calibrate(L, path, "%s/%s share %s" % (m0, m1, ms))
+        if mode == "stream" and os.environ.get("KINDI_XS_DROP", "0") != "0":
+            # the experts now come from the store; the pages that loading put in the page cache (the cards' experts)
+            # go, so the cache budget is the RAM the experts use. Off by default: other processes may use those pages.
+            for f, p, size in expert_only:
+                L.dsv_drop_cache(f.encode())
+        if (mode == "stream" and os.environ.get("KINDI_DSV_GPU", "0") not in ("", "0", "1")
+                and os.environ.get("KINDI_DSV_RELEASE", "1") != "0"):
+            # streamed experts, whole layers on the GPU: what loading read through the mappings (the dense weights,
+            # the cards' experts, the store's pins) leaves this process and the page cache; rows read later (the
+            # engram table, the token embeddings) fault in again. KINDI_DSV_RELEASE=0 keeps them.
+            for f, p, size in mapped:
+                L.dsv_release_pages(p, size, f.encode())
         if expert_copy and os.environ.get("KINDI_MOE_DROP_CACHE", "1") != "0":
             # the copied experts no longer need the page cache of the shards that hold only experts; dropping it
             # keeps the engram table (read at random, one row per n-gram) resident without memory pressure
@@ -377,9 +425,16 @@ class Model(object):
         self.ctx, self.tmax = ctx, tmax
         self.hist = []                                   # the tokens at positions 0 .. pos - 1 (prompt cache)
         self.logits = np.zeros(VOCAB, np.float32)
+        # ring checkpoints (0.7.0): a host copy of the window ring (and the small rings) at every KINDI_DSV_RING_EVERY
+        # positions (a multiple of 2 tmax, so a resume reads the same chunks as a full prefill), so that a request that
+        # edits the conversation further back than the ring reaches (tmax) resumes at the nearest older checkpoint
+        # instead of position 0. About 11 MB each; at most KINDI_DSV_RING_MAX (the spacing doubles past that).
+        # KINDI_DSV_RING_EVERY=0: off.
+        self._ring_init()
         if verbose:
             print("dsv41: loaded in %.1f s (dense cores %s / %s, expert cores %s / %s, experts %s)"
-                  % (time.time() - t0, d0, d1, m0, m1, "copied" if expert_copy else "in place"), file=sys.stderr)
+                  % (time.time() - t0, d0, d1, m0, m1,
+                     "streamed" if mode == "stream" else "copied" if expert_copy else "in place"), file=sys.stderr)
 
     @property
     def pos(self):
@@ -388,6 +443,65 @@ class Model(object):
     def reset(self):
         lib().dsv_reset()
         self.hist = []
+        self.rings.clear()
+        self.ring_step = self.ring_every
+
+    def _ring_init(self):
+        self.ring_bytes = int(lib().dsv_ring_size())
+        ev, t2 = int(os.environ.get("KINDI_DSV_RING_EVERY", "1024")), 2 * self.tmax
+        self.ring_every = -(-ev // t2) * t2 if ev > 0 and self.ring_bytes > 0 else 0
+        self.ring_max = max(2, int(os.environ.get("KINDI_DSV_RING_MAX", "256")))
+        self.rings = {}                                  # position -> (sha1 of hist[:position], host copy)
+        self.ring_step = self.ring_every                 # the spacing now (doubles each time RING_MAX is reached)
+        self.ring_stats = {"saved": 0, "restored": 0, "tokens_saved": 0}
+
+    def _ring_drop_after(self, pos):
+        """the tokens from pos on change: checkpoints past pos no longer match the caches on the card"""
+        for q in [q for q in self.rings if q > pos]:
+            del self.rings[q]
+
+    def _ring_save(self):
+        """a ring checkpoint at the current position when it is a multiple of ring_every"""
+        p = self.pos
+        if not self.ring_every or p == 0 or p % self.ring_step or p in self.rings:
+            return
+        n = int(lib().dsv_ring_size())                   # asked again: never write past the buffer
+        if n != self.ring_bytes:
+            self.rings.clear()
+            self.ring_bytes = n
+        buf = np.zeros(n, np.uint8)
+        if lib().dsv_ring_save(buf.ctypes.data):
+            return
+        self.rings[p] = (self._ckpt_key(self.hist[:p]), buf)
+        self.ring_stats["saved"] += 1
+        while len(self.rings) > self.ring_max:
+            # thin out: the checkpoints at odd multiples of the spacing go, and the spacing doubles
+            for q in [q for q in self.rings if (q // self.ring_step) % 2 == 1]:
+                del self.rings[q]
+            self.ring_step *= 2
+
+    def ring_lookup(self, c):
+        """the nearest ring checkpoint at or before position c that is valid for the tokens on the card (0: none)"""
+        best = 0
+        for q in self.rings:
+            if best < q <= min(c, self.pos):
+                best = q
+        while best:
+            if self.rings[best][0] == self._ckpt_key(self.hist[:best]):
+                return best
+            del self.rings[best]                          # the caches on the card belong to other tokens
+            best = max([q for q in self.rings if q < best] or [0])
+        return 0
+
+    def ring_restore(self, q):
+        """back to ring checkpoint q (from ring_lookup): positions 0 .. q - 1 as they were"""
+        if self.rings[q][1].size != int(lib().dsv_ring_size()):
+            raise RuntimeError("dsv41: ring checkpoint of another size")
+        if lib().dsv_ring_load(q, self.rings[q][1].ctypes.data):
+            raise RuntimeError("dsv41: ring checkpoint restore failed")
+        del self.hist[q:]
+        self._ring_drop_after(q)
+        self.ring_stats["restored"] += 1
 
     def rewind(self, pos):
         """continue from position pos (for speculation: drop rejected draft tokens). The caches past pos are
@@ -397,6 +511,7 @@ class Model(object):
             raise ValueError("dsv41: rewind to %d, position is %d" % (pos, self.pos))
         lib().dsv_set_pos(pos)
         del self.hist[pos:]
+        self._ring_drop_after(pos)
 
     def can_rewind(self, pos):
         """True when rewind(pos) is valid: an even position inside the reach of the window ring (tmax back from the
@@ -423,6 +538,7 @@ class Model(object):
         if p != snap.n:
             raise RuntimeError("dsv41: snapshot restore failed (%d)" % p)
         self.hist = list(snap.hist)
+        self._ring_drop_after(p)                         # the older ones are checked against hist when used
         return p
 
     def _check_cancel(self):
@@ -455,6 +571,8 @@ class Model(object):
                 n = min(self.tmax, 128)
                 lib().dsv_dspark_push(self.tmax - n, n, p0 + 2 * self.tmax - n)
             a0 += 2 * self.tmax
+            if push:
+                self._ring_save()
         for a in range(a0, len(ids), self.tmax):
             b = min(len(ids), a + self.tmax)
             dst = out[a:b] if all_logits else out
@@ -469,10 +587,14 @@ class Model(object):
             if push and getattr(self, "dspark", False):
                 n = min(b - a, 128)
                 lib().dsv_dspark_push(b - a - n, n, p0 + b - a - n)
+            if push:                                     # (push=False: a verify pass; its end may be rewound)
+                self._ring_save()
         return out
 
     def _ckpt_key(self, toks):
-        return hashlib.sha1(np.asarray(toks, np.int32).tobytes()).hexdigest()
+        k = hashlib.sha1(np.asarray(toks, np.int32).tobytes()).hexdigest()
+        # KINDI_DSV_CKV4: the compressed KV is saved in FP4 codes, another layout: its own files
+        return k + "-c4" if os.environ.get("KINDI_DSV_CKV4", "0") not in ("", "0") else k
 
     def checkpoint_save(self, cache_dir):
         """save the current state (positions 0 .. pos - 1) to cache_dir, keyed by the hash of those tokens"""
@@ -516,15 +638,22 @@ class Model(object):
         while c < n and ids[c] == self.hist[c]:
             c += 1
         c -= c % 2
+        ring = 0
         if c < self.pos - self.tmax:
-            c = 0                                       # beyond the window ring: compute from the start
+            # beyond the window ring: the nearest ring checkpoint at or before c, else compute from the start
+            ring = self.ring_lookup(c)
+            c = ring
         if cache_dir:                                   # a saved state with a longer common prefix
             n, path = self.checkpoint_lookup(ids, cache_dir)
             if n > c:
                 p = lib().dsv_state_load(path.encode())
                 if p == n:
                     self.hist = list(ids[:n])
-                    c = n
+                    self._ring_drop_after(n)
+                    c, ring = n, 0
+        if ring:
+            self.ring_restore(ring)
+            self.ring_stats["tokens_saved"] += ring
         if c == 0:
             self.reset()
         elif c < self.pos:
@@ -549,7 +678,7 @@ class Model(object):
         self.dspark = True
 
     def generate_dspark(self, ids, n, conf_min=0.0, kmax=5, stop_eos=True, stats=None, auto=False, cal=(1.0, 0.0),
-                        ms=(45.0, 2.0, 50.0), lg=None, on_tokens=None, temperature=0.0, top_p=1.0, top_k=0,
+                        ms=None, lg=None, on_tokens=None, temperature=0.0, top_p=1.0, top_k=0,
                         min_p=0.0, rng=None):
         """greedy with DSpark drafts: after each step the drafter proposes 5 tokens; the drafts whose confidence logit
         is >= conf_min (a prefix, at most kmax) go through one forward with the next token; drafts are kept up to the
@@ -592,6 +721,14 @@ class Model(object):
             est1 = [ub[j] / union[j - 1] for j in ub]
             u1 = ub[1] if 1 in ub else sum(est1) / len(est1)
             return ub[m] / u1 if u1 > 0 else union[m - 1]
+
+        if ms is None:
+            # the step cost model of the draft-length chooser, in ms: card + per drafted position + host experts x the
+            # union factor. F9 (11-15) measured verify forwards on the DeepSeek host (KINDI_DSV_TPROF): card and head
+            # 30 + 6 per drafted position, host experts 47 for one token; the earlier (45, 2, 50) over-weighted the
+            # fixed part. The output never depends on this, only the speed. KINDI_DS_MS="a,b,c" sets it.
+            env_ms = os.environ.get("KINDI_DS_MS")
+            ms = tuple(float(x) for x in env_ms.split(",")) if env_ms else (30.0, 6.0, 47.0)
 
         def cost(k):
             return ms[0] + ms[1] * k + ms[2] * ufac(k + 1)
@@ -673,7 +810,8 @@ class Model(object):
             st["steps"] += 1; st["drafted"] += len(draft); st["accepted"] += a
             if use_ng:
                 st["ng_accepted"] = st.get("ng_accepted", 0) + a
-            st.setdefault("conf_log", []).extend((float(conf[i]), int(i < a)) for i in range(len(draft)))
+            # (confidence, accepted, position in the draft) of every drafted token (KINDI_DS_LOG, tools/dsv41_dspark_fit.py)
+            st.setdefault("conf_log", []).extend((float(conf[i]), int(i < a), i) for i in range(len(draft)))
             L.dsv_dspark_push(0, 1 + a, p0)
             out.extend(draft[:a])
             if a < len(draft):
@@ -1040,7 +1178,7 @@ def main(argv=None):
             print("prompt %d: %s, plain %.2f tok/s, spec %.2f tok/s, %d steps, accepted %d of %d drafted, draft %.1f ms/step%s"
                   % (j["id"], "same tokens" if same else "TOKENS DIFFER", (len(g1) - 1) / d1, (len(g2) - 1) / d2,
                      st["steps"], st["accepted"], st["drafted"], 1e3 * st.get("draft_s", 0) / max(st["steps"], 1),
-                     (", conf/accept " + " ".join("%.1f:%d" % c for c in st.get("conf_log", [])[:12])) if st.get("conf_log") else ""),
+                     (", conf/accept " + " ".join("%.1f:%d" % c[:2] for c in st.get("conf_log", [])[:12])) if st.get("conf_log") else ""),
                   file=sys.stderr, flush=True)
         print("total: plain %.2f tok/s, spec %.2f tok/s" % (tot["tokens"] / tot["plain_s"], tot["tokens"] / tot["spec_s"]),
               file=sys.stderr)

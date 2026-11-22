@@ -74,6 +74,9 @@ def run(cfg, log=print):
     if man.get("backend") == "kindi_nanbeige":
         from .nanbeige_cli import verify
         return verify(cfg, man, log=log)
+    if man.get("backend") == "kindi_qwen4exp":
+        from .qwen4exp_cli import verify
+        return verify(cfg, man, log=log)
     if man.get("backend") == "kindi_lightning":
         from .lightning_cli import verify
         return verify(cfg, man, log=log)
@@ -82,6 +85,14 @@ def run(cfg, log=print):
         log("no llama.cpp reference for this model in this version of Kindi")
         return 2
     ref = json.load(open(rp))
+    from .packcheck import check, PackError
+    try:                                    # B16: every pack file as kindi convert wrote it (sha256)
+        n = check(pack, "full", man)
+    except PackError as e:
+        log("FAIL: %s" % e)
+        return 1
+    log("pack files: %s" % ("%d checked (size and sha256)" % n if n else "no record (a pack from before 0.7.0; "
+                                                                          "kindi convert --force adds it)"))
     cl = os.path.join(pack, "head_clusters.npz")
     eng = make_engine(pack, ctx=1024, clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log)
     ok_all, tok, dt, ties = True, 0, 0.0, 0

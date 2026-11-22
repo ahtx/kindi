@@ -20,15 +20,20 @@ checks every draft, so the output does not change.
 
 ## The two host profiles
 
-**ram (about 560 GB of RAM or more).** The whole model stays in the Linux page cache. A host can have two CPU
+**ram (496 GiB of RAM or more, as `MemTotal` in `/proc/meminfo` reports it).** The whole model stays in the Linux
+page cache. The 496 GiB are the 9 GGUF shards (466 GiB), the server's own memory (about 11 GiB) and room for the
+kernel and the rest of the system (18 GiB), measured on the test host. A build with 512 GB of memory modules reports a
+few GiB less than 512 in `MemTotal`. From 496 GiB it gets this profile, with little room left for other programs. The installer prints the RAM it
+found and the RAM the profile needs, and `--profile ram` or `--profile nvme` overrides its choice. A host can have two CPU
 sockets. Then Kindi puts the rows of each expert on the memory node of the cores that compute them. The service does
 this before it starts (`python -m kindi.dsv41 numa MODEL --rowsplit`). So both memory controllers read at the same
 time. The model file can be on any disk. Kindi reads the file one time at the first start, and then uses the copy in
 RAM. On a hard disk, the first read takes 40 minutes or more.
 
-**nvme (less RAM).** Kindi reads the experts from an NVMe drive. The speed depends on the read speed of the drive and
-on the part of the experts that RAM holds. The installer does not accept this profile on a hard disk. Two or more NVMe
-drives in RAID 0 increase the read speed. We did not measure this profile yet.
+**nvme (less RAM).** Kindi streams the experts from an NVMe drive (`KINDI_DSV_EXPERTS=stream`, see "Streamed
+experts" below). The speed depends on the read speed of the drive and on the part of the experts that RAM holds. The
+installer does not accept this profile on a hard disk. Two or more NVMe drives in RAID 0 increase the read speed. We
+did not measure this profile yet.
 
 ## Install
 
@@ -84,6 +89,78 @@ this).
 MoE placement (`kindi/moe.py`), the same policy as the other MoE engines. The installer makes the plan for the VRAM
 of the expert cards. With the counts in the release, 7 GB of VRAM on the expert card holds 399 experts. These experts
 get 36% of the expert picks.
+
+## Streamed experts
+
+The routed experts are 289 GB of the 494 GB file. In the ram profile, Kindi reads them in place from the memory-mapped
+file (`KINDI_DSV_EXPERTS=mmap`, the default). With less RAM, the kernel then loads 4 KB pages one at a time when a
+token needs them, and it drops pages by its own LRU order.
+
+`KINDI_DSV_EXPERTS=stream` (the installer's nvme profile) uses Kindi's expert store (`kindi/xstore.c`) instead:
+
+- Each call reads only the experts that its tokens route to. An expert is 17.9 MB (gate, up and down). The store
+  reads it with direct I/O (`O_DIRECT`, past the page cache) in chunks of 2 MB, with 32 reads in flight.
+- The experts stay in a RAM cache with a fixed size (`KINDI_XS_GB`). The cache holds the bytes of the file without a
+  change, so the expert kernels give the same bits as in the mmap mode.
+- The store pins the most used experts that the cards do not hold (half of the cache). The list is the hot-expert
+  list of the installer (the shared MoE placement, `kindi/moe.py`). The store drops the other experts by a use count
+  that halves every 64 forward steps. Experts used in the last three steps stay first.
+- Prefetch: when the experts of layer l start, a thread applies the routers of layers l + 1 and l + 2 to the input of
+  layer l. It reads the top 8 experts of each token ahead. On real activations, this guess holds 79% of the experts
+  of the next layer and 74% of the layer after it (`tools/dsv41_prefetch_recall.py`). A wrong guess costs only a read.
+- A DSpark verify step computes the token and its drafts in one call, so all of them share the reads of their
+  experts.
+- If no slot is free, or a read fails, the call reads that expert from the mapped file. The counters report it.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `KINDI_DSV_EXPERTS` | `mmap` | `stream` turns the store on |
+| `KINDI_XS_GB` | 70% of the free RAM less 8 GB | The RAM of the expert cache (the installer: 70% less 16 GB) |
+| `KINDI_XS_PIN` | 0.5 | The part of the cache for pinned experts |
+| `KINDI_XS_PIN_LIST` | `KINDI_HOT_LIST` | The order of the pins ("layer expert count" lines) |
+| `KINDI_XS_THREADS`, `KINDI_XS_CHUNK` | 32, 2 MB | The read threads and the size of one read |
+| `KINDI_XS_PF_DEPTH`, `KINDI_XS_PF_K` | 2, 8 | Prefetch: the layers ahead and the experts per token (0 = off) |
+| `KINDI_XS_DROP` | 0 | 1 drops the page cache of the expert shards after the start (the installer sets it) |
+| `KINDI_XS_CHECK` | 0 | 1 compares each read with the mapped file (for tests) |
+
+The checks: `tools/test_xstore.py` (a synthetic file), `tools/dsv41_xstore_check.py` (three layers of the real model)
+and `tools/dsv41_xstore_e2e.py` (the whole model on the CPU, a few tokens). Each one compares the stream mode with the
+mmap mode, and the results must be the same bits. `tools/dsv41_nvme_measure.sh` measures both modes under a RAM cap.
+
+## Edits far back in a conversation
+
+The attention window ring keeps only the last positions of each layer, so the state in memory can go back at most one
+prompt chunk (`tmax`, 512 tokens). Before 0.7.0, a request that changed the conversation further back (an agent that
+compresses its history and rewrites its first message, or an edit at an early turn) read the whole prompt again from
+the start, unless a saved state on disk matched.
+
+From 0.7.0 the engine copies the window ring to host RAM at every 1,024 positions while it reads (about 11 MB for each
+copy). The compressed caches are indexed by position, so they stay valid on the card. Such a request now resumes at
+the nearest copy at or before its first changed token, and reads only the tokens after it. The copies are taken where
+the chunks of a full read end, so the result is the same as a full read.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `KINDI_DSV_RING_EVERY` | 1024 | Positions between two ring copies (rounded up to a multiple of 2 `tmax`); 0 = off |
+| `KINDI_DSV_RING_MAX` | 256 | The most copies kept; past it, every second one goes and the spacing doubles |
+
+`tools/test_dsv41_ring.py` checks the bookkeeping with a small fake engine.
+
+Measured on 11-15 on the test host with the service's cards and settings (3060 + M4000 expert card,
+`KINDI_DSV_GPU=2 KINDI_SPLIT=1`), without `--cache-dir`, with `tools/dsv41_ring_measure.py` on an agent conversation of
+26 messages and 24,386 tokens (`tools/dsv41_ring_request.py`, made from this repository's files) whose message 6 (between
+positions 3,072 and 4,096) is edited:
+
+| Request | Ring off (`KINDI_DSV_RING_EVERY=0`) | Ring on (default) |
+|---|---|---|
+| original | 24,386 tokens read, 254.8 s | 24,386 tokens read, 255.4 s |
+| edited (message 6) | 24,391 tokens read again, 256.1 s | 21,319 tokens read (from the copy at 3,072), 228.2 s |
+| back to the original | 24,386 tokens read again, 257.6 s | 21,314 tokens read, 227.4 s |
+
+The answers are the same with the ring on and off. The copies cost nothing that shows in the first read. The gain
+follows the position of the edit: here the edit was early, so 3,072 tokens were saved; an edit at position 20,000
+would read only the tokens after the copy at 19,456. (An earlier 11-15 run crashed in the first copy; the copy's size did not
+count the drafter's rings. `tools/dsv41_ring_test.cu` checks the fix on any card.)
 
 ## Measured speeds
 

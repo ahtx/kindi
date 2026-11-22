@@ -24,7 +24,11 @@
 
 __device__ __forceinline__ float tc_h2f(unsigned short h){ return __half2float(*(const __half*)&h); }
 __device__ __forceinline__ int td_dot4(unsigned int a, unsigned int b, int c){
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+  return __builtin_amdgcn_sdot4((int)a, (int)b, c, false);   /* RDNA2: the digits are 0 / 1 / 2, so signed x signed is exact */
+#else
   return __builtin_amdgcn_sudot4(false, (int)a, true, (int)b, c, false);   /* digits unsigned, activations signed */
+#endif
 }
 
 /* ------------------------------------------------------------------ repack: 5-trit lane layout -> row layout */

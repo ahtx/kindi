@@ -4,11 +4,11 @@
 # For the Radeon 780M (gfx1103), also set HSA_OVERRIDE_GFX_VERSION=11.0.2 and boot with amdgpu.cwsr_enable=0
 # (see docs/AMD.md).
 #
-#   docker build -t kindi-rocm:0.6.1 -f docker/Dockerfile.rocm --build-arg KINDI_VERSION=0.6.1 .
+#   docker build -t kindi-rocm:0.7.0 -f docker/Dockerfile.rocm --build-arg KINDI_VERSION=0.7.0 .
 #   docker run -d --name kindi --device /dev/kfd --device /dev/dri \
 #       --group-add $(getent group video | cut -d: -f3) --group-add $(getent group render | cut -d: -f3) \
 #       --security-opt seccomp=unconfined -e HSA_OVERRIDE_GFX_VERSION=11.0.2 \
-#       -p 127.0.0.1:8093:8093 -v kindi-data:/data -e KINDI_MODEL=bonsai-4b kindi-rocm:0.6.1
+#       -p 127.0.0.1:8093:8093 -v kindi-data:/data -e KINDI_MODEL=bonsai-4b kindi-rocm:0.7.0
 #
 # The base image is pinned by digest (rocm/dev-ubuntu-24.04:6.3.3).
 FROM rocm/dev-ubuntu-24.04:6.3.3@sha256:17811ff26c4c9067e774aeb0829742633dff5927caaead1e78434a975e15af64

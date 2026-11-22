@@ -90,6 +90,13 @@ class Kindi(object):
             self.variant = "nanbeige"
             self.nanbeige = NanbeigeBackend(man, cfg, log=log)
             self.eng, self.tok, self.runner, self.sample = self.nanbeige.eng, self.nanbeige.tok, None, None
+        elif man.get("backend") == "kindi_qwen4exp":      # Qwen3.8-Flash-Next (the qwen4exp card engine)
+            from .qwen4exp_cli import check_shards
+            from .qwen4exp_gen import FlashNextBackend
+            check_shards(man)
+            self.variant = "flashnext"
+            self.nanbeige = FlashNextBackend(man, cfg, log=log)   # (the backend interface of Lightning's)
+            self.eng, self.tok, self.runner, self.sample = self.nanbeige.eng, self.nanbeige.tok, None, None
         elif man.get("backend") == "kindi_lightning":     # Nemotron-H MoE GGUF (Nemotron 3.5 Lightning 30B-A3B)
             from .lightning_gen import LightningBackend
             self.variant = "lightning"
@@ -122,6 +129,65 @@ class Kindi(object):
         self.lock = threading.RLock()        # reentrant: a background request runs waiting chat requests inside its own turn
         self.stats = {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
         self.t0 = time.time()
+        self.slot_views = None
+        if getattr(self.eng, "slots", None) is not None:
+            self._make_slots(cfg, log)
+
+    # ------------------------------------------------------------------ decode slots (F7, kindi/slots.py)
+    def _make_slots(self, cfg, log):
+        """one view of this server per slot: its own engine facade, prompt cache, progress and lock; the views share
+        the stats. A request takes a free view (acquire) and runs generate on it."""
+        import copy
+        from .slots import Batcher, Slot
+        from .cache import _ram_bytes
+        ss = self.eng.slots
+        self.batcher = Batcher(ss)
+        c2 = dict(cfg)
+        budget = int(cfg.get("checkpoint_budget_mb") or 0) or _ram_bytes() // 5 // 2 ** 20
+        c2["checkpoint_budget_mb"] = max(64, budget // ss.n)
+        views = []
+        for k in range(ss.n):
+            v = copy.copy(self)
+            v.slot, v.slot_views = k, None
+            v.eng = Slot(ss, self.batcher, k)
+            v.busy = {"active": False, "phase": "", "prompt_tokens": 0, "cached": 0, "read": 0, "generated": 0,
+                      "started": 0.0}
+            v.runner = Runner(v.eng, c2, self.pack_id, log, progress=v.busy)
+            v.sample = Sampler(v.eng)
+            v.lock = threading.RLock()
+            v.last_used = 0.0
+            views.append(v)
+        self.slot_views, self.slot_free = views, list(views)
+        self.slot_cv = threading.Condition()
+        log("decode slots: %d requests at a time; drafting (KINDI_SPEC, the MTP head, DSpine) is off with slots" % ss.n)
+
+    def acquire(self, req):
+        """the view a request runs on: this server (one slot), or a free slot; the slot that served the same
+        conversation (session) last is preferred, since its prompt cache holds it, then the lowest free slot"""
+        if getattr(self, "slot_views", None) is None:
+            return self
+        session = req.get("_kindi_session") or req.get("kindi_session") or req.get("user")
+        with self.slot_cv:
+            while not self.slot_free:
+                self.slot_cv.wait()
+            pick = None
+            if session:
+                pick = next((v for v in self.slot_free if v.runner.session == session), None)
+            if pick is None:
+                # the lowest free slot: a batched pass covers slots 0 .. the highest writing one, so low slots keep
+                # the passes small
+                pick = min(self.slot_free, key=lambda v: v.slot)
+            self.slot_free.remove(pick)
+            return pick
+
+    def release(self, v):
+        if v is self:
+            return
+        v.eng.release()
+        with self.slot_cv:
+            v.last_used = time.time()
+            self.slot_free.append(v)
+            self.slot_cv.notify()
 
     def head_mode(self):
         """exact | fast: the state file (written by `kindi head`) wins over the config."""
@@ -171,8 +237,8 @@ class Kindi(object):
         from .gemma4_chat import render as render_gemma
         from . import gemma4_tools
         cfg=self.cfg; messages=gemma4_tools.prepare_messages(req.get("messages") or [])
-        tools=req.get("tools") or None
-        if req.get("tool_choice")=="none": tools=None
+        from . import oai
+        tools,_=oai.check(req,can_force=False)       # #38: a forced call or a JSON schema gets a 400, not free text
         kw=dict(req.get("chat_template_kwargs") or {})
         kw["enable_thinking"]=bool(kw.get("enable_thinking",req.get("enable_thinking",False)))
         kw["conversational_mode"]=bool(kw.get("conversational_mode",False))
@@ -331,8 +397,8 @@ class Kindi(object):
         """after a request has been answered, on the engine thread: queue the end-of-turn state for disk.
         locked: the caller holds self.lock already (the stream generator)."""
         r = getattr(self, "runner", None)
-        if r is None or not hasattr(r, "turn_end"):
-            return
+        if r is None or not hasattr(r, "turn_end") or getattr(self, "slot_views", None):
+            return                                   # (decode slots: each slot saves its turn before it is freed)
         if locked:
             r.turn_end()
         else:
@@ -344,7 +410,9 @@ class Kindi(object):
         drafts and how many were accepted"""
         last = getattr(self, "last_spec", None)
         out = {"enabled": False, "method": None, "drafter": None, "last": None}
-        if self.nanbeige is not None:
+        if self.nanbeige is not None and hasattr(self.nanbeige, "drafting"):
+            out.update(self.nanbeige.drafting())
+        elif self.nanbeige is not None:
             m = [n for n, on in (("lookup", int(self.cfg.get("lookup") or 0) > 0),
                                  ("mtp", bool(self.cfg.get("mtp_head")))) if on]
             out.update(enabled=bool(m), method="+".join(m) or None)
@@ -361,6 +429,13 @@ class Kindi(object):
 
     def progress(self):
         """the request being served: phase, tokens reused, read and to read, generated"""
+        if getattr(self, "slot_views", None):
+            act = [v for v in self.slot_views if v.busy["active"]]
+            if not act:
+                return None
+            p = act[0].progress()
+            p["slots_busy"] = len(act)
+            return p
         b = self.busy
         if not b["active"]:
             return None
@@ -377,10 +452,12 @@ class Kindi(object):
             return (yield from self._generate_gemma(req, cancel))
         cfg = self.cfg
         messages = req.get("messages") or []
-        tools = req.get("tools") or None
-        if req.get("tool_choice") == "none":
-            tools = None
+        from . import oai
+        tools, force = oai.check(req, can_force=True)   # #38: tool_choice and response_format are honoured or refused
         think = bool((req.get("chat_template_kwargs") or {}).get("enable_thinking", req.get("enable_thinking", False)))
+        if force is not None:
+            think = False                                # a forced call is the whole reply: no thinking block first
+        forced = oai.forced_call_prefix(force) if force is not None else ""
         budget = req.get("thinking_budget_tokens") or req.get("thinking_budget") or cfg.get("thinking_budget") or 0
         budget = int(budget) if think else 0
         g = lambda k, d: d if req.get(k) is None else req.get(k)  # noqa: E731
@@ -402,7 +479,7 @@ class Kindi(object):
         body, gp = chat.render(messages, tools, think, variant=self.variant, reasoning_effort=effort,
                                preserve_thinking=kw.get("preserve_thinking"))
         Tb = self.tok.encode(body)
-        T = Tb + self.tok.encode(gp)
+        T = Tb + self.tok.encode(gp + forced)             # a forced call: the reply starts with the call's opening
         ctx = self.eng.ctx
         if len(T) + 1 >= ctx:
             raise ContextOverflow(len(T), ctx)
@@ -439,7 +516,9 @@ class Kindi(object):
             else:                                              # speculative decoding (KINDI_SPEC), min-p included
                 self.eng.spec_begin(temperature <= 0, temperature, top_p, top_k, rng, min_p)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        text, gen, finish = "", [], "length"
+        text, gen, finish = forced, [], "length"
+        if forced:
+            yield "text", forced                          # so a stream holds the call back as it does for a written one
         # while thinking, pieces go out as ("reasoning", ...) - the last 8 characters are held back in case they are
         # the start of "</think>"; after it, as ("text", ...)
         st = {"think": think, "sent": 0, "forced": False, "lead": think}
@@ -640,15 +719,48 @@ class _Yield(object):
         self.cancel.set()
 
 
+# the speeds of the last finished request, for /health (Kindi Monitor and Bridge read them)
+LAST = {}
+
+
+def _note_last(info, t0, t_first):
+    """the "done" info of a request -> LAST: prompt and write speeds. The engines that report "timing" give their
+    own; the others are timed here (from the start of the request to its first piece, then to its end)."""
+    now = time.time()
+    u = info.get("usage") or {}
+    tm = info.get("timing") or {}
+    n = int(u.get("completion_tokens") or 0)
+    new = int(tm.get("prompt_new_tokens", int(u.get("prompt_tokens") or 0) -
+                     int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)))
+    if tm:
+        ps, gs, wt = float(tm.get("prompt_s") or 0), float(tm.get("gen_s") or 0), float(tm.get("gen_tok_s") or 0)
+    else:
+        tf = t_first or now
+        ps, gs = max(0.0, tf - t0), max(0.0, now - tf)
+        wt = (n - 1) / gs if n > 1 and gs > 0 else 0.0
+    LAST.clear()
+    LAST.update(prompt_tokens=int(u.get("prompt_tokens") or 0), prompt_new=new, tokens=n,
+                prompt_s=round(ps, 3), write_s=round(gs, 3), prompt_tps=round(new / ps, 1) if ps > 0 and new > 0 else 0.0,
+                write_tps=round(wt, 2), finished=round(now, 1))
+
+
 def run_generate(K, req, cancel, prio):
     """K.generate with the priority classes: a background request that yields to chat requests runs them here, then
     starts again (from the prompt cache). Yields what K.generate yields."""
     while True:
-        c = _Yield(cancel, K) if prio >= PRIO_BACKGROUND else cancel
+        # (decode slots: requests do not wait for one another, so a background request does not yield)
+        c = _Yield(cancel, K) if prio >= PRIO_BACKGROUND and getattr(K, "slot", None) is None else cancel
         done = False
+        t0, t_first = time.time(), None
         for item in K.generate(req, c):
+            if t_first is None and item[0] in ("text", "reasoning"):
+                t_first = time.time()
             if item[0] == "done":
                 done = True
+                try:
+                    _note_last(item[1], t0, t_first)
+                except Exception:  # noqa: BLE001 - telemetry only
+                    pass
             yield item
         if done or cancel.is_set() or not getattr(c, "fired", False):
             return
@@ -689,31 +801,82 @@ def create_app(cfg, log=print):
     from fastapi.responses import JSONResponse, StreamingResponse
 
     K = GPU_THREAD.submit(_make_engine, cfg, log).result()
+    if getattr(K, "slot_views", None):
+        # decode slots: one engine thread per slot (and one for the turn saves); each thread makes its own cuBLAS
+        # handle at its first use (the tensor-core plans do not use cuBLAS)
+        globals()["GPU_THREAD"] = concurrent.futures.ThreadPoolExecutor(max_workers=len(K.slot_views) + 1,
+                                                                        thread_name_prefix="kindi-slot")
     model_id = cfg["model_name"]
     app = FastAPI(title="Kindi", version=__version__)
 
     def _err(code, msg, typ="invalid_request_error"):
         return JSONResponse({"error": {"message": msg, "type": typ, "code": typ}}, status_code=code)
 
+    def _bad(e):
+        """a ValueError of a request as HTTP 400; an oai.RequestError also names the field (#38)"""
+        p = getattr(e, "param", None)
+        if p:
+            return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error", "param": p,
+                                           "code": "unsupported_" + p}}, status_code=400)
+        return _err(400, str(e))
+
     def _auth(request):
         key = cfg["api_key"]
         return not key or request.headers.get("authorization", "") == "Bearer " + key
 
+    on_gpu = K.cp is not None and os.environ.get("KINDI_DEVICE", "gpu") != "cpu"
+    card = {}
+    if on_gpu:   # the card this server runs on, so a monitor can match it with NVML (CUDA_VISIBLE_DEVICES renumbers)
+        try:
+            dev = K.cp.cuda.Device()
+            card["gpu_pci"] = str(dev.pci_bus_id).lower()
+            u = bytes(K.cp.cuda.runtime.getDeviceProperties(dev.id).get("uuid", b"") or b"")[:16]
+            if len(u) == 16:
+                h = u.hex()
+                card["gpu_uuid"] = "GPU-%s-%s-%s-%s-%s" % (h[:8], h[8:12], h[12:16], h[16:20], h[20:])
+        except Exception:  # noqa: BLE001 - telemetry only
+            pass
+
+    def _busy(b):
+        if not b["active"]:
+            return None
+        return {"phase": b["phase"], "elapsed_s": round(time.time() - b["started"]),
+                "prompt_tokens": b["prompt_tokens"], "reused": b["cached"],
+                "prompt_read": "%d/%d" % (b["read"], b["prompt_tokens"] - b["cached"]), "generated": b["generated"]}
+
+    mem = [0.0, 0, 0]   # (time, free, total): memGetInfo at most once a second, however often /health is asked
+
     @app.get("/health")
     def health():
         free = total = 0
-        if K.cp is not None and os.environ.get("KINDI_DEVICE", "gpu") != "cpu":
-            free, total = K.cp.cuda.runtime.memGetInfo()
-        b = K.busy
-        busy = None
-        if b["active"]:
-            busy = {"phase": b["phase"], "elapsed_s": round(time.time() - b["started"]),
-                    "prompt_tokens": b["prompt_tokens"], "reused": b["cached"],
-                    "prompt_read": "%d/%d" % (b["read"], b["prompt_tokens"] - b["cached"]), "generated": b["generated"]}
-        return {"ok": True, "kindi": __version__, "commit": COMMIT, "model": model_id, "ctx": K.eng.ctx, "head": K.head_active(),
-                "uptime_s": round(time.time() - K.t0), "busy": busy, "stats": K.stats, "drafting": K.drafting(),
-                "queue": dict(SCHED.counts(), yields=getattr(K, "yields", 0)),
-                "gpu_free_mib": round(free / 1048576.0), "gpu_total_mib": round(total / 1048576.0)}
+        if on_gpu:
+            now = time.time()
+            if now - mem[0] >= 1.0:
+                mem[1], mem[2] = K.cp.cuda.runtime.memGetInfo()
+                mem[0] = now
+            free, total = mem[1], mem[2]
+        views = getattr(K, "slot_views", None) or [K]
+        each = [_busy(v.busy) for v in views]
+        busy = next((e for e in each if e), None)
+        return dict({"ok": True, "kindi": __version__, "commit": COMMIT, "model": model_id, "ctx": K.eng.ctx,
+                     "head": K.head_active(), "uptime_s": round(time.time() - K.t0), "busy": busy, "stats": K.stats,
+                     "drafting": K.drafting(), "queue": dict(SCHED.counts(), yields=getattr(K, "yields", 0)),
+                     "slots": {"n": len(views), "busy": sum(1 for e in each if e),
+                               "each": [e or {"phase": "idle"} for e in each]},
+                     "last": dict(LAST) or None,
+                     "gpu_free_mib": round(free / 1048576.0), "gpu_total_mib": round(total / 1048576.0),
+                     "device": "gpu" if on_gpu else "cpu"}, **card, **{k: v for k, v in _extra().items()
+                                                                      if k not in card})
+
+    def _extra():
+        """a backend's own /health fields (Flash-Next: its card fields, PyTorch not CuPy, and the expert numbers)"""
+        f = getattr(K.nanbeige, "health_extra", None)
+        if f is None:
+            return {}
+        try:
+            return dict(f())
+        except Exception:  # noqa: BLE001 - telemetry only
+            return {}
 
     def _overflow(e):
         return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error", "param": "messages",
@@ -790,7 +953,7 @@ def create_app(cfg, log=print):
                         "usage": {"prompt_tokens": e.n, "completion_tokens": 0, "total_tokens": e.n}}
             return _overflow(e)
         except ValueError as e:
-            return _err(400, str(e))
+            return _bad(e)
         except Exception:  # noqa: BLE001 - anything else: the request itself reports it
             ids = None
         if dry:
@@ -819,12 +982,20 @@ def create_app(cfg, log=print):
 
         if req.get("stream"):
             def sse():
-                with K.lock:
+                V = K.acquire(req)
+                try:
+                    for item in _sse(V):
+                        yield item
+                finally:
+                    K.release(V)
+
+            def _sse(V):
+                with V.lock:
                     mine["started"] = True
                     yield chunk({"role": "assistant", "content": ""})
                     held, in_call = "", False
                     try:
-                        for kind, val in run_generate(K, req, cancel, prio):
+                        for kind, val in run_generate(V, req, cancel, prio):
                             if kind == "reasoning":
                                 yield chunk({"reasoning_content": val})
                             elif kind == "text":
@@ -861,10 +1032,10 @@ def create_app(cfg, log=print):
                         yield "data: " + json.dumps({"error": {"message": str(e), "type": "invalid_request_error"}}) + "\n\n"
                     except Exception as e:
                         yield "data: " + json.dumps({"error": {"message": "kindi: %s" % e, "type": "server_error"}}) + "\n\n"
-                        _after_engine_error(K, e)
+                        _after_engine_error(V, e)
                     yield "data: [DONE]\n\n"
                     if not cancel.is_set():
-                        K.after_turn(locked=True)     # the client has its answer; the next request waits for this
+                        V.after_turn(locked=True)     # the client has its answer; the next request waits for this     # the client has its answer; the next request waits for this
             async def relay():
                 # the generator runs in a worker thread; if the client disconnects, Starlette cancels this
                 # coroutine, the finally sets `cancel`, and the engine stops at its next token
@@ -898,13 +1069,19 @@ def create_app(cfg, log=print):
             return StreamingResponse(relay(), media_type="text/event-stream")
 
         def run():
-            with K.lock:
-                mine["started"] = True
-                info = None
-                for kind, val in run_generate(K, req, cancel, prio):
-                    if kind == "done":
-                        info = val
-                return info
+            V = K.acquire(req)
+            try:
+                with V.lock:
+                    mine["started"] = True
+                    info = None
+                    for kind, val in run_generate(V, req, cancel, prio):
+                        if kind == "done":
+                            info = val
+                    if V is not K and info is not None and not cancel.is_set():
+                        V.after_turn(locked=True)     # (a slot saves its turn before another request takes it)
+                    return info
+            finally:
+                K.release(V)
 
         def answer(info):
             msg = {"role": "assistant",

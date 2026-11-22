@@ -12,8 +12,9 @@ import time
 import numpy as np
 try:
     import cupy as cp
-except ImportError:                   # a CPU-only host (KINDI_DEVICE=cpu)
-    cp = None
+    _CP_ERR = None
+except ImportError as _e:             # a CPU-only host (KINDI_DEVICE=cpu), or no GPU in the container
+    cp, _CP_ERR = None, _e
 
 
 def _cupy_arch_fix():
@@ -449,13 +450,48 @@ class Engine(object):
         return out
 
 
-PLAN_SMALL_HIP = ("gfx1151",)      # the AMD GPUs where the 2B / 4B / 9B take the plan engine (measured)
+PLAN_SMALL_HIP = ("gfx1151", "gfx1030")   # the AMD GPUs where the 2B / 4B / 9B take the plan engine (measured)
+
+
+def tc_hp_for(man):
+    """The activation precision the plan engine should use for this pack: "1", or None to leave the
+    environment alone.
+
+    A pack folded with Hadamard block 4096 (the 9B here) passes the tensor-core verify 4/4 only with the
+    high-precision activations (about 14 bits instead of 8, same weight traffic); with the default ones one
+    borderline prompt flips at token 36 (3/4), which is why `kindi/spec.py` refuses HB 4096 without them.
+    Measured on the RTX 4060 Ti: 9B 4/4 at 122.6 tok/s against 74.6-80.0 on the plain engine. So for those
+    packs the exact setting is the default rather than a flag every user has to find. An explicit
+    `KINDI_TC_HP` always wins, including `0` (which then stops with the measured explanation).
+
+    It is read once, when `kindi.spec` is imported, and caps the verify pass at T = 4, so a process that
+    loads an HB-4096 pack first keeps that cap for any later pack.
+    """
+    if os.environ.get("KINDI_TC", "0") != "1" or "KINDI_TC_HP" in os.environ:
+        return None
+    try:
+        hb = int(man.get("hadamard_block", 512))
+    except (TypeError, ValueError):
+        return None
+    return "1" if hb == 4096 else None
 
 
 def make_engine(pack, ctx=4096, clusters=None, log=print):
     """Engine on one GPU, or the two-card tensor parallel engine (kindi.tp) when the weights do not fit one card and
     two GPUs are present. KINDI_TP=1 / 0 forces the choice."""
+    from .packcheck import check, PackError
+    try:
+        check(pack, "size")                 # B16: a pack file that changed size after kindi convert stops here
+    except PackError as e:
+        raise SystemExit("kindi: %s" % e)
     if os.environ.get("KINDI_DEVICE", "gpu") == "cpu" or cp is None:
+        if os.environ.get("KINDI_DEVICE", "gpu") != "cpu":
+            # B11: a container started without --gpus has no CUDA driver library, CuPy does not load, and the server
+            # ran on the CPU without a word. Say so (KINDI_DEVICE=cpu, as the installer sets for the CPU, is quiet).
+            why = str(_CP_ERR).splitlines()[0][:160] if _CP_ERR and str(_CP_ERR) else "CuPy is not installed"
+            log("WARNING: no GPU is visible (%s). Kindi runs on the CPU engine, much slower. In Docker, start the "
+                "container with --gpus all (NVIDIA) or the AMD devices, also when you publish the port to the "
+                "network; set KINDI_DEVICE=cpu to use the CPU on purpose" % why)
         from .cpu import Engine as CPUEngine
         if clusters is not None:
             log("the fast head is not available on the CPU: exact head")
@@ -471,12 +507,18 @@ def make_engine(pack, ctx=4096, clusters=None, log=print):
     # head, Hadamard blocks of 1024, q8_0 K/V)
     plan_model = dims.get("heads", 8) != 4 * dims.get("kv_heads", 2) or int(man.get("hadamard_block", 512)) == 1024
     # AMD GPUs with many CUs (Strix Halo, gfx1151): the 2B, 4B and 9B (512- and 4096-point folds) also run faster on
-    # the plan engine's 5-trit products (2B write 173 -> 259, 9B 52 -> 89 tokens/s); measured there only
+    # the plan engine's 5-trit products (2B write 173 -> 259, 9B 52 -> 89 tokens/s); the Radeon PRO W6800 (gfx1030,
+    # 60 CUs): 2B write 209 -> 253, read 2,164 -> 4,463 tokens/s at 512
     if cp.cuda.runtime.is_hip and int(man.get("hadamard_block", 512)) in (512, 4096) and not two:
         arch = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id).get("gcnArchName", b"")
         arch = (arch.decode() if isinstance(arch, bytes) else str(arch)).split(":")[0]
         plan_model = plan_model or arch in PLAN_SMALL_HIP
     if force == "1" or (force != "0" and (plan_model or (two and weights > 0.9 * cp.cuda.runtime.memGetInfo()[1]))):
+        hp = tc_hp_for(man)
+        if hp is not None:
+            os.environ["KINDI_TC_HP"] = hp         # before kindi.spec is imported: it reads this once
+            log("Hadamard block 4096: high-precision activations on (measured 4/4 at 122 tok/s; "
+                "KINDI_TC_HP=0 asks for the default activations, measured 3/4)")
         from .tp import TPEngine
         from . import spec
         spec.install(log)                       # KINDI_TC=1: tensor-core plans (one sm_80+ card); no-op otherwise

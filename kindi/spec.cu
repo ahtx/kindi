@@ -4,14 +4,16 @@
    as it was; once the accepted count n is known, the commit kernels advance the state by the first n tokens from
    the inputs the verify pass kept (per layer), so the state is exactly that of n one-token steps. */
 
-extern "C" __global__ void k_sgdn_pre_T(const float* __restrict__ xn, int ldxn, const unsigned short* __restrict__ bw,
+__device__ __forceinline__ void sgdn_pre(const float* __restrict__ xn, int ldxn, const unsigned short* __restrict__ bw,
     const unsigned short* __restrict__ aw, const float* __restrict__ dtb, const float* __restrict__ ssma,
     float* __restrict__ beta, float* __restrict__ g, int ldg, int n,
     const float* __restrict__ qkv, int ldqkv, float* __restrict__ conv, const float* __restrict__ cw,
-    float* __restrict__ cs, int ldcs, float* __restrict__ qk, int ldqk, int C, int NV, int NK, int HK, int T, int wb){
+    float* __restrict__ cs, int ldcs, float* __restrict__ qk, int ldqk, int C, int NV, int NK, int HK, int T, int wb,
+    int by){
+  /* by: the block's token row (blockIdx.y in k_sgdn_pre_T, 0 in k_sgdn_pre_R) */
   const int b = blockIdx.x, t = threadIdx.x;
   if(b < NV){
-    const int tok = blockIdx.y;
+    const int tok = by;
     if(tok >= T) return;
     __shared__ float sb[256];
     __shared__ float sa[256];
@@ -36,7 +38,7 @@ extern "C" __global__ void k_sgdn_pre_T(const float* __restrict__ xn, int ldxn, 
     }
     return;
   }
-  if(blockIdx.y) return;
+  if(by) return;
   const bool qkh = b < NV + 2 * NK;
   int c;
   bool act;
@@ -72,6 +74,15 @@ extern "C" __global__ void k_sgdn_pre_T(const float* __restrict__ xn, int ldxn, 
     if(act) qk[(long long)tok * ldqk + (b - NV) * HK + t] = row[t] * scl;
   }
   if(act && wb){ conv[c] = c0; conv[C + c] = c1; conv[2 * C + c] = c2; }
+}
+
+extern "C" __global__ void k_sgdn_pre_T(const float* __restrict__ xn, int ldxn, const unsigned short* __restrict__ bw,
+    const unsigned short* __restrict__ aw, const float* __restrict__ dtb, const float* __restrict__ ssma,
+    float* __restrict__ beta, float* __restrict__ g, int ldg, int n,
+    const float* __restrict__ qkv, int ldqkv, float* __restrict__ conv, const float* __restrict__ cw,
+    float* __restrict__ cs, int ldcs, float* __restrict__ qk, int ldqk, int C, int NV, int NK, int HK, int T, int wb){
+  sgdn_pre(xn, ldxn, bw, aw, dtb, ssma, beta, g, ldg, n, qkv, ldqkv, conv, cw, cs, ldcs, qk, ldqk, C, NV, NK, HK, T, wb,
+           blockIdx.y);
 }
 
 extern "C" __global__ void k_sconv_C(float* __restrict__ conv, const float* __restrict__ qkv, int ldqkv, int C,
@@ -274,4 +285,48 @@ extern "C" __global__ void __launch_bounds__(1024) k_xsum_T(
     v.x += a; v.y += bb; v.z += c; v.w += d;
     *(float4*)(out + e) = v;
   }
+}
+
+/* ------------------------------------------------------------------ decode slots (slots.py): all rows in one launch */
+/* A batched pass of the decode slots runs, per row r, the one-token launches on row r's own state. These kernels do
+   the rows of one such launch at once: blockIdx.z (pre) or blockIdx.y (the others) is the row, ptab[j * R + r] row
+   r's pointer j, rv[r] its position, rv[2 R + r] its GDN write-back flag. Each row runs the one-token code itself
+   (sgdn_pre with T = 1, sgdn_deltan, d_k_rope2, d_k_store_q8), so every row's result is that of its own launch. */
+#define SLOT_P(T_, j) reinterpret_cast<T_>(ptab[(j) * R + r])
+extern "C" __global__ void k_sgdn_pre_R(const unsigned long long* __restrict__ ptab, const int* __restrict__ rv, int R,
+    int ldxn, const unsigned short* __restrict__ bw, const unsigned short* __restrict__ aw, const float* __restrict__ dtb,
+    const float* __restrict__ ssma, int ldg, int n, int ldqkv, const float* __restrict__ cw, int ldcs, int ldqk, int C,
+    int NV, int NK, int HK){
+  const int r = blockIdx.z;
+  sgdn_pre(SLOT_P(const float*, 0), ldxn, bw, aw, dtb, ssma, SLOT_P(float*, 1), SLOT_P(float*, 2), ldg, n,
+           SLOT_P(const float*, 3), ldqkv, SLOT_P(float*, 4), cw, SLOT_P(float*, 5), ldcs, SLOT_P(float*, 6), ldqk,
+           C, NV, NK, HK, 1, rv[2 * R + r], 0);
+}
+
+extern "C" __global__ void __launch_bounds__(128) k_sgdn_deltan_R(const unsigned long long* __restrict__ ptab,
+    const int* __restrict__ rv, int R, int ldqk, int ldv, int ldg, const float* __restrict__ nw, int ldo, float scale,
+    int n_k_heads){
+  const int r = blockIdx.y;
+  sgdn_deltan(SLOT_P(float*, 0), SLOT_P(const float*, 1), SLOT_P(const float*, 2), ldqk, SLOT_P(const float*, 3), ldv,
+              SLOT_P(const float*, 4), SLOT_P(const float*, 5), ldg, nw, SLOT_P(float*, 6), ldo, scale, n_k_heads, 1,
+              rv[2 * R + r]);
+}
+
+/* RoPE of row r at its position: q, k, qo, ko are pointers 0 .. 3; cos and sin rows at rv[r] (rd floats each) */
+extern "C" __global__ void k_rope2_R(const unsigned long long* __restrict__ ptab, const int* __restrict__ rv, int R,
+    const float* __restrict__ cs0, const float* __restrict__ sn0, int rd, int nq, int HD){
+  const int r = blockIdx.y;
+  const long long p = rv[r];
+  d_k_rope2(SLOT_P(const float*, 0), SLOT_P(const float*, 1), cs0 + p * rd, sn0 + p * rd, SLOT_P(float*, 2),
+            SLOT_P(float*, 3), nq, HD);
+}
+
+/* the K/V store of row r at its position: k, v are pointers 0, 1; row r's caches kq, kd, vq, vd pointers 2 .. 5 */
+extern "C" __global__ void k_store_q8_R(const unsigned long long* __restrict__ ptab, const int* __restrict__ rv, int R,
+    int L, int nblk){
+  const int r = blockIdx.y;
+  const long long p = rv[r];
+  d_k_store_q8(SLOT_P(const float*, 0), SLOT_P(const float*, 1), SLOT_P(signed char*, 2) + p * L,
+               SLOT_P(unsigned short*, 3) + p * nblk, SLOT_P(signed char*, 4) + p * L,
+               SLOT_P(unsigned short*, 5) + p * nblk, nblk);
 }

@@ -1,0 +1,10 @@
+# The Python packages of the native Windows runtime (windows/package.ps1). The versions are the set that B6 tested
+# on Windows (numpy below 2 with CuPy 13) and the web packages of the ROCm images. `package.ps1 -Lock` resolves this
+# file for CPython 3.12 on win_amd64 and writes runtime.lock with the sha256 of every wheel.
+numpy==1.26.4
+fastrlock==0.8.3
+cupy-cuda12x==13.6.0
+nvidia-cuda-nvrtc-cu12==12.9.86
+fastapi==0.115.6
+uvicorn==0.32.1
+nvidia-cuda-runtime-cu12==12.9.79

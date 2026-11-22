@@ -55,6 +55,14 @@ class G4Cache(object):
         return out
 
     @staticmethod
+    def _give_back():
+        """dropped host copies go back to the OS. A dropped cupyx.empty_pinned buffer returns to CuPy's pinned pool,
+        which reuses a block only for a request of the same size and never frees it by itself, so the server grew with
+        every parked conversation and checkpoint (#44). cache._recycle does the same for the 27B's checkpoints."""
+        import cupy as cp
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+
+    @staticmethod
     def _to_host(a):
         """an asynchronous copy of a device array into pinned host memory, in stream order (a later copy back on the
         same stream sees it complete), so the prompt does not wait for it"""
@@ -131,6 +139,8 @@ class G4Cache(object):
                 self._rings_set(snap)
             self.log("prompt cache: conversation of %d tokens back from host memory, %d positions reused"
                      % (len(P["tokens"]), p))
+            del P, snap
+            self._give_back()                 # its copies are on the card now; the ones dropped by parking are free
             return p
         if here < 0.5 * len(self.tokens) and len(self.tokens) >= 1024:
             self._park_active(ids)
@@ -138,7 +148,10 @@ class G4Cache(object):
         if snap is not None:
             self._rings_set(snap)
         self.tokens = list(self.tokens[:here])
+        n = len(self.ckpts)
         self.ckpts = [c for c in self.ckpts if c[0] <= here]
+        if len(self.ckpts) < n:
+            self._give_back()
         return here
 
     def _park_active(self, ids):
@@ -148,16 +161,22 @@ class G4Cache(object):
             return
         ck = self.ckpts + ([(n, self._rings_host())] if not self.ckpts or self.ckpts[-1][0] != n else [])
         self.parked.append({"tokens": list(self.tokens), "globals": self._globals_host(n), "ckpts": ck[-self.ckpt_max:]})
+        dropped = len(self.parked) > self.park_max or len(ck) > self.ckpt_max
         del self.parked[:-self.park_max]
+        del ck
         self.log("prompt cache: conversation of %d tokens parked in host memory (%d parked)" % (n, len(self.parked)))
         self.tokens, self.ckpts = [], []
+        if dropped:
+            self._give_back()
 
     def advanced(self, tokens, checkpoint=False):
         """the card now holds tokens (call after each prompt batch, at the prompt's end and after generated tokens)"""
         self.tokens = list(tokens)
         if checkpoint and self.on and (not self.ckpts or self.ckpts[-1][0] < len(tokens)):
             self.ckpts.append((len(tokens), self._rings_host()))
-            del self.ckpts[:-self.ckpt_max]
+            if len(self.ckpts) > self.ckpt_max:
+                del self.ckpts[:-self.ckpt_max]
+                self._give_back()
 
     def append(self, token):
         self.tokens.append(token)

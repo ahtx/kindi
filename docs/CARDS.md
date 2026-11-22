@@ -2,9 +2,10 @@
 
 The installer ([INSTALL.md](INSTALL.md)) uses these settings. It selects them from the cards that it finds.
 
-Blocking sync (`KINDI_BLOCKING_SYNC`, on by default) lets the host thread sleep while it waits for the card. It
-costs 2-3% of the decode speed on the GTX 1080. With one server on its own card, set `KINDI_BLOCKING_SYNC=0`
-(the installer does this). The RTX 3080 profile keeps it on: there, many servers share few CPU cores.
+Blocking sync (`KINDI_BLOCKING_SYNC`) lets the host thread sleep while it waits for the card. It costs 2-3% of the
+decode speed on the GTX 1080 and 5 to 15% of the write speed on the NVIDIA 580 driver. It is on by default before the
+580 driver and off from 580 on. With one server on its own card, set `KINDI_BLOCKING_SYNC=0` (the installer does
+this). The RTX 3080 profile sets it to 1: there, many servers share few CPU cores.
 
 This page gives the settings for each tested card. It also gives the speeds that we measured with these settings.
 All the cards use the same Docker image (CUDA 10.2, CuPy 9.6). The `kindi` folder of this repository is the code.
@@ -19,6 +20,26 @@ docker run -d --name kindi --restart unless-stopped --gpus all -u $(id -u):$(id 
 ```
 
 Replace `...` with the variables in the section for your card. To use one card of two, set `--gpus device=N`.
+
+## Will my card work?
+
+One line per card family. "Measured" means our measurements or a user report on this page; nothing here is
+estimated. The card memory that each model needs at the installer's default context (`kindi models` shows it for
+your machine): 2B 0.9 GB, 4B 1.9 GB, 9B 3.8 GB, Nemotron E4B 3.3 GB, Nemotron Lightning 30B 5.8 GB (less with experts
+in host memory), 27B 7.6 GB on one card or 3.8 GB on each of two, AH-Nanbeige4.3-33B 16.2 GB on one card or about
+17 GB over several. A larger card gives the same model a longer context.
+
+| family | compute capability | cards measured (memory) | largest model measured | notes |
+|---|---|---|---|---|
+| Kepler | 3.0, 3.5 | Quadro K420 (1 GB, 2 GB), Quadro K6000 (12 GB) | 27B on the K6000; 4B on 2 GB; 2B on 1 GB | the NVIDIA 470 driver |
+| Maxwell | 5.0, 5.2 | Quadro K1200 (4 GB), Quadro M5000 (8 GB, user report) | 27B on the M5000 (24K to 28K context); 9B on 4 GB; 27B on two K1200 | |
+| Pascal | 6.0, 6.1 | GeForce GTX 1080 (8 GB), GTX 1070 (8 GB, user report), Tesla P100 (16 GB) | 27B on 8 GB; AH-Nanbeige4.3-33B on two P100 | |
+| Volta | 7.0 | Tesla V100 (16 GB and 32 GB), V100S (32 GB, user report) | AH-Nanbeige4.3-33B on one V100 32 GB; 27B on 16 GB at 65,536 context | |
+| Turing | 7.5 | GeForce GTX 1650 SUPER (4 GB, user report), RTX 2060 (12 GB) | Nemotron Lightning 30B on the RTX 2060 12 GB; 9B on 4 GB | |
+| Ampere | 8.0, 8.6 | RTX 3080 (10 GB), RTX 3060 (12 GB), RTX 3090 (24 GB), CMP 170HX (40 GB) | AH-Nanbeige4.3-33B on one CMP 170HX or two RTX 3080; 27B and Lightning 30B on 10 GB | the tensor-core path and speculative decoding start here |
+| Ada, Blackwell | 8.9, 12.0 | RTX 40 and 50 series | supported, `kindi verify` passes | no speed numbers yet |
+| AMD RDNA 3, 3.5 | gfx1103, gfx1152, gfx1151 | Radeon 780M, 840M, 8060S (graphics in the processor, host memory) | 27B on all three | the `kindi-rocm` images ([AMD.md](AMD.md)) |
+| CPU | x86-64 with AVX2 | | 9B | the CPU engine (`KINDI_DEVICE=cpu`) |
 
 ## Quadro K420, 1 GB (Kepler, sm_30)
 
@@ -102,6 +123,22 @@ Replace `...` with the variables in the section for your card. To use one card o
   (a driver change that Kindi does not need or support), the 27B got 66,560 tokens. `kindi verify` passed in both
   modes, and the write speed was the same (22.0 to 22.9 tokens/s). Report: epscheel (GitHub), issue #33.
 
+## GeForce GTX 1070, 8 GB (Pascal, sm_61): user report
+
+| item | value |
+|---|---|
+| model | 27B (Kindi 0.6.0, exact head) |
+| card and computer | GTX 1070 8 GB, driver 582.78, no monitor on the card; Core i5-8500, 16 GB; Windows 11, native (no WSL) |
+| generation, 27B, `kindi bench` | default settings: 20.4 tokens/s at position 100, 18.7 at 24K; with `KINDI_TC=1`: 27.7 and 23.0 |
+| prompt reading, 27B | 107 tokens/s at 530 tokens, 140 at 9.8K, 114 at 33K (Kindi 0.3.0, int8 prompt products, the default) |
+| context, 27B | 24,576 tokens by default; with `KINDI_TC=1`, 33,536 under the WDDM driver and 57,344 in TCC mode |
+
+- `kindi verify` passed (Kindi 0.2.0 and 0.3.0, 4 of 4).
+- The write speed is the same under the WDDM driver and in TCC mode; only the context changes.
+- Kindi ran natively on Windows with one local change: `nvcuda.dll` in place of `libcuda.so.1`. Kindi 0.7.0 loads
+  `nvcuda.dll` itself.
+- Report: epscheel (GitHub), issues #4 and #33. We did not measure this card ourselves.
+
 ## GeForce RTX 3080, 10 GB (Ampere, sm_86)
 
 | item | value |
@@ -135,6 +172,12 @@ reading 1,093 tokens/s at 512 to 855 at 22K.
 
 - With `KINDI_TC=1`, the server reads prompts in passes of up to `KINDI_TC_TMAX` tokens.
 - Speculative greedy output is the same as the output without speculation.
+- `KINDI_TC=1` is not token-exact with llama.cpp at near-ties (#31). Its products quantize each token's activations to
+  8 bits per 128 columns; the default path keeps them in fp32. On the 27B this moves the logits by 0.07 (median) and
+  at most 0.15 from the default path. `kindi verify` on an RTX 3080 then ends prompt 1 at token 14, where llama.cpp's
+  own top two differ by 0.0064, and the verify reports a tie. On other cards the first difference can come at token 5,
+  where llama.cpp's top two differ by 0.0105 and the default path's by 0.0123. `KINDI_TC_HP=1` (about 14 bits) moves
+  the logits by 0.010 (median) and passes `kindi verify` on all four prompts.
 - The cluster runs seven servers on one 4-core host with `--memory 6g`. One server on a computer of its own can use
   the default budgets.
 
@@ -169,6 +212,20 @@ bandwidth of 732 GB/s. Photo: GP100 chip of a Tesla P100, by Fritzchens Fritz, W
   41.3 tokens/s at that context; two 9B servers on one card gave 65.8 tokens/s in total (1.64 times one server).
   Report: scuderiapk (GitHub), issue #22.
 
+## Tesla V100, 16 GB (Volta, sm_70): user report
+
+| item | value |
+|---|---|
+| model | 27B (Kindi 0.6.0, exact head, context 65,536) |
+| card | Tesla V100-PCIE-16GB at 120 W, driver 550.163.01, in a desktop board |
+| generation, 27B | 48.2 tokens/s at 10K tokens of context, 43.6 at 20K, 39.9 at 30K, 35.0 at 40K, 32.4 at 50K |
+| prompt reading, 27B (new tokens) | about 228 tokens/s for a 44,285-token prompt, 187 for a 61,483-token prompt |
+
+- The card held the 27B with a 65,536-token context; about 8.3 GB of its memory was in use.
+- With prompts near 60K tokens, the container ran out of host memory and restarted; the card memory did not. Give the
+  container more memory (`--memory`) for long prompts.
+- Report: JugglerMaster (GitHub), issue #35. We did not measure this card ourselves.
+
 ## Tesla V100S, 32 GB (Volta, sm_70): user report
 
 | item | value |
@@ -179,7 +236,38 @@ bandwidth of 732 GB/s. Photo: GP100 chip of a Tesla P100, by Fritzchens Fritz, W
 | generation, 2B | about 160 to 170 tokens/s at all depths to 16K |
 
 - `kindi verify` passed. The card was capped at 185 W (its default is 250 W).
-- Report: vntgeai (GitHub), issue #25. We did not measure this card ourselves.
+- Report: vntgeai (GitHub), issue #25. We did not measure this card ourselves. Our own Volta measurements are in the
+  next section.
+
+## Tesla V100, 32 GB (Volta, sm_70)
+
+Measured on a 2x V100 32 GB test machine (SXM2, 300 W, NVIDIA 580 driver), Kindi 0.7.0-rc with CUDA 12.4 and
+CuPy 13.6. llama.cpp: build 900f01b, the same cards, the same GGUF file and the same prompt lengths (`llama-bench -ngl 99`).
+
+| item | value |
+|---|---|
+| `kindi verify` | 2B: passed (1 card). 27B: passed on 1 card and on 2 cards. 33B: passed on 1 card and on 2 cards (8 of 11 prompts token-exact, 3 at a llama.cpp tie) |
+| generation, 27B (1 card) | 56.4 tokens/s at position 100, 55.6 at 2K, 54.4 at 8K, 50.3 at 16K, 46.7 at 24K |
+| generation, 33B (1 card) | 45.2 tokens/s at a short context, 44.6 at 2K, 40.3 at 8K, 36.3 at 16K |
+
+Prompt reading of the 33B (AH-Nanbeige4.3-33B IQ3_XXS), tokens/s:
+
+| prompt tokens | Kindi 0.7.0, 1 card | llama.cpp, 1 card | Kindi 0.7.0, 2 cards | llama.cpp, 2 cards |
+|---:|---:|---:|---:|---:|
+| 512 | 566 | 624 | 751 | 631 |
+| 2,048 | 550 | 624 | 968 | 954 |
+| 8,192 | 548 | 566 | 1,015 | 1,004 |
+| 16,384 | 474 | 499 | 908 | 913 |
+
+- Volta has fp16 tensor cores but no int8 tensor-core instructions. Before 0.7.0 the 33B read the prompt in check
+  passes of 8 tokens on Volta: 144, 140, 123 and 106 tokens/s at these four lengths on one card. Kindi 0.7.0 has its
+  own Volta prompt path (`KINDI_NB_VOLTA`, see [CONFIGURATION.md](CONFIGURATION.md)).
+- The 33B's `kindi verify` failed on Volta before 0.7.0 (issue #25): the prompt "Once upon a time, ..." differed
+  from llama.cpp at token 27, where llama.cpp's top two tokens are 0.0839 apart. The check passes add the products
+  in a different order than a whole-prompt pass, and at such a close margin the order decides. The new prompt path
+  gives the same matrix products, bit for bit, as the sm_80 and later cards, and the prompt now ends at a llama.cpp
+  tie, as on those cards.
+- The 2B is too small to split over two cards.
 
 ## Quadro M5000, 8 GB (Maxwell, sm_52): user report
 
@@ -191,11 +279,25 @@ bandwidth of 732 GB/s. Photo: GP100 chip of a Tesla P100, by Fritzchens Fritz, W
 | context | Nemotron at its full 131,072 tokens; the 27B at 24K to 28K |
 
 - `kindi verify` passed on the 2B, 4B, 9B and 27B.
-- With the NVIDIA 580 driver, set `KINDI_BLOCKING_SYNC=0`: the default (blocking sync) cost 5 to 15% of the write
-  speed there (2B: 117 instead of 137 tokens/s). The 470 driver did not show this.
+- With the NVIDIA 580 driver, blocking sync cost 5 to 15% of the write speed (2B: 117 instead of 137 tokens/s). The
+  470 driver did not show this. Since 0.7.0 it is off by default on 580+ drivers.
 - The 580 driver also uses 29 MiB more card memory, so the 27B at 28,672 tokens was fitted down to 27,904.
 - Report: rojecas (GitHub), issue #30. Installers before 0.6.0 showed this card as sm_50 on the 470 driver; it is
   sm_52.
+
+## GeForce GTX 1650 SUPER, 4 GB (Turing, sm_75): user report
+
+| item | value |
+|---|---|
+| models | 2B, 4B, 9B (Kindi 0.3.0, a local Docker image, CUDA 10.2, driver 565.57.01, exact head, context 24,576) |
+| generation at 100 tokens | 2B 119.7, 4B 67.6, 9B 54.2 tokens/s |
+| generation at 16K | 2B 115.0, 4B 53.4, 9B 45.7 tokens/s |
+| prompt reading (`kindi bench`, one-token feeds) | 2B 143.1, 4B 76.5, 9B 61.6 tokens/s |
+| context (asked for 131,072, 96 MB reserve) | 2B 131,072; 4B 58,112; 9B 19,200 |
+
+- `kindi verify` passed on the 2B, 4B and 9B. CUDA showed 3,716 MiB, and the desktop ran on the card.
+- `kindi models` showed the 9B as too large for the card, but it loaded and passed at the smaller context.
+- Report: kidkal (GitHub), pull request #24. We did not measure this card ourselves.
 
 ## NVIDIA CMP 170HX, 40 GB (GA100, sm_80)
 

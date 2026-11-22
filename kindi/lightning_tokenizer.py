@@ -4,7 +4,12 @@ with the merges of the model file.
 Text is split on the control tokens first (token type 3: <|im_start|>, <|im_end|>, <SPECIAL_n>, ...), then each plain
 fragment goes through the pre-tokenizer pattern of the model's tokenizer.json (pretoken(), regex alternation
 semantics reproduced: no `regex` dependency). A piece that is itself in the vocabulary is one token (the BPE model
-has ignore_merges); other pieces go through the merges."""
+has ignore_merges); other pieces go through the merges.
+
+added_tags (B19): the tags the model's tokenizer.json lists as added tokens (Nemotron 3.5 Lightning: <think>,
+</think>, <tool_call>, </tool_call>, <tool_response>, </tool_response>, ids 12-17) are whole tokens in text, as the
+model was trained. Its GGUF marks them as normal tokens (type 1), so the type does not tell them apart; they are the
+tag-like vocabulary entries (<...>) that the merges cannot produce from their own text."""
 import re
 
 from .tokenizer import _B2U, _cat, bpe, gpt2_bytes
@@ -131,7 +136,11 @@ def pretoken(text):
 
 
 class LightningTokenizer(object):
-    def __init__(self, kv):
+    def __init__(self, kv, user_defined=False, added_tags=False):
+        """user_defined: the user-defined tokens (type 4) are whole tokens in text too, as the control tokens (type 3)
+        are. The Qwen3.8 GGUFs mark <think>, </think> and <tool_call> as type 4, and the model was trained on them as
+        one token each; split into text pieces (<th ink >), a thinking-off prompt ends in a sequence the model never
+        saw, and its first token is <|im_end|>."""
         self.vocab = kv["tokenizer.ggml.tokens"]
         self.types = kv["tokenizer.ggml.token_type"]
         self.sid = {s: i for i, s in enumerate(self.vocab)}
@@ -143,10 +152,17 @@ class LightningTokenizer(object):
         self.eos = int(kv.get("tokenizer.ggml.eos_token_id", 2))
         self.add_bos = bool(kv.get("tokenizer.ggml.add_bos_token", False))
         self.control = [s for s, t in zip(self.vocab, self.types) if t == 3]
-        alts = "|".join(re.escape(s) for s in sorted(self.control, key=len, reverse=True))
+        whole = self.control + ([s for s, t in zip(self.vocab, self.types) if t == 4] if user_defined else [])
+        self.cache = {}
+        self.added = []
+        if added_tags:              # tag-like normal tokens the merges never produce: added tokens (see the top)
+            tag = re.compile(r"^<[^<>\s]+>$")
+            self.added = [s for i, (s, t) in enumerate(zip(self.vocab, self.types))
+                          if t == 1 and tag.match(s) and self._plain(s) != [i]]
+            whole += self.added
+        alts = "|".join(re.escape(s) for s in sorted(whole, key=len, reverse=True))
         self.split_re = re.compile("(" + alts + ")")
         self.u2b = {v: k for k, v in _B2U.items()}
-        self.cache = {}
 
     def encode(self, text, special=True):
         out = [self.bos] if self.add_bos else []
@@ -157,14 +173,20 @@ class LightningTokenizer(object):
             if k % 2:
                 out.append(self.sid[part])
                 continue
-            for w in pretoken(part):
-                ids = self.cache.get(w)
-                if ids is None:
-                    b = gpt2_bytes(w)
-                    ids = [self.sid[b]] if b in self.sid else [self.sid.get(p, 0) for p in bpe(b, self.ranks)]
-                    if len(self.cache) < 200000:
-                        self.cache[w] = ids
-                out.extend(ids)
+            out.extend(self._plain(part))
+        return out
+
+    def _plain(self, text):
+        """the ids of text with no special tokens in it: pre-tokenizer pieces, then the merges"""
+        out = []
+        for w in pretoken(text):
+            ids = self.cache.get(w)
+            if ids is None:
+                b = gpt2_bytes(w)
+                ids = [self.sid[b]] if b in self.sid else [self.sid.get(p, 0) for p in bpe(b, self.ranks)]
+                if len(self.cache) < 200000:
+                    self.cache[w] = ids
+            out.extend(ids)
         return out
 
     def decode_bytes(self, i):

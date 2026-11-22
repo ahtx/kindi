@@ -1,1 +1,5 @@
 kindi/COMMIT export-subst
+# The install scripts are published byte for byte (the site and the release notes carry their sha256), so they are
+# checked out with LF on every OS, also with core.autocrlf=true.
+*.ps1 text eol=lf
+*.sh text eol=lf

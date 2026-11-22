@@ -67,6 +67,8 @@ def verify(cfg, man, log=print):
         return 2
     ref = json.load(open(rp))
     floor = noise_floor(ref)
+    # llama.cpp splits the added tags (<think>, ...: normal tokens in the GGUF) into text pieces; the reference ids are
+    # llama.cpp's, so the BPE and the template are checked with the same split. The server keeps the tags whole (B19).
     tok = LightningTokenizer(GGUF(man["model_path"]).kv)
     ok_tok = True
     for r in ref["prompts"]:

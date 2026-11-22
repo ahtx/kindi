@@ -85,31 +85,79 @@ class F16Kernels(object):
             setattr(self, n, m.get_function(n))
 
 
+def _cublas():
+    try:
+        from cupy_backends.cuda.libs import cublas
+    except ImportError:
+        from cupy.cuda import cublas
+    return cublas
+
+
+def _gemm16(h, R, n, K, W16, X16, ldx, C16):
+    """C16[n][R] = W16[R][K] x X16[n][K] (ldx) in fp16: the cublasGemmEx call of the fp16 prompt path"""
+    cublas = _cublas()
+    one, zero = np.array([1.0], np.float16), np.array([0.0], np.float16)
+    # cublasGemmEx's compute type: a cudaDataType before CUDA 11, a cublasComputeType_t since
+    ct = 64 if cp.cuda.runtime.runtimeGetVersion() >= 11000 else 2     # CUBLAS_COMPUTE_16F / CUDA_R_16F
+    R16 = 2                                                            # CUDA_R_16F
+    cublas.gemmEx(h, cublas.CUBLAS_OP_T, cublas.CUBLAS_OP_N, R, n, K, one.ctypes.data, W16, R16, K, X16, R16, ldx,
+                  zero.ctypes.data, C16, R16, R, ct, -1)
+
+
+_F16_OK = {}
+
+
+def f16_gemm_ok(card):
+    """(ok, reason): whether this card's cuBLAS runs the fp16 GEMM of the fp16 prompt path, at the shapes the path
+    uses (512 columns, 1 to a whole chunk of tokens); probed once per card. The CUDA 10.2 cuBLAS of the Docker image
+    answers CUBLAS_STATUS_NOT_SUPPORTED on an RTX 3080 (sm_86) from about 96 tokens on (16 tokens still run), which
+    crashed the prompt path when KINDI_P100_FP16_PROMPT=1 was set by hand."""
+    if card not in _F16_OK:
+        try:
+            with cp.cuda.Device(card):
+                T = max(512, int(os.environ.get("KINDI_CHUNK", "512") or 512))
+                R, K, ldx = 256, 512, 1024
+                W, X, Y = (cp.zeros(R * K, cp.float16), cp.zeros(T * ldx, cp.float16), cp.zeros(R * T, cp.float16))
+                h = cp.cuda.device.get_cublas_handle()
+                _cublas().setStream(h, 0)
+                for n in (1, 16, 97, T):
+                    _gemm16(h, R, n, K, W.data.ptr, X.data.ptr, ldx, Y.data.ptr)
+                cp.cuda.Device(card).synchronize()
+            _F16_OK[card] = (True, "")
+        except Exception as e:      # CUBLASError, CUDARuntimeError: the library cannot do the call here
+            _F16_OK[card] = (False, "%s: %s" % (type(e).__name__, e))
+    return _F16_OK[card]
+
+
+_f16_warned = set()
+
+
 def f16_prompt(card):
     """the fp16 prompt path (f16p.cu): on by default for sm_60 (Tesla P100); KINDI_P100_FP16_PROMPT=1 turns it on for any
-    card of sm_53 or later, =0 turns it off"""
+    card of sm_53 or later, =0 turns it off. A card whose cuBLAS cannot run the fp16 GEMM keeps the int8/fp32 path,
+    with a warning (once per card)."""
     if cp.cuda.runtime.is_hip:
         return False
     p = cp.cuda.runtime.getDeviceProperties(card)
     cc = p["major"] * 10 + p["minor"]
     v = os.environ.get("KINDI_P100_FP16_PROMPT", "")
-    return cc >= 53 and (v == "1" or (v != "0" and cc == 60))
+    if not (cc >= 53 and (v == "1" or (v != "0" and cc == 60))):
+        return False
+    ok, why = f16_gemm_ok(card)
+    if not ok and card not in _f16_warned:
+        _f16_warned.add(card)
+        print("kindi: the fp16 prompt path (KINDI_P100_FP16_PROMPT) is ignored on card %d (sm_%d): its cuBLAS cannot "
+              "run the fp16 GEMM (%s)" % (card, cc, why), flush=True)
+    return ok
 
 
 def _gemm_f16(s, Wt, R, C, X, ldx, Yb, ldy, quant, lane=False):
     """the plan step of one product on the fp16 path: Y[t][r] = sum over pieces of 512 columns of the fp16 GEMM of
     the piece, added in fp32 (f16p.cu). lane: Wt in the 5-trit lane layout (else the pl layout of tcp.cu)"""
-    try:
-        from cupy_backends.cuda.libs import cublas
-    except ImportError:
-        from cupy.cuda import cublas
+    cublas = _cublas()
     c = s.chunk
     F, X16, W16, C16 = c["F16"], c["X16"], c["W16"], c["C16"]
     NG = C // 128
-    one, zero = np.array([1.0], np.float16), np.array([0.0], np.float16)
-    # cublasGemmEx's compute type: a cudaDataType before CUDA 11, a cublasComputeType_t since
-    ct = 64 if cp.cuda.runtime.runtimeGetVersion() >= 11000 else 2     # CUBLAS_COMPUTE_16F / CUDA_R_16F
-    R16 = 2                                                            # CUDA_R_16F
 
     def step(n):
         with cp.cuda.Device(s.card):
@@ -123,9 +171,7 @@ def _gemm_f16(s, Wt, R, C, X, ldx, Yb, ldy, quant, lane=False):
                     F.k_f16_dq5(((R * ng * 26 + 255) // 256,), (256,), (Wt, i32(R), i32(NG), i32(g0), i32(ng), W16))
                 else:
                     F.k_f16_dq(((R * ng * 7 + 255) // 256,), (256,), (Wt, i32(R), i32(NG), i32(g0), i32(ng), W16))
-                cublas.gemmEx(h, cublas.CUBLAS_OP_T, cublas.CUBLAS_OP_N, R, n, 128 * ng,
-                              one.ctypes.data, W16.data.ptr, R16, 128 * ng, X16.data.ptr + 2 * 128 * g0, R16, C,
-                              zero.ctypes.data, C16.data.ptr, R16, R, ct, -1)
+                _gemm16(h, R, n, 128 * ng, W16.data.ptr, X16.data.ptr + 2 * 128 * g0, C, C16.data.ptr)
                 F.k_f16_acc((min(4096, (n * R + 255) // 256),), (256,), (C16, i32(R), i32(n), Yb, i32(ldy), i32(g0 == 0)))
     return step
 
@@ -148,6 +194,31 @@ def enabled(eng):
     return v not in ("0", "", "1") and eng.W in (1, 2) and all(s.g5l or not s.g5 or getattr(s, "wl", None) for s in eng.cards)
 
 
+def _g5_split(R, NG, T):
+    """the column splits of a 5-trit chunk GEMM of R rows (NG 128-column groups) over T tokens (gemm below)"""
+    gx, gy = R // 128, (T + 127) // 128
+    return 1 if gx * gy >= 40 else max(1, min(8, NG, -(-80 // max(1, gx * gy))))
+
+
+def _spl_size(s, T):
+    """the split-parts buffer (floats). The 5-trit path splits only its small products: the buffer is sized for the
+    largest split one among the card's weights (0.4.0 sized it for D rows, which took 1,024 tokens of the 27B's context
+    on an 8 GB GTX 1070, issue #4). The 2-bit path (gemm4) splits D-row products too, as far as the buffer allows."""
+    D, NHKV, HD = s.D, s.NHKV, s.HD
+    if not s.g5:
+        return 8 * T * max(NHKV * HD, D)
+    try:
+        need = 1
+        for name, w in (getattr(s, "wl", None) or s.w).items():
+            R, C = int(w[2]), int(w[3])
+            sp = _g5_split(R, C // 128, T)
+            if sp > 1:
+                need = max(need, sp * T * R)
+        return need
+    except (AttributeError, IndexError, TypeError, ValueError):    # no weight table yet: the 0.2.0 size
+        return 8 * T * NHKV * HD
+
+
 def reserve(eng):
     """the chunk buffers, allocated before the context is fitted to the free memory"""
     eng.chunk_ok = False
@@ -168,7 +239,7 @@ def reserve(eng):
             # split parts: the 5-trit path splits only the small K/V products; the 2-bit path may split D-row ones
             ctc = getattr(s, "tc_layout", False) and getattr(s, "wl", None) is None and not getattr(s, "tc_lane", False)
             # (HIP keeps the lane copy, sm_60 the lane layout itself: no tc GEMMs)
-            c["SPL"] = z(1 if ctc else 8 * T * max(s.NHKV * HD, D))   # (small models split D-row products too)   # (tc: not used)
+            c["SPL"] = z(1 if ctc else _spl_size(s, T))   # (tc: not used)
             c["YP"] = z(T * D) if eng.W == 2 else None          # the other card's row-parallel part
             tv = os.environ.get("KINDI_CHUNK_TILE", "")
             c["small"] = tv == "64" or (tv != "128" and cp.cuda.runtime.getDeviceProperties(s.card)["major"] < 5)
@@ -262,7 +333,7 @@ def _build(s):
                     P.add(CK.k_q8x_T, (NG, T), (128,), (X, i32(ldx), c["XQ"], c["XS"], i32(T), TT))
             P.add(CK.k_mm_g5q, (gx, gy), (256,), (W5, i32(R), i32(NG), c["XQ"], c["XS"], i32(T), Yb, i32(ldy), TT))
             return
-        sp = 1 if gx * gy >= 40 else max(1, min(8, NG, -(-80 // (gx * gy))))
+        sp = _g5_split(R, NG, T)
         if sp == 1:
             P.add(CK.k_mm_g5n, (gx, gy, 1), (256,), (W5, i32(R), i32(NG), X, i32(ldx), Yb, i32(ldy), _tp.Dyn("T", 0, 1), i32(0)))
         else:

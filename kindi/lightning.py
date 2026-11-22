@@ -120,7 +120,8 @@ class Engine(object):
         self.k = {n: mod.get_function(n) for n in KERNELS + (K35_KERNELS if self.k35 else ())}
         if self.k35 and self.cc < 50:                      # Kepler: 8-byte shared memory banks for the tile loads
             import ctypes
-            cu = ctypes.CDLL("libcuda.so.1")
+            from .gpudrv import libcuda
+            cu = libcuda()
             for n in ("lt_mmk_q2", "lt_mmk32_q2", "lt_mmf_q2", "lt_mmf32_q2"):
                 cu.cuFuncSetSharedMemConfig(ctypes.c_void_p(getattr(self.k[n], "kernel", self.k[n]).ptr), 2)
         # tensor cores for the prompt on sm_75+ (lightning_tc.cu; Turing: LT_SM75); the other cards use lt_mm_q2

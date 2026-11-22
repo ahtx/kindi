@@ -159,3 +159,130 @@ NBQ_FA(5, nbq_fa_prefill_g5)
 NBQ_FA_Q8(7, nbq_fa_prefill_q8)
 NBQ_FA_Q8(5, nbq_fa_prefill_q8_g5)
 #endif
+
+#if NBQ_HMMA
+/* Volta (sm_70): the same causal prompt attention as nbq_fa_t (f16 cache), on mma.sync m8n8k4. Block: 64 query
+   rows of one K/V head (row r = G t + j), 128 threads; tiles of 64 positions with a running max and sum per row
+   (FA2). Warp w takes rows 16 w .. +15; its quad pair qp takes the 8 rows of group qp & 1 and, for S = Q K^T, the
+   positions 32 (qp >> 1) .. +31 of the tile; for O += P V, the dims 64 (qp >> 1) .. +63. Accumulator element e of
+   a lane is row (lane & 1) + (e & 2) (+ 4 in the upper half of the quad pair), column (e & 4) + (lane & 2) + (e & 1)
+   of its 8 x 8 tile, so a lane's two rows are the same in S and in O. Q is scaled and rounded to fp16, P is fp16 for
+   P V, the sums are fp32 (as nbq_fa_t). */
+#define NBQ_VLD 72                /* the shared row stride of V transposed and of P, in halves */
+#define NBQ_FAV_SMEM ((64 * NBQ_FLD + 64 * NBQ_FLD + 128 * NBQ_VLD + 4 * 16 * NBQ_VLD) * 2)
+template <int G>
+__device__ __forceinline__ void nbq_fa_v(const float* qkv, int ld, int nt, int pos0, const __half* kc,
+                                         const __half* vc, int ctx, float scale, float* out) {
+    extern __shared__ __align__(16) unsigned char fsm[];
+    __half* Qs = reinterpret_cast<__half*>(fsm);            /* [64][NBQ_FLD] */
+    __half* Ks = Qs + 64 * NBQ_FLD;                          /* [64][NBQ_FLD] */
+    __half* Vt = Ks + 64 * NBQ_FLD;                          /* [128 dims][NBQ_VLD positions] */
+    const int hk = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    __half* P = Vt + 128 * NBQ_VLD + warp * 16 * NBQ_VLD;    /* this warp's [16 rows][64 positions] */
+    const int R = G * nt, r0 = blockIdx.x * 64;
+    const int qp = (lane >> 2) & 3, hi = lane >> 4, qr = (lane & 3) + 4 * hi, rg = qp & 1, hf = qp >> 1;
+    const int lra = 8 * rg + (lane & 1) + 4 * hi, lrb = lra + 2;            /* this lane's rows in the warp's 16 */
+    const int ra = r0 + 16 * warp + lra, rb = r0 + 16 * warp + lrb;
+    const int ca = min(ra, R - 1), cb = min(rb, R - 1);
+    const int la = pos0 + ca / G, lb = pos0 + cb / G;        /* the last position each row sees */
+    const int lmax = pos0 + min(r0 + 63, R - 1) / G;
+    for (int idx = tid; idx < 64 * 64; idx += 128) {        /* Q: 64 rows x 64 pairs of dims, scaled, fp16 */
+        const int r = idx >> 6, d = 2 * (idx & 63), rr = min(r0 + r, R - 1);
+        const float* q = qkv + (size_t)(rr / G) * ld + (hk * G + rr % G) * 128 + d;
+        *reinterpret_cast<__half2*>(Qs + r * NBQ_FLD + d) = __floats2half2_rn(q[0] * scale, q[1] * scale);
+    }
+    float o[8][8];
+#pragma unroll
+    for (int m = 0; m < 8; m++)
+#pragma unroll
+        for (int e = 0; e < 8; e++) o[m][e] = 0.0f;
+    float ma = -1e30f, mb = -1e30f, sa = 0.0f, sb = 0.0f;
+    const __half* vbase = vc + (size_t)hk * ctx * 128;
+    for (int p0 = 0; p0 <= lmax; p0 += 64) {
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < 8; h++) {                       /* K: 64 positions x 16 pieces; V transposed */
+            const int idx = tid + 128 * h, pc = idx >> 6, p = idx & 63, vp = idx >> 4, vpc = idx & 15;
+            *reinterpret_cast<uint4*>(Ks + p * NBQ_FLD + 8 * pc) = *reinterpret_cast<const uint4*>(kc + nbq_kofs(hk, ctx, p0 + p, pc));
+            const uint4 vv = *reinterpret_cast<const uint4*>(vbase + (size_t)(p0 + vp) * 128 + 8 * vpc);
+            const __half* hv = reinterpret_cast<const __half*>(&vv);
+#pragma unroll
+            for (int e = 0; e < 8; e++) Vt[(8 * vpc + e) * NBQ_VLD + vp] = hv[e];
+        }
+        __syncthreads();
+        float s[4][8];
+#pragma unroll
+        for (int n = 0; n < 4; n++)
+#pragma unroll
+            for (int e = 0; e < 8; e++) s[n][e] = 0.0f;
+        const __half* qrow = Qs + (16 * warp + 8 * rg + qr) * NBQ_FLD;
+#pragma unroll 4
+        for (int k = 0; k < 32; k++) {
+            const uint2 a = *reinterpret_cast<const uint2*>(qrow + 4 * k);
+#pragma unroll
+            for (int n = 0; n < 4; n++) {
+                const uint2 b = *reinterpret_cast<const uint2*>(Ks + (8 * (4 * hf + n) + qr) * NBQ_FLD + 4 * k);
+                NBQ_HMMA884(s[n], a, b);
+            }
+        }
+        float mxa = -1e30f, mxb = -1e30f;
+#pragma unroll
+        for (int n = 0; n < 4; n++)
+#pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const int p = p0 + 8 * (4 * hf + n) + (e & 4) + (lane & 2) + (e & 1);
+                if (e & 2) { if (p > lb) s[n][e] = -1e30f; mxb = fmaxf(mxb, s[n][e]); }
+                else { if (p > la) s[n][e] = -1e30f; mxa = fmaxf(mxa, s[n][e]); }
+            }
+        mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, 2)); mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, 8));
+        mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 2)); mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 8));
+        const float na = fmaxf(ma, mxa), nb = fmaxf(mb, mxb);
+        const float fa = expf(ma - na), fb = expf(mb - nb);
+        ma = na; mb = nb;
+        sa *= fa; sb *= fb;
+#pragma unroll
+        for (int m = 0; m < 8; m++)
+#pragma unroll
+            for (int e = 0; e < 8; e++) o[m][e] *= (e & 2) ? fb : fa;
+#pragma unroll
+        for (int n = 0; n < 4; n++)
+#pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const float ev = expf(s[n][e] - ((e & 2) ? nb : na));
+                if (e & 2) sb += ev; else sa += ev;
+                P[((e & 2) ? lrb : lra) * NBQ_VLD + 8 * (4 * hf + n) + (e & 4) + (lane & 2) + (e & 1)] = __float2half_rn(ev);
+            }
+        __syncwarp();
+        const __half* prow = P + (8 * rg + qr) * NBQ_VLD;
+#pragma unroll 4
+        for (int k = 0; k < 16; k++) {
+            const uint2 a = *reinterpret_cast<const uint2*>(prow + 4 * k);
+#pragma unroll
+            for (int m = 0; m < 8; m++) {
+                const uint2 b = *reinterpret_cast<const uint2*>(Vt + (8 * (8 * hf + m) + qr) * NBQ_VLD + 4 * k);
+                NBQ_HMMA884(o[m], a, b);
+            }
+        }
+        __syncwarp();
+    }
+    sa += __shfl_xor_sync(0xffffffffu, sa, 2); sa += __shfl_xor_sync(0xffffffffu, sa, 8);
+    sb += __shfl_xor_sync(0xffffffffu, sb, 2); sb += __shfl_xor_sync(0xffffffffu, sb, 8);
+    const float ia = 1.0f / sa, ib = 1.0f / sb;
+    const int lo = gridDim.y * G * 128;
+    float* oa = out + (size_t)(ca / G) * lo + (hk * G + ca % G) * 128;
+    float* ob = out + (size_t)(cb / G) * lo + (hk * G + cb % G) * 128;
+#pragma unroll
+    for (int m = 0; m < 8; m++)
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const int d = 8 * (8 * hf + m) + (e & 4) + (lane & 2) + (e & 1);
+            if (e & 2) { if (rb < R) ob[d] = o[m][e] * ib; }
+            else if (ra < R) oa[d] = o[m][e] * ia;
+        }
+}
+#define NBQ_FAV(G, NAME) extern "C" __global__ void __launch_bounds__(128) NAME(const float* qkv, int ld, int nt, \
+    int pos0, const __half* kc, const __half* vc, int ctx, float scale, float* out) { \
+    nbq_fa_v<G>(qkv, ld, nt, pos0, kc, vc, ctx, scale, out); }
+NBQ_FAV(7, nbq_fav_prefill)
+NBQ_FAV(5, nbq_fav_prefill_g5)
+#endif

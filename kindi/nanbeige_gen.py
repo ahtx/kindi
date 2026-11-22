@@ -201,9 +201,8 @@ class NanbeigeBackend(object):
     def generate(self, K, req, cancel=None):
         from .nanbeige_chat import render, prompt_ids
         cfg = K.cfg
-        tools = req.get("tools") or None
-        if req.get("tool_choice") == "none":
-            tools = None
+        from .oai import check
+        tools, _ = check(req, can_force=False)          # #38: a forced call or a JSON schema gets a 400, not free text
         kw = req.get("chat_template_kwargs") or {}
         thinking = kw.get("enable_thinking", req.get("enable_thinking", True)) is not False
         ids = prompt_ids(self.tok, render(req.get("messages") or [], tools=tools, enable_thinking=thinking))

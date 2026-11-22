@@ -20,6 +20,7 @@ DEFAULTS = {
     "model_name": "auto",              # infer the reported id from the selected pack
     # engine
     "ctx": "24576",                     # requested context; each backend clamps it to available device memory
+    "slots": "1",                       # requests written at the same time (decode slots, plan engine with KINDI_TC=1)
     "head": "exact",                    # exact | fast (shortlist head, ~15% faster, approximate)
     "fast_clusters": "256",             # clusters scored by the fast head
     # prompt cache
@@ -47,7 +48,7 @@ DEFAULTS = {
     "repeat_last_n": "64",              # the tokens that repeat_penalty looks at (-1: the whole context)
 }
 
-INT_KEYS = {"repeat_stop", "lookup", "port", "ctx", "fast_clusters", "checkpoint_every", "checkpoint_budget_mb", "prefix_max", "prefix_min", "park_max",
+INT_KEYS = {"repeat_stop", "lookup", "port", "ctx", "slots", "fast_clusters", "checkpoint_every", "checkpoint_budget_mb", "prefix_max", "prefix_min", "park_max",
             "turn_save", "turn_keep", "turn_disk_mb", "turn_min",
             "max_tokens", "top_k", "repeat_last_n"}
 FLOAT_KEYS = {"temperature", "top_p", "min_p", "repeat_penalty"}
@@ -112,7 +113,7 @@ def load(explicit=None, overrides=None):
     if cfg["model_name"] == "auto":
         manifest = os.path.join(cfg["pack"], "kindi_pack.json")
         m = json.load(open(manifest)) if os.path.isfile(manifest) else {}
-        if m.get("backend") in ("kindi_gemma4", "kindi_lightning"):
+        if m.get("backend") in ("kindi_gemma4", "kindi_lightning", "kindi_qwen4exp"):
             cfg["model_name"] = m.get("model_id", "gemma4")
         else:
             # the GGUF's general.name, then its file name: some files name the model only "Hf"

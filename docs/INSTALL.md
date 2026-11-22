@@ -29,26 +29,26 @@ Download the script, compare its sha256 with the value below, read it, and then 
 
 ```bash
 curl -fsSLO https://amirhusain.com/kindi/install.sh
-echo "31c4a86025c4c25303b94ba7ff7436a34b2486de0621ac44a57f4b805f0a5a1c  install.sh" | sha256sum -c -
+echo "fae9cb6d91df74d583f152290b14b788d127c86ee1aff59436071b994e3b8a43  install.sh" | sha256sum -c -
 bash install.sh --dry-run
 bash install.sh
 ```
 
 | File | sha256 |
 |---|---|
-| `install.sh` (Kindi 0.6.1) | `31c4a86025c4c25303b94ba7ff7436a34b2486de0621ac44a57f4b805f0a5a1c` |
+| `install.sh` (Kindi 0.7.0) | `fae9cb6d91df74d583f152290b14b788d127c86ee1aff59436071b994e3b8a43` |
 
 If `sha256sum -c` does not print `install.sh: OK`, do not run the script. The same script is in the repository root
-and in the 0.6.1 release.
+and in the 0.6.0 release.
 
 ## What it does
 
 | Step | What it does | sudo |
 |---|---|---|
-| 1. Check the machine | Linux x86-64, RAM, free disk, each NVIDIA GPU with its compute capability, and each AMD RDNA3 or RDNA 3.5 GPU. No GPU: the CPU engine. | no |
+| 1. Check the machine | Linux x86-64, RAM, free disk, each NVIDIA GPU with its compute capability, and each AMD RDNA2, RDNA3 or RDNA 3.5 GPU. No GPU: the CPU engine. | no |
 | 2. Docker and GPU access | Finds Docker, and the NVIDIA Container Toolkit or the AMD devices `/dev/kfd` and `/dev/dri`. If something is missing, it asks before it installs it (apt). Without the toolkit, it gives the container the NVIDIA devices and the driver libraries directly. | only to install |
 | 3. Select the setup | Shows each setup for this computer, the recommended one first, and asks which one (below). | no |
-| 4. Build the image | Builds `kindi:0.6.1` (CUDA 10.2), `kindi-rocm:0.6.1` (ROCm 6.3, RDNA3) or `kindi-rocm7:0.6.1` (ROCm 7, RDNA 3.5) from the release source, and checks that the Kindi modules load. A re-run with the same source does not build again. | no |
+| 4. Build the image | Builds `kindi:0.7.0` (CUDA 10.2), `kindi-rocm:0.7.0` (ROCm 6.3, RDNA3) or `kindi-rocm7:0.7.0` (ROCm 7, RDNA2 and RDNA 3.5) from the release source, and checks that the Kindi modules load. A re-run with the same source does not build again. | no |
 | 5. Download the models | Downloads each GGUF from Hugging Face. The sha256 must match the value in the script (table below). | no |
 | 6. Convert and verify | `kindi convert`, then `kindi verify` one time for each model on each kind of card. | no |
 | 7. Start the servers | One Docker container for each server, with `--restart unless-stopped`, on `127.0.0.1`. It waits until each `/health` answers. | no |
@@ -84,6 +84,34 @@ cache folder when a model runs more than one time.
 To select without questions, add `--auto`: the installer takes the recommended setup and continues. In a script, add
 `--config` and the numbers, for example `--config 2,8`. `--dry-run` prints the list.
 
+### Place the servers yourself (`--place`), and the plan file
+
+`kindi cards` lists every card: its name, compute capability, memory and free memory, PCIe link, memory bandwidth,
+driver, and whether Kindi can use it (or why not). `kindi plan` proposes where each model runs, the best first; with
+`--model 27b,2b` it places those models. A card that is too full, or that another program uses, is left out.
+
+To choose yourself, give one `--place` argument for each server, `MODEL:CARDS`:
+
+```bash
+bash install.sh --place "27b:0" "2b:1"            # a 27B on card 0 and a 2B on card 1
+bash install.sh --place "27b:2,3"                 # one 27B split over cards 2 and 3 by their free memory
+bash install.sh --place "dsv41:0+" "27b:3"        # DeepSeek with card 0 as the main card and every other card
+                                                  # except card 3 as an expert card; a 27B on card 3
+```
+
+`MODEL` is `2b`, `4b`, `9b`, `27b`, `nemotron`, `lightning`, `nanbeige` or `dsv41`. `CARDS` are the card numbers of
+`kindi cards` (or `nvidia-smi`), or the card UUIDs. For DeepSeek, `dsv41:0+1,2` names the main card and the expert
+cards; `dsv41:0+` takes every card that no other server takes. `@PORT` after the cards sets the port. The installer
+checks the placement first: a card in two servers, or a model that does not fit its cards, stops it with the reason.
+
+The placement goes to `~/.kindi/plan.json` (the cards by UUID, so a card that moves to another slot is still found).
+A setup chosen from the list is written there too. `--plan FILE` installs the servers of a plan file that
+`kindi plan --out FILE` made; `kindi plan --check FILE` says whether a plan still fits the cards.
+
+With two or more servers, the installer also starts the front door, `kindi route` (container `kindi-route`, port
+8090, `--route-port`): one OpenAI endpoint for all servers. The request's `"model"` picks the server
+(`bonsai2-27b`, `bonsai2-2b`, `deepseek-v4.1-flash`, ...); `/v1/models` lists the models of all servers.
+
 ### The recommended setup
 
 | Your computer | Recommended | Other setups in the list |
@@ -94,9 +122,10 @@ To select without questions, add `--auto`: the installer takes the recommended s
 | One Quadro K1200 4 GB | 9B | Nemotron, 4B, 2B, 2B on the CPU |
 | Two Quadro K1200 4 GB | 27B split over both cards (tensor parallel) | Nemotron split over both cards; 9B, Nemotron, 4B or 2B on each card; 2B on the CPU |
 | GeForce GTX 1080 8 GB | 27B | Nemotron, 9B, 4B, 2B, 2B on the CPU |
-| GeForce RTX 3060 / 3080 (sm_86, 9.5 GB or more) | 27B with tensor cores and the 2B draft model | Nemotron, 9B, 4B, 2B, 2B on the CPU |
+| GeForce RTX 3060 / 3080 (sm_86, 9.5 GB or more) | 27B with tensor cores and the DSpine drafter (the 2B draft model with `--no-dspine`) | Nemotron, 9B, 4B, 2B, 2B on the CPU |
 | AMD Radeon 780M (gfx1103) | 27B | Nemotron, 2B, 2B on the CPU |
 | AMD RDNA 3.5: Radeon 840M (gfx1152), Radeon 8060S (gfx1151) | 27B (12 GB of graphics memory or more) | 9B, 4B, 2B, 2B on the CPU |
+| AMD RDNA2: Radeon PRO W6800 (gfx1030); other gfx1030-gfx1036 cards not yet measured | 27B (12 GB of graphics memory or more) | 9B, 4B, 2B, 2B on the CPU |
 | Two or more GPUs that do not split one model | the best model on every GPU, one server each | each setup of each card |
 
 | Profile | Cards | Context asked |
@@ -109,6 +138,7 @@ To select without questions, add `--auto`: the installer takes the recommended s
 | tc | sm_80 or newer, 9.5 GB or more | 131,072 |
 | rocm-gfx1103 | AMD Radeon 780M | 24,576 |
 | rocm-gfx1151, rocm-gfx1152 | AMD Radeon 8060S, Radeon 840M (RDNA 3.5) | 24,576 |
+| rocm-gfx1030 ... rocm-gfx1036 | AMD Radeon PRO W6800, Radeon RX 6000 series (RDNA2) | 24,576 |
 
 Nemotron always asks for 24,576. The engine fits the context to the free memory and reports what it got. For
 example, Nemotron split over two K1200 cards gets 8,448.
@@ -116,7 +146,7 @@ example, Nemotron split over two K1200 cards gets 8,448.
 ## AMD graphics
 
 The Kindi ROCm images hold ROCm, CuPy 14.2.0 and Kindi, so you do not install ROCm on the computer. RDNA3 graphics
-get `kindi-rocm` (ROCm 6.3.3). RDNA 3.5 graphics (gfx1150-gfx1152) get `kindi-rocm7` (ROCm 7, HIP 7.16). The
+get `kindi-rocm` (ROCm 6.3.3). RDNA 3.5 graphics (gfx1150-gfx1152) and RDNA2 graphics (gfx1030-gfx1036) get `kindi-rocm7` (ROCm 7, HIP 7.16). The
 computer needs the `amdgpu` driver of Linux (kernel 6.2 or newer and `linux-firmware`) and Docker. The installer gives
 the container `/dev/kfd` and `/dev/dri`. On the Radeon 780M it also sets `HSA_OVERRIDE_GFX_VERSION=11.0.2` and
 checks the kernel option `amdgpu.cwsr_enable=0` (see [AMD.md](AMD.md)). It asks before it adds that option, and it
@@ -152,6 +182,9 @@ The script pins these files. It does not use a file with a different sha256.
 | `--yes`, `-y` | Answers yes to each question (for scripts) and takes the recommended setup. Kernel changes are never answered. |
 | `--auto` | Takes the recommended setup and continues with no questions. Kernel changes are only described. |
 | `--config N` | Setup N of the list; `N,M` for several servers; `NxK` for setup N on K cards. |
+| `--place P ...` | Your own placement, one `MODEL:CARDS` per server (see above). |
+| `--plan FILE` | Install the servers of a plan file (`kindi plan --out FILE`). |
+| `--route-port P` | The port of the front door when there are two or more servers (default 8090; `0` = none). |
 | `--model M` | Lists only the setups with this model: `2b`, `4b`, `9b`, `27b` or `nemotron`. |
 | `--ctx N` | The context length in tokens. |
 | `--gpu G` | `N` (one NVIDIA card), `N,M` (two cards), `amd` or `amdN`, `all`, or `cpu`. |
@@ -184,7 +217,7 @@ curl http://<address>:8093/v1/chat/completions -H 'Content-Type: application/jso
 | `--name N` | The name of the first container (default `kindi`; later ones are `N-2`, `N-3`, ...). |
 | `--threads N` | The CPU engine: the number of threads. |
 | `--memory M` | The container memory limit, for example `8g`. |
-| `--source S` | The Kindi source: a folder, or a `.tar.gz` path or URL (default: the 0.6.1 release). |
+| `--source S` | The Kindi source: a folder, or a `.tar.gz` path or URL (default: the 0.6.0 release). |
 | `--with-bridge` | Also installs Kindi Bridge, the terminal workspace for agents on Kindi (see below). |
 | `--no-bridge` | Does not ask about Kindi Bridge. |
 | `--bridge-source D` | Installs Kindi Bridge from folder D (default: `bridge/` in the Kindi source). |
@@ -217,6 +250,47 @@ removed.
 bash install.sh --uninstall          # the containers and the images; the models stay in ~/.kindi
 bash install.sh --uninstall --purge  # also ~/.kindi
 ```
+
+## Native Windows (without WSL)
+
+The supported way on Windows is WSL2 ([WINDOWS.md](WINDOWS.md)). From 0.7.0, the Windows runtime package
+(`kindi-VERSION-windows-x64.zip`: `kindi.exe` with its own Python, CuPy and NVRTC, and Kindi Monitor) does the
+steps below for you ([docs/dev/F8-WINDOWS.md](dev/F8-WINDOWS.md)). Kindi also runs natively on Windows with an
+NVIDIA card, from the source, without the installer and without Docker. We tested it on Windows 11 with an RTX 3080
+(driver 610): `kindi convert`, `kindi verify` (2B, 4B and 27B: all pass, token-exact), and `kindi serve` with a chat
+request.
+
+1. Install Python 3.11 from python.org, then make a virtual environment and the packages:
+
+   ```powershell
+   py -3.11 -m venv $HOME\kindi-venv
+   $HOME\kindi-venv\Scripts\python.exe -m pip install "numpy<2" cupy-cuda12x nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 fastapi uvicorn
+   ```
+
+2. CuPy compiles Kindi's kernels with NVRTC. Point `CUDA_PATH` at the NVRTC package, or the first run stops with
+   "CuPy failed to load nvrtc64_120_0.dll", and put its `bin` folder first on `PATH`, or NVRTC cannot load
+   `nvrtc-builtins64_129.dll`. The `nvidia-cuda-runtime-cu12` package gives the CUDA headers (`cuda_fp16.h`) that
+   the kernels include; without it every kernel fails with "cannot open source file cuda_fp16.h":
+
+   ```powershell
+   $env:CUDA_PATH = "$HOME\kindi-venv\Lib\site-packages\nvidia\cuda_nvrtc"
+   $env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
+   ```
+
+3. Get the Kindi source (the release `.tar.gz`, or a clone), and run Kindi from its folder:
+
+   ```powershell
+   $py = "$HOME\kindi-venv\Scripts\python.exe"
+   & $py -m kindi convert C:\models\Ternary-Bonsai-2-2B-PTQ1_0.gguf --out C:\kindi\pack-2b
+   & $py -m kindi --pack C:\kindi\pack-2b verify
+   & $py -m kindi --pack C:\kindi\pack-2b serve
+   ```
+
+- With two NVIDIA cards, pick the one without a display: `$env:CUDA_DEVICE_ORDER = "PCI_BUS_ID"` and
+  `$env:CUDA_VISIBLE_DEVICES = "1"` (the numbers of `nvidia-smi`). The Windows (WDDM) driver keeps part of the card's
+  memory, so the same card gets a smaller context than on Linux.
+- The CPU engine needs gcc with OpenMP and does not build on Windows: use WSL2 for it.
+- Kindi Bridge, the installer and the Docker images are Linux only.
 
 ## Tested
 

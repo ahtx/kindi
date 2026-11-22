@@ -25,6 +25,12 @@ static __device__ __forceinline__ int nbq_dp4a(int a, int b, int c) {
 #ifndef NBQ_TC                /* 0 before sm_80: no tensor-core kernels (the prompt then goes through Engine.check) */
 #define NBQ_TC 1
 #endif
+#ifndef NBQ_HMMA              /* 1 (Volta): the prompt GEMMs on fp16 tensor cores (nbq_gemm_hm in nbq_mm.cu) */
+#define NBQ_HMMA 0
+#endif
+#ifndef NBQ_SIMT              /* 1 (Volta): the prompt GEMMs of nbq_mm.cu with dp4a in place of the int8 MMA */
+#define NBQ_SIMT 0
+#endif
 
 /* Kepler (sm_35, sm_37) has no __dp4a and no tensor cores. __dp4a is then four byte products (exact); the
    tensor-core kernels compile to a trap and nanbeige.py does not launch them. */

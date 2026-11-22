@@ -92,7 +92,9 @@ def convert(gguf_path, out_dir, log=print):
         log("recognized Gemma 4 GGUF: %d tensors, %s quantization; Kindi native CUDA decoder" %
             (info["tensor_count"], info["tensor_types"]))
         return manifest
-    from . import lightning_cli, nanbeige_cli
+    from . import lightning_cli, nanbeige_cli, qwen4exp_cli
+    if qwen4exp_cli.is_qwen4exp(g):           # Qwen3.8-Flash-Next: the weights stay in the GGUF shards
+        return qwen4exp_cli.convert(g, gguf_path, out_dir, __version__, PACK_FORMAT, log=log)
     if lightning_cli.is_lightning(g):
         return lightning_cli.convert(g, gguf_path, out_dir, __version__, PACK_FORMAT, sha256, log=log)
     if nanbeige_cli.is_llama_iq(g):
@@ -194,6 +196,9 @@ def convert(gguf_path, out_dir, log=print):
                 "head": "output.weight" if any(t[0] == "output.weight" for t in g.tensors) else "token_embd.weight",
                 # the chat template: the 27B's differs from the 2B/4B/9B one (chat.template_variant)
                 "chat_template": g.kv.get("tokenizer.chat_template", "")}
+    # B16: each pack file's size, fast hash and sha256, checked before the pack is used (kindi.packcheck)
+    from .packcheck import record
+    manifest["files"] = record(out_dir, log)
     with open(os.path.join(out_dir, "kindi_pack.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     log("pack written to %s (%.0f MB) in %.0fs" % (out_dir, (bc_off + dpm_off + f32_off) / 1e6, time.time() - t0))

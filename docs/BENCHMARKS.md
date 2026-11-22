@@ -9,7 +9,67 @@ Unless a table says otherwise, the method is the same for the two engines. They 
 is read in segments up to each N, and the read time of N tokens is the sum of the segments. At each N, 32 tokens are
 generated. Project page: [amirhusain.com/kindi](https://amirhusain.com/kindi/).
 
-## Kindi 0.6.0 (in development): Nemotron 3.5 Lightning 30B-A3B (ternary, Q2_0)
+## Kindi 0.7.0: Qwen3.8-Flash-Next
+
+One RTX 3060 12 GB with two Xeon E5-2673 v4 (40 cores) and 755 GB of RAM, the model in RAM. Model file: ISTA-DASLab's
+Qwen3.8-Flash-Next GSQ-RCO IQ3_S (two GGUF shards), with the converted MTP head (the default). Writing: 8 new chats,
+200 tokens each, short context, three runs. Fast mode, drafting and the 8-bit dense path are on by default. Reading: one prompt of 4,096 or 16,384 tokens. There is no llama.cpp row for this
+model on this card yet.
+
+| | tokens/s |
+|---|---:|
+| Writing (the default) | 39.4 |
+| Reading a 4K-token prompt | 489 |
+| Reading a 16K-token prompt | 465 |
+
+See [FLASHNEXT.md](FLASHNEXT.md).
+
+## Kindi 0.7.0: Qwen3.8-Flash-Next on a Quadro M4000 (Maxwell)
+
+A Quadro M4000 8 GB (sm_52) as the only card, with the same CPUs and RAM and the same model file as above. llama.cpp:
+built for sm_52 with CUDA 12.4, the same card and the same model file. Kindi's row is the default install (fast mode, drafting and
+the 8-bit dense path on); `kindi verify` passes 174 of 174.
+
+| | Kindi | llama.cpp |
+|---|---:|---:|
+| Writing | 13.1 | 5.4 |
+| Reading a 4K-token prompt | 54.7 | 34.2 |
+
+## Kindi 0.7.0: AMD Radeon PRO W6800 (RDNA2, gfx1030, 32 GB)
+
+Ternary Bonsai 2B, 9B and 27B, context 9,216. Kindi: the method at the top of this page (3 x 32 greedy tokens at
+each depth), q8_0 K/V. `kindi verify` passes on all three models.
+
+The 27B, against llama.cpp with the same GGUF file and q8_0 K/V (the PrismML fork, commit c96baf4, ROCm,
+`llama-bench -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0`, read `-p N`, write `-n 64 -d N`):
+
+| context | Kindi read | llama.cpp read | Kindi write | llama.cpp write |
+|---:|---:|---:|---:|---:|
+| 512 | 573 | 265 | 42.3 | 35.0 |
+| 8,192 | 506 | 263 | 38.8 | 33.4 |
+
+The 2B and the 9B, Kindi alone (the llama.cpp rows with the same K/V type are not measured yet):
+
+| model | context | Kindi read | Kindi write |
+|---|---:|---:|---:|
+| 2B | 512 | 4,479 | 254.9 |
+| 2B | 8,192 | 4,215 | 235.3 |
+| 9B | 512 | 1,635 | 106.1 |
+| 9B | 8,192 | 1,490 | 95.7 |
+
+## Kindi 0.7.0: several requests at once (slots)
+
+Slots are an opt-in feature (`kindi serve --slots N`; the default is one request at a time). One RTX 3080,
+`KINDI_TC=1`. With `--slots 8`, one pass writes 396 tokens/s in all with the 27B (one slot: 70) and 2,852 tokens/s
+with the 2B (one slot: 481). Through the server with `--slots 8`, 16 requests of 256 tokens to the 27B finish at 134
+tokens/s in all, against 52 tokens/s with the default of one at a time. Every conversation's greedy output is the same as when it runs alone.
+
+## Kindi 0.7.0: VRAM auto-split on two cards
+
+Two RTX 3080 cards, one with 5 GB taken by another program, the 27B. With `KINDI_TP_SPLIT=auto` (the default) the
+context grows from 75,008 to 166,656 tokens (with tensor cores: from 66,816 to 147,968).
+
+## Kindi 0.6.0: Nemotron 3.5 Lightning 30B-A3B (ternary, Q2_0)
 
 Model file: Ternary-Nemotron-3.5-Lightning-30B-A3B-GGUF.gguf, sha256 38854de6…, f16 K/V for both engines.
 llama.cpp: commit 785322d (CUDA, `llama-bench -ngl 99 -fa 1`). Read: `-p N -n 0`, one prompt of N tokens. Write:

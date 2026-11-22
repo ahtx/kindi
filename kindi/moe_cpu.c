@@ -137,6 +137,13 @@ typedef struct {
     float clamp;                 /* swiglu limit (0 = none) */
     int direct;                  /* 1: the experts are read in place from the GGUF tensors (no copy, no node split) */
     const uint8_t *dgate, *dup, *ddown;  /* direct: [E][rows][blocks] of 17 bytes */
+    /* streamed experts (xstore.c): before a call, fetch(sid, n, experts, ptr) brings the call's experts into RAM and
+       gives each one's gate/up/down rows (the file's own bytes); xp[e * 3 + m] then points there instead of into
+       the mapped file, and release(sid, ...) ends the call. The kernels read the same bytes either way. */
+    const uint8_t** xp;
+    int (*fetch)(int sid, int n, const int* ids, const uint8_t** ptr);
+    void (*release)(int sid, int n, const int* ids);
+    int sid;
 } moe_layer;
 
 static inline const uint8_t* gu_group(const moe_layer* L, int e, int g) {
@@ -172,11 +179,34 @@ typedef struct {
 
 static moe_pool P;
 static long spin_idle = SPIN_IDLE;
+/* the pool's phase timers (always on; a few clock reads per thread and call): per thread the time from a call's
+   start to the thread picking it up (wake), the time in run_job less the barriers (work), the time in barriers; per
+   call the host's wall time and its wait for the last thread at the end (tail) */
+static double prof_wake[MOE_MAXTHR], prof_job[MOE_MAXTHR], prof_bar[MOE_MAXTHR];
+static long long prof_jobs[MOE_MAXTHR];
+static double prof_call, prof_tail;
+static long long prof_calls;
+static _Atomic long long prof_post_ns;
+static __thread int prof_t = -1;
+static inline long long prof_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000000000LL + ts.tv_nsec; }
 
 /* pause loops an idle worker spins before it sleeps. With the dense part on a GPU the cores have nothing else to
    do between two layers (~1-2 ms); a sleeping core drops its clock and the next call starts slow, so the GPU engine
    sets this to several milliseconds of spinning. */
 void moe_pool_set_spin(long pauses) { spin_idle = pauses > 0 ? pauses : SPIN_IDLE; }
+/* out [nthr][4]: wake ms, work ms, barrier ms, calls (summed since the last reset); host [3]: wall ms, tail ms, calls */
+int moe_pool_prof(double* out, double* host) {
+    for (int t = 0; t < P.nthr; t++) {
+        out[4 * t] = prof_wake[t] * 1e-6; out[4 * t + 1] = (prof_job[t] - prof_bar[t]) * 1e-6;
+        out[4 * t + 2] = prof_bar[t] * 1e-6; out[4 * t + 3] = (double)prof_jobs[t];
+    }
+    host[0] = prof_call * 1e-6; host[1] = prof_tail * 1e-6; host[2] = (double)prof_calls;
+    return P.nthr;
+}
+void moe_pool_prof_reset(void) {
+    memset(prof_wake, 0, sizeof prof_wake); memset(prof_job, 0, sizeof prof_job); memset(prof_bar, 0, sizeof prof_bar);
+    memset(prof_jobs, 0, sizeof prof_jobs); prof_call = prof_tail = 0; prof_calls = 0;
+}
 
 /* One call. Pairs (token, expert) are grouped by union expert u: pairs [pstart[u], pstart[u + 1]), tokens
    ascending; the pair index is also the row of h. tpair[t * nsel + s] = the pair of token t's s-th expert. */
@@ -245,7 +275,8 @@ static inline grp gu_grp(const moe_layer* L, int e, int g) {
     if (L->direct) {
         size_t rb = (size_t)L->nbk * 17;
         for (int i = 0; i < 8; i++) {
-            G.r[i] = (i < 4 ? L->dgate : L->dup) + ((size_t)e * L->F + g * GU_ROWS + (i & 3)) * rb;
+            const uint8_t* m = L->xp ? L->xp[e * 3 + (i < 4 ? 0 : 1)] : (i < 4 ? L->dgate : L->dup) + (size_t)e * L->F * rb;
+            G.r[i] = m + ((size_t)g * GU_ROWS + (i & 3)) * rb;
             G.so[i] = 0; G.co[i] = 1;
         }
         G.bs = 17;
@@ -261,7 +292,8 @@ static inline grp dn_grp(const moe_layer* L, int e, int g) {
     grp G;
     if (L->direct) {
         size_t rb = (size_t)L->nbf * 17;
-        for (int i = 0; i < 4; i++) { G.r[i] = L->ddown + ((size_t)e * L->K + g * DN_ROWS + i) * rb; G.so[i] = 0; G.co[i] = 1; }
+        const uint8_t* m = L->xp ? L->xp[e * 3 + 2] : L->ddown + (size_t)e * L->K * rb;
+        for (int i = 0; i < 4; i++) { G.r[i] = m + ((size_t)g * DN_ROWS + i) * rb; G.so[i] = 0; G.co[i] = 1; }
         G.bs = 17;
     } else {
         const uint8_t* p = dn_group(L, e, g);
@@ -276,6 +308,9 @@ static inline grp dn_grp(const moe_layer* L, int e, int g) {
 /* One-group-ahead prefetch: while the first kernel call of a work item walks its row group's blocks, each block also
    prefetches the same block of the next item's group (set in tl_pf), so the next ~22 KB (gate/up) or ~5 KB (down)
    arrive during ~30K cycles of compute instead of being fetched with an 8-block lead. Results are unchanged. */
+/* KINDI_MOE_PFD (default 8): how many blocks ahead the row kernels prefetch the row they read (a prefetch only;
+   the results do not change) */
+static int pfd_blk = 8;
 static __thread const grp* tl_pf;
 static __thread int tl_pfrows;
 #define PF_BLOCK(b) do { const grp* P_ = tl_pf; if (P_) {                                                       \
@@ -296,7 +331,7 @@ static inline void rows4_tok1(const grp* G, int r0, int nb, const int8_t* xq, co
     const int bs = G->bs;
     for (int b = 0; b < nb; b++) {
         const size_t o = (size_t)b * bs;
-        _mm_prefetch((const char*)(G->r[r0] + o + 8 * bs), _MM_HINT_T0);
+        _mm_prefetch((const char*)(G->r[r0] + o + pfd_blk * bs), _MM_HINT_T0);
         PF_BLOCK(b);
         const __m256i x = _mm256_loadu_si256((const __m256i*)(xq + b * QK));
         const float dx = xd[b];
@@ -314,7 +349,7 @@ static inline void rows4_tok2(const grp* G, int r0, int nb, const int8_t* xq, co
     const int bs = G->bs;
     for (int b = 0; b < nb; b++) {
         const size_t o = (size_t)b * bs;
-        _mm_prefetch((const char*)(G->r[r0] + o + 8 * bs), _MM_HINT_T0);
+        _mm_prefetch((const char*)(G->r[r0] + o + pfd_blk * bs), _MM_HINT_T0);
         PF_BLOCK(b);
         const __m256i x = _mm256_loadu_si256((const __m256i*)(xq + b * QK));
         const __m256i y = _mm256_loadu_si256((const __m256i*)(yq + b * QK));
@@ -338,7 +373,7 @@ static inline void rows2_tok4(const grp* G, int r0, int nb, const int8_t* const 
     const int bs = G->bs;
     for (int b = 0; b < nb; b++) {
         const size_t o = (size_t)b * bs;
-        _mm_prefetch((const char*)(G->r[r0] + o + 8 * bs), _MM_HINT_T0);
+        _mm_prefetch((const char*)(G->r[r0] + o + pfd_blk * bs), _MM_HINT_T0);
         PF_BLOCK(b);
         W_LOAD(0); W_LOAD(1);
 #define T4(t, ca, cb) { const __m256i x = _mm256_loadu_si256((const __m256i*)(xq[t] + b * QK)); const float dx = xd[t][b]; \
@@ -454,7 +489,7 @@ static inline void fast_rows8(const grp* G, int nb, const int8_t* const xq[4], c
     const int bs = G->bs;
     for (int b = 0; b < nb; b++) {
         const size_t o = (size_t)b * bs;
-        _mm_prefetch((const char*)(G->r[0] + o + 8 * bs), _MM_HINT_T0);
+        _mm_prefetch((const char*)(G->r[0] + o + pfd_blk * bs), _MM_HINT_T0);
         __m256i w[8];
         float sc[8];
 #pragma unroll
@@ -517,7 +552,13 @@ static inline int work_next(int step, int t, int t0, int nn, int* victim, long* 
 }
 
 /* the work of thread t for the current job */
+/* mode 2: a job of another engine's kernels on this pool (qx_cpu.c, Flash-Next): fn(t, nact, arg) on every thread */
+typedef void (*moe_pool_fn)(int t, int nact, void* arg);
+static moe_pool_fn J_fn;
+static void* J_arg;
+
 static void run_job(int t) {
+    if (J.mode == 2) { J_fn(t, J.nact, J_arg); return; }
     if (J.mode == 1) {                       /* combine: out[t][d] = sum over slots in order of w * value */
         const int K = J.nsel ? (int)(size_t)J.L : 0;
         for (int tk = t; tk < J.T; tk += P.nthr)
@@ -799,7 +840,11 @@ static void* worker(void* arg) {
         }
         seen = g;
         if (atomic_load(&P.quit)) return NULL;
+        const long long tw = prof_now();
+        prof_wake[t] += (double)(tw - atomic_load_explicit(&prof_post_ns, memory_order_relaxed));
+        prof_t = t;
         run_job(t);
+        prof_job[t] += (double)(prof_now() - tw); prof_jobs[t]++;
         atomic_fetch_add_explicit(&P.done_count, 1, memory_order_acq_rel);
     }
 }
@@ -860,6 +905,13 @@ int moe_pool_init(const int* cpus, int n0, int n1, float share0) {
     return 0;
 }
 
+/* for other users of the pool (qx_cpu.c): a thread's node, the threads per node, the row share of node 0, memory
+   on a node */
+int moe_pool_node_of(int t) { return t >= 0 && t < MOE_MAXTHR ? P.node_of[t] : 0; }
+int moe_pool_nthr_node(int nd) { return nd >= 0 && nd < MOE_MAXNODE ? P.nthr_node[nd] : 0; }
+float moe_pool_share0(void) { return P.share0; }
+void* moe_node_alloc(size_t bytes, int node) { return node_alloc(bytes, node); }
+
 void moe_pool_stop(void) {
     atomic_store(&P.quit, 1);
     atomic_fetch_add(&P.job_gen, 1);
@@ -902,6 +954,21 @@ moe_layer* moe_layer_direct(int K, int F, int E, float clamp, const uint8_t* gat
     L->gu_gbytes = (size_t)L->nbk * 17 * 8; L->dn_gbytes = (size_t)L->nbf * 17 * 4;
     L->dgate = gate; L->dup = up; L->ddown = down;
     return L;
+}
+
+/* stream an in-place layer's experts through a store (xstore.c xs_acquire / xs_release, store layer sid) */
+static void xp_reset(moe_layer* L, int e) {
+    L->xp[e * 3] = L->dgate + (size_t)e * L->F * (L->nbk * 17);
+    L->xp[e * 3 + 1] = L->dup + (size_t)e * L->F * (L->nbk * 17);
+    L->xp[e * 3 + 2] = L->ddown + (size_t)e * L->K * (L->nbf * 17);
+}
+int moe_layer_set_stream(moe_layer* L, int (*fetch)(int, int, const int*, const uint8_t**),
+                         void (*release)(int, int, const int*), int sid) {
+    if (!L->direct) return -1;
+    L->xp = malloc(sizeof(*L->xp) * 3 * L->E);
+    for (int e = 0; e < L->E; e++) xp_reset(L, e);
+    L->sid = sid; L->release = release; L->fetch = fetch;
+    return 0;
 }
 
 /* rows of each node in an in-place layer: gate/up rows [0, gu_rows) and down rows [0, dn_rows) on node 0 */
@@ -982,6 +1049,34 @@ int moe_combine_alt(int T, int nsel, const float* w, const float* parts, const i
     J.mode = 0; J.crow = NULL; J.calt = NULL;
     return 0;
 }
+/* runs fn(t, nact, arg) on the nthr pool threads (t = 0 is the caller) and returns when all are done; fn may call
+   moe_pool_barrier() (every thread must reach it the same number of times) */
+int moe_pool_run(moe_pool_fn fn, void* arg) {
+    if (P.nthr < 1) return -1;
+    J.mode = 2; J.nact = P.nthr; J_fn = fn; J_arg = arg;
+    atomic_store_explicit(&P.done_count, 0, memory_order_relaxed);
+    const long long t0 = prof_now();
+    atomic_store_explicit(&prof_post_ns, t0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&P.job_gen, 1, memory_order_seq_cst);
+    if (atomic_load(&P.sleepers)) futex(&P.job_gen, FUTEX_WAKE_PRIVATE, 0x7fffffff);
+    prof_t = 0;
+    run_job(0);
+    const long long t1 = prof_now();
+    prof_job[0] += (double)(t1 - t0); prof_jobs[0]++;
+    for (int n = 0; atomic_load_explicit(&P.done_count, memory_order_acquire) != (unsigned)P.nthr - 1; n++)
+        if (n < SPIN_MAX) _mm_pause(); else sched_yield();
+    const long long t2 = prof_now();
+    prof_tail += (double)(t2 - t1); prof_call += (double)(t2 - t0); prof_calls++;
+    J.mode = 0; J_fn = NULL; J_arg = NULL;
+    return 0;
+}
+void moe_pool_barrier(void) {
+    const long long t0 = prof_now();
+    barrier();
+    if (prof_t >= 0 && prof_t < MOE_MAXTHR) prof_bar[prof_t] += (double)(prof_now() - t0);
+}
+int moe_pool_threads(void) { return P.nthr; }
+
 int moe_combine(int T, int nsel, const float* w, const float* parts, int K, float* out) {
     return moe_combine_alt(T, nsel, w, parts, NULL, NULL, K, out);
 }
@@ -1023,6 +1118,8 @@ static int moe_run(const moe_layer* L, int T, const float* x, int nsel, const in
         gb1_env = getenv("KINDI_MOE_GB1") ? atoi(getenv("KINDI_MOE_GB1")) : 1;
         gbd1_env = getenv("KINDI_MOE_GBD1") ? atoi(getenv("KINDI_MOE_GBD1")) : 1;
         pfb_env = getenv("KINDI_MOE_PFB") ? atoi(getenv("KINDI_MOE_PFB")) : 0;
+        pfd_blk = getenv("KINDI_MOE_PFD") ? atoi(getenv("KINDI_MOE_PFD")) : 8;
+        if (pfd_blk < 1) pfd_blk = 1;
         xsteal_env = getenv("KINDI_MOE_XSTEAL") ? atoi(getenv("KINDI_MOE_XSTEAL")) : 0;
         if (gb_env < 1) gb_env = 1;
         if (gbd_env < 1) gbd_env = 1;
@@ -1061,6 +1158,12 @@ static int moe_run(const moe_layer* L, int T, const float* x, int nsel, const in
         S.cnt[S.umap[e]]++;
     }
     if (nu == 0) return 0;
+    if (L->fetch) {
+        static const uint8_t** ptr; static int pcap;
+        if (nu > pcap) { free(ptr); ptr = malloc(sizeof(*ptr) * 3 * L->E); pcap = L->E; }
+        L->fetch(L->sid, nu, S.uexp, ptr);
+        for (int u = 0; u < nu; u++) for (int m = 0; m < 3; m++) L->xp[S.uexp[u] * 3 + m] = ptr[u * 3 + m];
+    }
     S.pstart[0] = 0;
     for (int u = 0; u < nu; u++) { S.pstart[u + 1] = S.pstart[u] + S.cnt[u]; S.cnt[u] = S.pstart[u]; }
     for (int t = 0; t < T; t++)
@@ -1095,6 +1198,10 @@ static int moe_run(const moe_layer* L, int T, const float* x, int nsel, const in
     const unsigned long long t2 = __rdtsc();
     for (int n = 0; atomic_load_explicit(&P.done_count, memory_order_acquire) != (unsigned)J.nact - 1; n++)
         if (n < SPIN_MAX) _mm_pause(); else sched_yield();
+    if (L->fetch) {
+        for (int u = 0; u < nu; u++) xp_reset((moe_layer*)L, S.uexp[u]);
+        L->release(L->sid, nu, S.uexp);
+    }
     {   /* KINDI_MOE_PROF=N: every N calls, the mean us of: before the job (quantize, union), the job on the caller,
            the wait for the other threads after it */
         static long prof = -1, n = 0; static unsigned long long a[3];
