@@ -1,10 +1,10 @@
-<p align="center"><img src="assets/kindi-banner.svg?v=0.7.0" alt="Kindi 0.7.0: language models on low-cost GPUs, from a 1 GB Quadro K420 to the RTX 50 series, the CMP 170HX and Radeon graphics. Ternary Bonsai 2B to 27B, AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B and DeepSeek-V4.1-Flash." width="100%"></p>
+<p align="center"><img src="assets/kindi-banner.svg?v=0.7.1" alt="Kindi 0.7.1: language models on low-cost GPUs, from a 1 GB Quadro K420 to the RTX 50 series, the CMP 170HX and Radeon graphics. Ternary Bonsai 2B to 27B, AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B and DeepSeek-V4.1-Flash." width="100%"></p>
 
-# Kindi 0.7.0
+# Kindi 0.7.1
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Commercial licenses available](https://img.shields.io/badge/commercial%20licenses-available-green.svg)](COMMERCIAL-LICENSE.md)
-[![Release v0.7.0](https://img.shields.io/badge/release-v0.7.0-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.7.0)
+[![Release v0.7.1](https://img.shields.io/badge/release-v0.7.1-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.7.1)
 
 Kindi is a custom inference engine for language models on low-cost GPUs. It runs Prism ML's ternary
 Bonsai models (2B, 4B, 9B and 27B), AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B, DeepSeek-V4.1-Flash and Qwen3.8-Flash-Next.
@@ -12,7 +12,8 @@ Kindi supports NVIDIA cards from the 1 GB Quadro K420 (Kepler) to the RTX 50 ser
 supports AMD Radeon 780M, 840M and 8060S graphics, and x86-64 CPUs. The OpenAI-compatible server has a prompt
 cache, tool calls, a thinking mode and speculative decoding. With the exact head, the greedy output is the same as
 the output of llama.cpp for the same model file, token for token. Version 0.7.0 adds Qwen3.8-Flash-Next, a 125B mixture-of-experts
-model for one 8 GB card, AMD RDNA2 support, native Windows with a tray monitor, several requests at once and card placement.
+model for one 8 GB card, AMD RDNA2 support, native Windows with a tray monitor, several requests at once and card placement. Version 0.7.1 adds drafting for sampled requests in Flash-Next, one CPU thread for each physical core, and
+experimental support for Inkling 2 Mini.
 
 ### Measured speed
 
@@ -102,6 +103,7 @@ By [Amir Husain](https://www.amirhusain.com).
 - [Limits](#limits)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
+- [Inkling 2 Mini (experimental)](#inkling-2-mini-experimental)
 - [Acknowledgements](#acknowledgements)
 
 ## First steps after the install
@@ -167,11 +169,11 @@ exactly that.
 
 ```sh
 git clone https://github.com/ahtx/kindi.git && cd kindi
-docker build -t kindi:0.7.0 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
+docker build -t kindi:0.7.1 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
 ```
 
-For AMD RDNA3 graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.7.0`, about 6 GB to download). For
-RDNA 3.5 graphics, build `docker/Dockerfile.rocm7` (`kindi-rocm7:0.7.0`, about 9 GB to download). See
+For AMD RDNA3 graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.7.1`, about 6 GB to download). For
+RDNA 3.5 graphics, build `docker/Dockerfile.rocm7` (`kindi-rocm7:0.7.1`, about 9 GB to download). See
 [docs/AMD.md](docs/AMD.md).
 
 You can also use the release archive. Download `kindi-0.4.0.tar.gz` from the
@@ -459,6 +461,21 @@ available. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
 The model is Prism ML's Ternary-Bonsai-2-2B under Apache 2.0. You download it from its publisher. The third-party
 notices are in [NOTICE](NOTICE).
 
+## Inkling 2 Mini (experimental)
+
+Kindi runs Thinking Machines Lab's Inkling 2 Mini from the IQ2_M GGUF (about 7.5 GiB). `kindi convert` writes a small
+pack, and `kindi serve` then serves the model with its chat template, streaming, thinking levels, tool calls, the
+sampling values of the GGUF and prompt reuse. All 3,072 experts fit in VRAM on an 8 GB card. The server answers one
+request at a time for this model.
+
+```
+kindi convert Inkling-2-Mini-IQ2_M.gguf
+kindi serve
+```
+
+On a GTX 1080 (8 GB, full VRAM, 2,048-token context), a 512-token prompt reads at 120.9 tokens/s and the model writes
+at 19.8 tokens/s. A context of 14,336 tokens fits in 8 GB. On an RTX 3080 10 GB, a context of 32,768 tokens fits.
+
 ## Acknowledgements
 
 Kindi exists because of the models it runs. Thank you to the teams that release their models openly:
@@ -477,6 +494,7 @@ Kindi exists because of the models it runs. Thank you to the teams that release 
 - The [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) team at Alibaba Cloud for Qwen3.8-Flash-Next and its
   MTP head (Qwen Community License 1.0), and [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
   for the GSQ-RCO IQ3_S GGUF that Kindi runs.
+- Thinking Machines Lab for Inkling 2 Mini and its DSpark drafter, and Unsloth for the Inkling 2 Mini GGUF conversion.
 
 Thank you to slavalevski-tech, who first ran Nemotron 3.5 Lightning on Kindi, on a Quadro K6000. Thank you to
 atimelessrage for the contributions in 0.7.0: the container RAM limit (#48), the tokenizer pack check (#49), one MTP

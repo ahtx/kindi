@@ -1,4 +1,4 @@
-Kindi 0.7.0 - third-party notices
+Kindi 0.7.1 - third-party notices
 
 Kindi is licensed under the GNU Affero General Public License v3.0 (see LICENSE). Commercial licenses are
 available (see COMMERCIAL-LICENSE.md).
@@ -47,6 +47,14 @@ Qwen3.8-Flash-Next MTP head (drafter weights)        Qwen Community License 1.0
   The installer fetches the head's tensors by byte range and converts them on the user's computer; the converted
   file keeps the license notice in its general.license field. `--no-mtp` leaves it out.
 
+Inkling 2 Mini (model weights, GGUF)                 Apache License 2.0 (thinkingmachines/Inkling-2-Mini)
+  Thinking Machines Lab. GGUF conversion (UD-Q4_K_M) by unsloth; Kindi's IQ2_M file is quantized from it.
+  https://huggingface.co/thinkingmachines/Inkling-2-Mini
+  https://huggingface.co/unsloth/Inkling-2-Mini-GGUF
+  Thinking Machines Lab's Model Acceptable Use Policy applies to users of the model:
+  https://thinkingmachines.ai/model-acceptable-use-policy/
+  Kindi reads the weights as they are.
+
 Kindi Bridge (bridge/ in the release archive)       GNU AGPL v3.0, the same as Kindi
   Amir Husain. The full source is in bridge/.
 
@@ -68,8 +76,9 @@ llama.cpp (MIT License, the ggml authors) for this model, so that its output can
 reference outputs in kindi/reference*.json were produced with llama.cpp. No llama.cpp source code is included,
 except the GGUF codebook tables listed below, which are file-format data.
 
-GGUF codebook tables (IQ2_S, IQ3_XXS and IQ3_S grids; IQ4_NL values), used in kindi/nbq_grids.h and
-kindi/gemma4.cu, are file-format data from ggml, MIT License, Copyright (c) 2023-2026 The ggml authors:
+GGUF codebook tables (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S grids; IQ4_NL values), used in
+kindi/inkling2_iq2_tables.h, kindi/nbq_grids.h and kindi/gemma4.cu, are file-format data from ggml,
+MIT License, Copyright (c) 2023-2026 The ggml authors:
 
   MIT License
 

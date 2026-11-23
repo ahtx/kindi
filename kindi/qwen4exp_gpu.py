@@ -251,7 +251,7 @@ class Model(object):
     cpu_experts: the cores of the CPU expert pool ("" with every expert on the cards).
     mtp: the MTP head file (kindi/qwen4exp_mtp_import.py) or None; its layer and all its experts go on the last card."""
 
-    def __init__(self, path, devices=(0,), expert_gb=None, reserve_gb=1.2, usage=None, cpu_experts="0-15",
+    def __init__(self, path, devices=(0,), expert_gb=None, reserve_gb=1.2, usage=None, cpu_experts=None,
                  split=None, log=print, mtp=None):
         # the MTP head: the given file, else KINDI_MTP_FILE, else next to the model the compact head
         # (qwen4exp-mtp-q2.gguf, Q2_0 experts, tools/qwen4exp_mtp_compact.py; KINDI_MTP_COMPACT=0 skips it) or
@@ -274,6 +274,9 @@ class Model(object):
         self.L = m.L
         self.log = log
         self._willneed()
+        if cpu_experts is None:                  # one thread per physical core (kindi.cores)
+            from .cores import default_cpu_list
+            cpu_experts = default_cpu_list()
         self._g_defaults(cpu_experts)
         lib()
         # layer split by dense bytes (the experts are placed after it)

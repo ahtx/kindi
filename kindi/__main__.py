@@ -171,6 +171,8 @@ def cmd_info(cfg, a):
             print("backend: Kindi Flash-Next (qwen4exp: card engine, CPU experts, MTP head)")
         elif m.get("backend") == "kindi_lightning":
             print("backend: Kindi Lightning CUDA (Nemotron-H MoE), exact head")
+        elif m.get("backend") == "kindi_inkling2":
+            print("backend: Kindi Inkling 2 (looped MoE: CPU, hybrid or full-VRAM CUDA)")
         elif m.get("backend") == "kindi_gemma4":
             print("backend: Kindi Gemma 4 CUDA")
             print("fast head: %s" % ("available" if os.path.exists(os.path.join(cfg["pack"],"head_clusters.npz"))
@@ -228,6 +230,11 @@ def main(argv=None):
     s.add_argument("--iters", type=int, default=12)
     sub.add_parser("verify", help="check against llama.cpp's reference output")
     sub.add_parser("bench", help="measure speed")
+    s = sub.add_parser("inkling", help="run experimental Inkling 2 Mini text inference")
+    s.add_argument("gguf", help="local Inkling 2 Mini GGUF")
+    s.add_argument("prompt")
+    s.add_argument("--max-tokens", type=int, default=128)
+    s.add_argument("--raw", action="store_true", help="use a raw completion prompt")
     s = sub.add_parser("serve", help="run the OpenAI-compatible server")
     s.add_argument("--host")
     s.add_argument("--port", type=int)
@@ -256,6 +263,11 @@ def main(argv=None):
     if not a.cmd:
         p.print_help()
         return 1
+    if a.cmd == "inkling":
+        from .inkling2_cli import run
+        if a.max_tokens < 1 or (a.ctx is not None and a.ctx < 512):
+            p.error("inkling requires --max-tokens >= 1 and --ctx >= 512")
+        return run(a)
     ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head")}
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,

@@ -1419,24 +1419,8 @@ def _dist(self, row, best):
 
 
 def spec_accept(dists, d, rng):
-    """speculative sampling with a deterministic draft (q = one-hot on d[i]): draft i is kept with probability
-    p_i(d[i]); at the first rejection the token is drawn from p_i without d[i] (renormalised); if all are kept, the
-    next token is drawn from p_k. dists(i) -> (ids, probs) of the target distribution after token i of the pass.
-    The emitted tokens are distributed exactly as tokens sampled one by one from the target."""
-    out = []
-    for i, di in enumerate(d):
-        idx, p = dists(i)
-        pd = float(p[idx == di].sum())
-        if rng.random_sample() < pd:
-            out.append(di)
-            continue
-        r = np.where(idx == di, 0.0, p)
-        rs = r.sum()
-        out.append(int(rng.choice(idx, p=r / rs)) if rs > 0 else int(rng.choice(idx, p=p)))
-        return out
-    idx, p = dists(len(d))
-    out.append(int(rng.choice(idx, p=p)))
-    return out
+    """speculative sampling with a deterministic draft (q = one-hot on d[i]): kindi.sampling.spec_accept"""
+    return sampling.spec_accept(dists, d, rng)
 
 
 def verify(eng, toks, pos):

@@ -312,6 +312,10 @@ class LightningBackend(object):
         # the same call 20 times (3,000+ tokens) before it stops.
         parallel = bool(req.get("parallel_tool_calls", False))
         closes = 0
+        # the request's sampling, for a backend whose _read drafts sampled tokens itself (Flash-Next)
+        self._rng = rng
+        self._samp = {"temperature": temperature, "top_p": top_p, "top_k": top_k, "min_p": min_p, "rp": rp,
+                      "rlast": rlast}
         try:
             greedy, reuse = self._read(ids)
             K.busy.update(read=len(ids), cached=reuse, phase="generating")

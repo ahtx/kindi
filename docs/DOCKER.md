@@ -8,9 +8,9 @@ Kindi has three images:
 
 | Image | Dockerfile | Contents | For |
 |---|---|---|---|
-| `kindi:0.7.0` | `docker/Dockerfile` | Ubuntu 18.04, CUDA 10.2, Python 3.6, CuPy 9.6, FastAPI, Kindi | NVIDIA cards from Kepler on, and the CPU engine |
-| `kindi-rocm:0.7.0` | `docker/Dockerfile.rocm` | Ubuntu 24.04, ROCm 6.3.3, Python 3.12, CuPy 14.2.0 built for ROCm, FastAPI, Kindi | AMD RDNA3 graphics (tested: Radeon 780M) |
-| `kindi-rocm7:0.7.0` | `docker/Dockerfile.rocm7` | Ubuntu 24.04, ROCm 7 (HIP 7.16), Python 3.12, CuPy 14.2.0 (cupy-rocm-7-0), FastAPI, Kindi | AMD RDNA 3.5 graphics (tested: Radeon 840M, Radeon 8060S) |
+| `kindi:0.7.1` | `docker/Dockerfile` | Ubuntu 18.04, CUDA 10.2, Python 3.6, CuPy 9.6, FastAPI, Kindi | NVIDIA cards from Kepler on, and the CPU engine |
+| `kindi-rocm:0.7.1` | `docker/Dockerfile.rocm` | Ubuntu 24.04, ROCm 6.3.3, Python 3.12, CuPy 14.2.0 built for ROCm, FastAPI, Kindi | AMD RDNA3 graphics (tested: Radeon 780M) |
+| `kindi-rocm7:0.7.1` | `docker/Dockerfile.rocm7` | Ubuntu 24.04, ROCm 7 (HIP 7.16), Python 3.12, CuPy 14.2.0 (cupy-rocm-7-0), FastAPI, Kindi | AMD RDNA 3.5 graphics (tested: Radeon 840M, Radeon 8060S) |
 
 Everything Kindi reads or writes lives in one volume mounted at `/data`:
 
@@ -49,14 +49,14 @@ AMD:
 ## Build
 
 ```sh
-docker build -t kindi:0.7.0 -f docker/Dockerfile .              # NVIDIA and CPU, about 15 minutes
-docker build -t kindi-rocm:0.7.0 -f docker/Dockerfile.rocm .    # AMD; builds CuPy for ROCm, 30-45 minutes
+docker build -t kindi:0.7.1 -f docker/Dockerfile .              # NVIDIA and CPU, about 15 minutes
+docker build -t kindi-rocm:0.7.1 -f docker/Dockerfile.rocm .    # AMD; builds CuPy for ROCm, 30-45 minutes
 ```
 
 ## Commands
 
 ```sh
-D="docker run --rm --gpus all -u $(id -u):$(id -g) -v $HOME/.kindi:/data kindi:0.7.0"
+D="docker run --rm --gpus all -u $(id -u):$(id -g) -v $HOME/.kindi:/data kindi:0.7.1"
 $D info
 $D convert /data/Ternary-Bonsai-2-2B-PTQ1_0.gguf
 $D verify
@@ -70,7 +70,7 @@ On AMD graphics, replace `--gpus all` with the AMD devices, and add the group ID
 A="docker run --rm --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined \
    --group-add $(getent group video | cut -d: -f3) --group-add $(getent group render | cut -d: -f3) \
    -e HSA_OVERRIDE_GFX_VERSION=11.0.2 -e HSA_ENABLE_SDMA=0 \
-   -u $(id -u):$(id -g) -v $HOME/.kindi:/data kindi-rocm:0.7.0"
+   -u $(id -u):$(id -g) -v $HOME/.kindi:/data kindi-rocm:0.7.1"
 $A verify
 ```
 
@@ -80,7 +80,7 @@ $A verify
 
 ```sh
 docker run -d --name kindi --restart unless-stopped --gpus all -u $(id -u):$(id -g) \
-    -p 127.0.0.1:8093:8093 -v $HOME/.kindi:/data kindi:0.7.0
+    -p 127.0.0.1:8093:8093 -v $HOME/.kindi:/data kindi:0.7.1
 docker logs -f kindi                                  # request log
 docker exec kindi python3 -m kindi head fast          # switch the output head
 ```
@@ -93,7 +93,7 @@ To run one server on each card, start one container for each card, with its own 
 ```sh
 docker run -d --name kindi-2 --restart unless-stopped --gpus all -u $(id -u):$(id -g) \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e CUDA_VISIBLE_DEVICES=1 -e KINDI_STATE_DIR=/data/state-gpu1 \
-    -p 127.0.0.1:8094:8093 -v $HOME/.kindi:/data kindi:0.7.0
+    -p 127.0.0.1:8094:8093 -v $HOME/.kindi:/data kindi:0.7.1
 ```
 
 Options go in as environment variables (`-e KINDI_CTX=16384`) or in `/data/kindi.conf`.
@@ -109,14 +109,14 @@ Publish the port on all interfaces, with an API key:
 
 ```sh
 docker run -d --name kindi --restart unless-stopped --gpus all -u $(id -u):$(id -g) \
-    -p 8093:8093 -e KINDI_API_KEY=<long random string> -v $HOME/.kindi:/data kindi:0.7.0
+    -p 8093:8093 -e KINDI_API_KEY=<long random string> -v $HOME/.kindi:/data kindi:0.7.1
 ```
 
 Or use the host's network (no port mapping; set the port with `KINDI_PORT`):
 
 ```sh
 docker run -d --name kindi --restart unless-stopped --gpus all -u $(id -u):$(id -g) \
-    --network host -e KINDI_PORT=8093 -e KINDI_API_KEY=<long random string> -v $HOME/.kindi:/data kindi:0.7.0
+    --network host -e KINDI_PORT=8093 -e KINDI_API_KEY=<long random string> -v $HOME/.kindi:/data kindi:0.7.1
 ```
 
 Other computers then use `http://<this computer's address>:8093/v1` and send the key as
@@ -166,10 +166,10 @@ The images run under Podman too. The NVIDIA cards go in through CDI: make the CD
 
 ```sh
 podman run -d --name kindi --device nvidia.com/gpu=all -u 0:0 \
-    -p 127.0.0.1:8093:8093 -v $HOME/.kindi:/data:Z kindi:0.7.0
+    -p 127.0.0.1:8093:8093 -v $HOME/.kindi:/data:Z kindi:0.7.1
 ```
 
-`podman build -t kindi:0.7.0 -f docker/Dockerfile .` builds the image. Compose files and AMD: see
+`podman build -t kindi:0.7.1 -f docker/Dockerfile .` builds the image. Compose files and AMD: see
 [CONTAINERS.md](CONTAINERS.md#podman). GPU access in rootless Podman is best effort; the installer uses Docker. We
 have not tested every Podman version.
 
@@ -186,6 +186,6 @@ container toolkit on the NAS) or the AMD devices. What Kindi needs:
   container limit at 60K-token prompts);
 - the port published to your network, with an API key (above).
 
-Container managers on NAS systems usually offer the same settings as fields: the image (`kindi:0.7.0`, built on
+Container managers on NAS systems usually offer the same settings as fields: the image (`kindi:0.7.1`, built on
 the NAS or another computer), the GPU, the volume for `/data`, the port and the environment variables. We have not
 tested a NAS ourselves; reports are welcome on GitHub.

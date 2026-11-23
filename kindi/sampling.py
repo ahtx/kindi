@@ -114,6 +114,41 @@ def distribution(cand, z, temperature, top_p, kk, min_p=0.0):
     return idx, p
 
 
+def spec_accept(dists, d, rng, qdists=None):
+    """speculative sampling of one verify pass: the tokens it emits are distributed exactly as tokens sampled one by
+    one from the target. dists(i) -> (ids, probs): the target (the sampler's distribution, after every transform) after
+    token i of the pass; d: the drafted tokens. qdists(i) -> (ids, probs): the draft's distribution of d[i]; None: the
+    draft is deterministic (an argmax: q is one-hot on d[i]).
+    Draft i is kept with probability min(1, p(d[i]) / q(d[i])); at the first rejection the token is drawn from the
+    normalised max(0, p - q) (one-hot q: p without d[i]); when every draft is kept, one more token is drawn from p
+    after the last. Returns the emitted tokens: the kept drafts, then one drawn token."""
+    out = []
+    for i, di in enumerate(d):
+        idx, p = dists(i)
+        pd = float(p[idx == di].sum())
+        if qdists is None:
+            qd, q = 1.0, None
+        else:
+            qi, qp = qdists(i)
+            qd = float(qp[qi == di].sum())
+            q = np.zeros(len(idx))
+            pos = {int(t): j for j, t in enumerate(idx)}
+            for t, v in zip(qi, qp):
+                j = pos.get(int(t))
+                if j is not None:
+                    q[j] = v
+        if qd > 0 and rng.random_sample() < min(1.0, pd / qd):
+            out.append(int(di))
+            continue
+        r = np.where(idx == di, 0.0, p) if q is None else np.maximum(p - q, 0.0)
+        rs = r.sum()
+        out.append(int(rng.choice(idx, p=r / rs)) if rs > 0 else int(rng.choice(idx, p=p)))
+        return out
+    idx, p = dists(len(d))
+    out.append(int(rng.choice(idx, p=p)))
+    return out
+
+
 def penalize(cand, z, rp, recent):
     """llama.cpp's repeat penalty: the logit of each recent token is divided by rp when it is positive and
     multiplied by rp when it is negative"""

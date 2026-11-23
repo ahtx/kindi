@@ -5,7 +5,8 @@ kindi.engine.Engine: reset(), feed(tok, pos), step(tok, pos) -> greedy token, ge
 self.ylog[:self.ylog_n]. Loads a Kindi pack (kindi convert) and repacks the ternary weights into pair codes
 ("perm8": per 8-row block and 128-column group, 64 words of 32 bits; one vpermps gives 8 rows x 2 columns).
 kcpu.c is built on first use with gcc (-O3 -march=native -fopenmp) into KINDI_CPU_CACHE (default ~/.cache/kindi).
-Threads: OMP_NUM_THREADS (with OMP_PROC_BIND=close; on a two-socket host, the cores of one socket)."""
+Threads: OMP_NUM_THREADS (with OMP_PROC_BIND=close; on a two-socket host, the cores of one socket); unset, the
+physical cores of the first NUMA node (kindi.cores: one thread per core is faster than one per SMT thread)."""
 import ctypes
 import json
 import os
@@ -95,8 +96,8 @@ def _p(a, t=PF):
 class Engine(object):
     def __init__(self, pack, ctx=4096, clusters=None, log=print, threads=None):
         t0 = time.time()
-        if threads:
-            os.environ["OMP_NUM_THREADS"] = str(threads)
+        from .cores import set_omp_default
+        set_omp_default(threads)              # OMP_NUM_THREADS, else the physical cores (kindi.cores)
         self.lib = _lib()
         self.ctx = int(ctx)
         man = json.load(open(os.path.join(pack, "kindi_pack.json")))

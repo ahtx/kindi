@@ -291,13 +291,29 @@ class Kernels(object):
         nb = n // 256                                   # k_quant256's bits, one warp a block (k_quant_w)
         self.launch(dev, st, "k_quant_w", ((nb + 7) // 8,), 256, [("p", x), ("l", nb), ("p", q), ("p", d), ("i", 256)])
 
+    _shapes_ok = set()
+
+    def check_shape(self, K, F):
+        """the expert kernels give each output row a group of 8 (k_gate_up, k_down, the slot kernels, k_fgu) or 16
+        lanes (k_fdn) and return the groups past the last row before full-warp shuffles. A warp then has lanes that
+        never reach the shuffle, which hangs on sm_70+ (tools/check_warp_masks.py). Every row count must fill whole
+        warps: F (the expert width) a multiple of 4 and K (the hidden size; k_down_slots does K / 2 rows) of 8."""
+        if (K, F) in self._shapes_ok:
+            return
+        if F % 4 or K % 8:
+            raise ValueError("Kindi qx: expert shape K=%d, F=%d is not supported: the expert kernels need F a multiple "
+                             "of 4 and K a multiple of 8 (a partial warp of rows would hang on sm_70+ cards)" % (K, F))
+        self._shapes_ok.add((K, F))
+
     def gate_up(self, dev, st, ty, K, F, nu, mats, pstart, ptok, xq, xd, h):
+        self.check_shape(K, F)
         if nu:
             self.launch(dev, st, "k_gate_up", ((F + 15) // 16, nu), 128,
                         [("i", ty), ("i", K), ("i", F), ("p", mats), ("p", pstart), ("p", ptok), ("p", xq), ("p", xd),
                          ("p", h)])
 
     def down(self, dev, st, ty, K, F, nsel, nu, mats, pstart, ptok, pslot, hq, hd, parts):
+        self.check_shape(K, F)
         if nu:
             self.launch(dev, st, "k_down", ((K + 15) // 16, nu), 128,
                         [("i", ty), ("i", K), ("i", F), ("i", nsel), ("p", mats), ("p", pstart), ("p", ptok),
@@ -319,6 +335,7 @@ class Kernels(object):
     def gate_up_slots(self, dev, st, ty, K, F, nsel, idx, slotmap, hot, rowbytes, xq, xd, h, tok_nsel=None,
                       min_slot=0):
         """nsel slots; slot s reads input row s // tok_nsel (default: one token, all slots on row 0)"""
+        self.check_shape(K, F)
         if self.fslots(ty, K, 40, (18, 21, 22, 23)):
             nw = 256 // self.FS_GL
             self.launch(dev, st, "k_fgu", ((F + nw - 1) // nw, nsel), 256,
@@ -330,6 +347,7 @@ class Kernels(object):
                      ("p", xq), ("p", xd), ("p", h), ("i", tok_nsel or nsel), ("i", min_slot)])
 
     def down_slots(self, dev, st, tyg, ty, K, F, nsel, idx, slotmap, hot, rowbytes, hq, hd, parts, min_slot=0):
+        self.check_shape(K, F)
         if (self.DN == 64 and K % 16 == 0 and self.fslots(ty, F, 24, (20, 42))
                 and self.fslots(tyg, K, 40, (18, 21, 22, 23))):
             rbg = (K // XG_PER[tyg]) * XG_BYTES[tyg]

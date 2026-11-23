@@ -145,8 +145,12 @@ class GraphDrafter(Drafter):
     probe_len = int(os.environ.get("KINDI_MTP_PROBE_LEN", "4"))
     hyst = float(os.environ.get("KINDI_MTP_HYST", "0.10"))
 
-    def _passes(self, ids, n, log=None, chunk=None, stats=None):
-        """the drafted decode as a generator: yields the first token as [tok], then each pass's new tokens"""
+    def _passes(self, ids, n, log=None, chunk=None, stats=None, sampler=None):
+        """the drafted decode as a generator: yields the first token as [tok], then each pass's new tokens.
+        sampler: None for greedy (the main model's argmax); else an object with first(logits, ids) -> the first token
+        and accept(window logits, drafts, ids, out) -> the pass's new tokens by speculative sampling
+        (kindi.sampling.spec_accept: the kept drafts, then one drawn token), so the output is distributed as plain
+        sampling. The drafts are the head's argmax either way."""
         g, k = self.g, self.k
         chunk = chunk or getattr(g, "prompt_chunk", 256)
         ids = list(ids)
@@ -184,7 +188,7 @@ class GraphDrafter(Drafter):
                 head_rows(c, hs)
                 del hs
         carry = cur["carry"]
-        nxt = int(lg[-1].argmax())
+        nxt = int(lg[-1].argmax()) if sampler is None else int(sampler.first(lg[-1], ids))
         torch.cuda.synchronize()
         dec = g.decoder()
         dec.win_max = k + 1                           # window buffers for the longest chain
@@ -278,12 +282,17 @@ class GraphDrafter(Drafter):
             tw = time.time()
             lgT, hT = dec.window(seq)
             tj = time.time()
-            pred = lgT.argmax(-1).tolist()
             stats["window_s"] += tj - tw
+            if sampler is None:
+                pred = lgT.argmax(-1).tolist()
+                j = 0
+                while j < k_now and pred[j] == drafts[j]:
+                    j += 1
+                pred = pred[:j + 1]
+            else:                                     # speculative sampling: kept drafts, then one drawn token
+                pred = sampler.accept(lgT, drafts, ids, out)
+                j = len(pred) - 1
             stats["judge_s"] += time.time() - tj
-            j = 0
-            while j < k_now and pred[j] == drafts[j]:
-                j += 1
             dec.keep(j + 1)
             stats["passes"] += 1
             stats["drafted"] += k_now
@@ -321,13 +330,13 @@ class GraphDrafter(Drafter):
             out += new
         return out[:n], stats
 
-    def stream(self, ids, n, cancel=None, stop=(), chunk=None, stats=None):
-        """token by token (greedy, the same tokens as generate): yields each accepted token; ends after n tokens,
-        after a token in stop (yielded), or when cancel() is true (checked between passes; a pass in flight
-        finishes first). stats: a dict filled as generate's."""
+    def stream(self, ids, n, cancel=None, stop=(), chunk=None, stats=None, sampler=None):
+        """token by token (greedy, the same tokens as generate; or sampled, see _passes): yields each accepted token;
+        ends after n tokens, after a token in stop (yielded), or when cancel() is true (checked between passes; a
+        pass in flight finishes first). stats: a dict filled as generate's."""
         k = 0
         stop = set(stop)
-        gen = self._passes(ids, n, chunk=chunk, stats=stats)
+        gen = self._passes(ids, n, chunk=chunk, stats=stats, sampler=sampler)
         try:
             for new in gen:
                 for t in new:

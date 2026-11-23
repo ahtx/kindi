@@ -40,6 +40,84 @@ def _clone(st):
     return out
 
 
+def band(z, temperature):
+    """(token ids, logits as float64) of the tokens of logit row z (a card tensor) within 16 temperatures of the best
+    (each other token has relative probability under e^-16 against the best), at most 256 of the best; None when
+    more than 4096 qualify even at a narrow band (the caller then takes the best token). The candidates of plain
+    sampling and of drafted sampling, so both sample the same distribution."""
+    z = z.float().reshape(-1)
+    w = 16.0 * max(temperature, 0.1)
+    got = None
+    while True:
+        idx = (z >= z.max() - w).nonzero().reshape(-1)
+        if idx.numel() <= 4096:
+            got = idx.cpu().numpy().astype(np.int64), z[idx].double().cpu().numpy()
+            break
+        if w <= 0.5:
+            break
+        w /= 2
+    if got is None:
+        return None
+    cand, sc = got
+    if cand.size > 256:
+        keep = np.argpartition(sc, -256)[-256:]
+        cand, sc = cand[keep], sc[keep]
+    return cand, sc
+
+
+def row_dist(z, temperature, top_p, top_k, min_p=0.0, penalty=None, got=None):
+    """the sampler's distribution for logit row z: (token ids, probabilities) after the repeat penalty, top-k, top-p,
+    min-p and the temperature (kindi.sampling.distribution); one-hot on the best token at temperature 0 or when
+    the band is too wide (as FlashNextBackend._pick). got: band(z, temperature) when the caller has it."""
+    from .sampling import distribution, penalize
+    got = band(z, temperature) if got is None else got
+    if got is None:
+        return np.array([int(z.reshape(-1).argmax())], dtype=np.int64), np.ones(1)
+    cand, sc = got
+    if penalty is not None and penalty[0] > 1.0:
+        sc = penalize(cand, sc, penalty[0], penalty[1])
+    if temperature <= 0:
+        return np.array([int(cand[int(np.argmax(sc))])], dtype=np.int64), np.ones(1)
+    return distribution(cand, sc, temperature, top_p, top_k, min_p)
+
+
+class DraftSampler(object):
+    """speculative sampling for the drafted stream (kindi.qwen4exp_mtp.GraphDrafter, sampler=): each row of a
+    verify window gets the distribution plain sampling would use there (row_dist, with the repeat penalty over the
+    history up to that row), and kindi.sampling.spec_accept keeps each draft (the head's argmax, so q is one-hot)
+    with probability p(draft), else draws from p without it. The output is distributed as plain sampling; the
+    request's random generator (its seed) draws every random number."""
+
+    def __init__(self, temperature, top_p, top_k, min_p, rp, rlast, rng):
+        self.t, self.top_p, self.top_k = float(temperature), float(top_p), int(top_k or 0)
+        self.min_p, self.rp, self.rlast, self.rng = float(min_p or 0.0), float(rp or 1.0), int(rlast), rng
+
+    def _pen(self, hist):
+        if self.rp <= 1.0:
+            return None
+        return self.rp, set(hist[-self.rlast:] if self.rlast > 0 else hist)
+
+    def dist(self, z, hist):
+        return row_dist(z, self.t, self.top_p, self.top_k, self.min_p, self._pen(hist))
+
+    def first(self, z, ids):
+        idx, p = self.dist(z, ids)
+        return int(self.rng.choice(idx, p=p))
+
+    def accept(self, lgT, drafts, ids, out):
+        from .sampling import spec_accept
+        drafts = list(drafts)
+        if self.rp > 1.0:
+            hist = list(ids) + list(out)
+
+            def hd(i):
+                return hist + drafts[:i]
+        else:
+            def hd(i):
+                return ()
+        return spec_accept(lambda i: self.dist(lgT[i], hd(i)), drafts, self.rng)
+
+
 # the card memory of the parts beside the hot experts (GB; FLASHNEXT-STATUS: dense 3.64, head 0.53; the compact MTP head
 # 0.71 + its draft vocabulary 0.11; the CUDA context, graphs and buffers 1.2) for KINDI_FN_DRAFT=auto's check
 DENSE_GB, HEAD_GB, RESERVE_GB = 4.17, 0.82, 1.2
@@ -55,7 +133,9 @@ class Engine(object):
         from .qwen4exp_gpu import Model
         self.torch = torch
         devs = [int(x) for x in os.environ.get("KINDI_FN_CARDS", "0").split(",") if x.strip() != ""]
-        cpus = os.environ.get("KINDI_FN_CPUS", os.environ.get("KINDI_MOE_CPUS0", "0-15"))
+        from .cores import default_cpu_list
+        # the CPU expert pool: one thread per physical core of every socket (KINDI_FN_CPUS overrides; 0.7 had 0-15)
+        cpus = os.environ.get("KINDI_FN_CPUS", os.environ.get("KINDI_MOE_CPUS0")) or default_cpu_list()
         t0 = time.time()
         # KINDI_FN_EXPERT_GB: the VRAM for hot experts on each card ("6" or "6,3"); default: what is free
         eg = os.environ.get("KINDI_FN_EXPERT_GB")
@@ -138,16 +218,18 @@ class Engine(object):
         self.pos, self.live = self.st["pos"], False
         return int(self.row.argmax())
 
-    def start_drafted(self, ids, n, cancel=None, stop=()):
-        """greedy reply of ids with MTP drafts (kindi.qwen4exp_mtp.GraphDrafter.stream): returns the first token;
-        each step() then gives the next accepted token. The drafter reads the prompt itself (its head needs the
-        prompt's cache), so the kept state is not this prompt's afterwards."""
+    def start_drafted(self, ids, n, cancel=None, stop=(), sampler=None):
+        """reply of ids with MTP drafts (kindi.qwen4exp_mtp.GraphDrafter.stream; greedy, or sampled with a
+        DraftSampler): returns the first token; each step() then gives the next accepted token. The drafter reads the
+        prompt itself (its head needs the prompt's cache), so the kept state is not this prompt's afterwards."""
         from .qwen4exp_mtp import GraphDrafter
         self.dstats = {}
         self._gen = GraphDrafter(self.gm, k=int(os.environ.get("KINDI_FN_DRAFT_K", "2"))).stream(
-            list(ids), n, cancel=cancel, stop=tuple(stop), stats=self.dstats)
+            list(ids), n, cancel=cancel, stop=tuple(stop), stats=self.dstats, sampler=sampler)
         self.st, self.live, self.pos = None, False, len(ids)
-        return next(self._gen)
+        first = int(next(self._gen))
+        self._dhist = list(ids) + [first]             # the prompt and the tokens handed out
+        return first
 
     def end_drafted(self):
         if self._gen is not None:
@@ -157,12 +239,21 @@ class Engine(object):
     def step(self, tok=None):
         """write tok at the next position (the decoder, loaded from the kept state at the first step); returns the
         greedy next token"""
+        if self._gen is not None and tok is not None and int(tok) != self._dhist[-1]:
+            # the caller writes another token than the drafter's (the thinking budget closes the thinking): the
+            # drafted stream ends; the plain path reads the reply so far with tok, and goes on from there
+            h = self._dhist[:-1] + [int(tok)]
+            self.end_drafted()
+            self.reset()
+            return self.prefill(h, 0)
         if self._gen is not None:                     # a drafted reply: the drafter's next accepted token
             self.pos += 1
             try:
-                return int(next(self._gen))
+                t = int(next(self._gen))
             except StopIteration:
                 return int(tok)
+            self._dhist.append(t)
+            return t
         if not self.live:
             if self.dec is None:
                 self.dec = self.gm.decoder(self.ctx)
@@ -179,6 +270,10 @@ class Engine(object):
         while len(out) < n:
             out.append(self.step(out[-1]))
         return out
+
+    def drafting_now(self):
+        """a drafted reply is running: step() hands out the drafter's tokens (sampled already when sampling)"""
+        return self._gen is not None
 
     def candidates(self, w):
         """(token ids, logits) of the tokens within w of the best, or None when more than 4096 qualify"""
@@ -270,23 +365,15 @@ class FlashNextBackend(LightningBackend):
     def _pick(self, greedy, temperature, top_p, top_k, rng, min_p=0.0, penalty=None):
         if temperature <= 0 and (penalty is None or penalty[0] <= 1.0 or greedy not in penalty[1]):
             return greedy
-        from .sampling import Sampler, penalize
-        w = 16.0 * max(temperature, 0.1)
-        got = self.eng.candidates(w)
-        while got is None and w > 0.5:
-            w /= 2
-            got = self.eng.candidates(w)
+        if self.eng.drafting_now():                   # drafted sampling: the drafter drew this token (DraftSampler)
+            return greedy
+        got = band(self.eng.row, temperature)
         if got is None:
             return greedy
-        cand, sc = got
-        if cand.size > 256:
-            keep = np.argpartition(sc, -256)[-256:]
-            cand, sc = cand[keep], sc[keep]
-        if penalty is not None and penalty[0] > 1.0:
-            sc = penalize(cand, sc, penalty[0], penalty[1])
+        idx, p = row_dist(self.eng.row, temperature, top_p, top_k, min_p, penalty, got=got)
         if temperature <= 0:
-            return int(cand[int(np.argmax(sc))])
-        return Sampler._pick(cand, sc, temperature, top_p, top_k, rng, min_p)
+            return int(idx[0])
+        return int(rng.choice(idx, p=p))
 
     def _read(self, ids):
         """the kept state holds the last prompt (not its reply): reuse it when ids continues that prompt, or the copy
@@ -315,9 +402,14 @@ class FlashNextBackend(LightningBackend):
         return greedy, reused
 
     def _read_drafted(self, ids):
-        """a greedy request with drafting on: the drafter reads the whole prompt (no reuse) and gives the reply"""
+        """a request with drafting on: the drafter reads the whole prompt (no reuse) and gives the reply (greedy; or,
+        for a sampled request, by speculative sampling with the request's sampling and random generator)"""
         d = self._draft
-        greedy = self.eng.start_drafted(ids, d["n"], cancel=d["cancel"], stop=sorted(self.stop_ids))
+        sampler = None
+        if d["sampled"]:
+            s = self._samp
+            sampler = DraftSampler(s["temperature"], s["top_p"], s["top_k"], s["min_p"], s["rp"], s["rlast"], self._rng)
+        greedy = self.eng.start_drafted(ids, d["n"], cancel=d["cancel"], stop=sorted(self.stop_ids), sampler=sampler)
         self._prompt, self.cached, self.snap = [], [], []
         return greedy, 0
 
@@ -327,13 +419,18 @@ class FlashNextBackend(LightningBackend):
         thinking = kw.get("enable_thinking", req.get("enable_thinking", True)) is not False
         saved = dict(_lg.MODEL_SAMPLING)
         _lg.MODEL_SAMPLING.update(SAMPLING_THINK if thinking else SAMPLING_PLAIN)
-        # drafting: greedy requests only (temperature 0 given, no repeat penalty), when the engine can draft
-        greedy_req = req.get("temperature") is not None and float(req.get("temperature")) <= 0 \
-            and float(req.get("repeat_penalty") or 1.0) <= 1.0
+        # drafting, when the engine can draft: a greedy request (temperature 0 given, no repeat penalty) takes the
+        # drafter's greedy stream, as in 0.7.0; any other request (0.7.1) drafts with speculative sampling
+        # (DraftSampler: the output is distributed as plain sampling). KINDI_FN_DRAFT_SAMPLED=0: sampled requests
+        # decode plainly
+        greedy_t = req.get("temperature") is not None and float(req.get("temperature")) <= 0
+        greedy_req = greedy_t and float(req.get("repeat_penalty") or 1.0) <= 1.0
+        sampled_ok = not greedy_t and os.environ.get("KINDI_FN_DRAFT_SAMPLED", "1") != "0"
         self._draft = None
-        if self.eng.draft_on and greedy_req and not req.get("_kindi_check"):
+        if self.eng.draft_on and (greedy_req or sampled_ok) and not req.get("_kindi_check"):
             n = int(req.get("max_tokens") or req.get("max_completion_tokens") or K.cfg["max_tokens"])
-            self._draft = {"n": n, "cancel": (lambda: cancel.is_set()) if cancel is not None else None}
+            self._draft = {"n": n, "cancel": (lambda: cancel.is_set()) if cancel is not None else None,
+                           "sampled": not greedy_req}
         read = self._read
         if self._draft is not None:
             self._read = self._read_drafted
@@ -350,7 +447,7 @@ class FlashNextBackend(LightningBackend):
             self.cached = list(getattr(self, "_prompt", []))
             if self._draft is not None and self.eng.dstats:
                 K.last_spec = {"drafted": self.eng.dstats.get("drafted", 0), "accepted": self.eng.dstats.get("accepted", 0),
-                               "passes": self.eng.dstats.get("passes", 0)}
+                               "passes": self.eng.dstats.get("passes", 0), "sampled": bool(self._draft["sampled"])}
 
     # ---- /health
     def drafting(self):

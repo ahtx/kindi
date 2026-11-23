@@ -3,7 +3,7 @@ optionally with the expert reads of xstore.c. Built on first use with gcc into K
 ~/.cache/kindi).
 
 Settings:
-  KINDI_QX_CPUS      the pool's cores (default "0-15"); one thread per core, the calling thread becomes thread 0
+  KINDI_QX_CPUS      the pool's cores (default: one per physical core, kindi.cores); one thread per core, the calling thread becomes thread 0
   KINDI_QX_XS_GB     > 0: stream the experts through xstore.c with a RAM cache of that many GB (direct I/O from the
                      model file); default 0: read them in place from the mapped file (the page cache)
   KINDI_XS_THREADS   xstore I/O threads (default 8 here), KINDI_XS_CHUNK bytes per read (default 1 MB)
@@ -161,6 +161,11 @@ def _mem_available():
     return 0
 
 
+def _default_cpus():
+    from .cores import default_cpu_list
+    return default_cpu_list()
+
+
 def cpus(text):
     out = []
     for part in text.split(","):
@@ -175,7 +180,7 @@ class Experts(object):
     def __init__(self, path, cpu_list=None, xs_gb=None):
         from .qwen4exp_ref import shards
         L = lib()
-        cl = cpus(cpu_list or os.environ.get("KINDI_QX_CPUS", "0-15"))
+        cl = cpus(cpu_list or os.environ.get("KINDI_QX_CPUS") or _default_cpus())
         self.files, t = [], {}
         for p in shards(path):
             g = GGUF(p)

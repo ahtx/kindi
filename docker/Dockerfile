@@ -3,8 +3,8 @@
 # driver. CUDA 10.2 is the last toolkit with Kepler sm_30 support, and CuPy 9.6 the last CuPy built for it; the host
 # needs the NVIDIA driver (470 for Kepler) and the NVIDIA Container Toolkit. See docs/DOCKER.md.
 #
-#   docker build -t kindi:0.7.0 -f docker/Dockerfile --build-arg KINDI_VERSION=0.7.0 --build-arg KINDI_REVISION=$(git rev-parse HEAD) .
-#   docker run -d --name kindi --gpus all -p 127.0.0.1:8093:8093 -v kindi-data:/data -e KINDI_MODEL=bonsai-4b kindi:0.7.0
+#   docker build -t kindi:0.7.1 -f docker/Dockerfile --build-arg KINDI_VERSION=0.7.1 --build-arg KINDI_REVISION=$(git rev-parse HEAD) .
+#   docker run -d --name kindi --gpus all -p 127.0.0.1:8093:8093 -v kindi-data:/data -e KINDI_MODEL=bonsai-4b kindi:0.7.1
 #
 # The base image is pinned by digest, and the CUDA installer by sha256, so a rebuild gives the same toolchain.
 FROM ubuntu:18.04@sha256:152dc042452c496007f07ca9127571cb9c29697f42acbfad72324b2bb2e43c98

@@ -92,7 +92,9 @@ def convert(gguf_path, out_dir, log=print):
         log("recognized Gemma 4 GGUF: %d tensors, %s quantization; Kindi native CUDA decoder" %
             (info["tensor_count"], info["tensor_types"]))
         return manifest
-    from . import lightning_cli, nanbeige_cli, qwen4exp_cli
+    from . import inkling2_cli, lightning_cli, nanbeige_cli, qwen4exp_cli
+    if inkling2_cli.is_inkling(g):            # Inkling 2 Mini: the weights stay in the GGUF file
+        return inkling2_cli.convert(g, gguf_path, out_dir, __version__, PACK_FORMAT, sha256, log=log)
     if qwen4exp_cli.is_qwen4exp(g):           # Qwen3.8-Flash-Next: the weights stay in the GGUF shards
         return qwen4exp_cli.convert(g, gguf_path, out_dir, __version__, PACK_FORMAT, log=log)
     if lightning_cli.is_lightning(g):

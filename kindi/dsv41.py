@@ -28,6 +28,7 @@ import time
 
 import numpy as np
 
+from .cores import default_cpu_list
 from .gguf import GGUF
 from .dsv41_tokenizer import Tok
 
@@ -122,7 +123,8 @@ def moe_phases():
     """the expert pool's per-thread phase cycles (moe_cpu.c moe_ph [128][6]), summed over the pool's threads:
     gate/up work, barrier 1, quantize, barrier 2, down work, gate/up kernels"""
     arr = (ctypes.c_ulonglong * (128 * 6)).in_dll(lib(), "moe_ph")
-    n = len(_cpus(os.environ.get("KINDI_MOE_CPUS0", "0-19"))) + len(_cpus(os.environ.get("KINDI_MOE_CPUS1", "20-23,32-39")))
+    n = len(_cpus(os.environ.get("KINDI_MOE_CPUS0") or default_cpu_list(0))) + len(_cpus(
+        "" if os.environ.get("KINDI_MOE_CPUS1") == "" else (os.environ.get("KINDI_MOE_CPUS1") or default_cpu_list(1))))
     return [sum(arr[t * 6 + k] for t in range(n)) for k in range(6)], n
 
 
@@ -358,8 +360,8 @@ class Model(object):
                 L.dsv_add_tensor(name.encode(), base + off, ty, ne[0], ne[1], ne[2])
             if g.tensors and all(n.endswith("_exps.weight") for n, _, _, _ in g.tensors):
                 expert_only.append((f, p, size.value))
-        m0 = _cpus(os.environ.get("KINDI_MOE_CPUS0", "0-19"))
-        m1 = _cpus(os.environ.get("KINDI_MOE_CPUS1", "20-23,32-39"))
+        m0 = _cpus(os.environ.get("KINDI_MOE_CPUS0") or default_cpu_list(0))
+        m1 = _cpus("" if os.environ.get("KINDI_MOE_CPUS1") == "" else (os.environ.get("KINDI_MOE_CPUS1") or default_cpu_list(1)))
         # dense workers: on the expert pool's own cores ("same"; the calling thread is thread 0 of both pools) or on
         # their hyper-thread siblings ("siblings")
         same = os.environ.get("KINDI_DSV_PLACE", "same") == "same"

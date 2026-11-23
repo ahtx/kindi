@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.7.1 (2026-11-23)
+
+0.7.1 keeps everything in 0.7.0 (Qwen3.8-Flash-Next, AMD RDNA2, native Windows, several requests at once and card
+placement) and adds three changes and one model. Flash-Next now drafts for sampled requests. The CPU engines use one
+thread for each physical core. A new check finds the warp-shuffle mistakes that hung kernels on RTX 20, 30 and 40
+cards. Kindi also runs Inkling 2 Mini.
+
+### New
+
+- **Inkling 2 Mini** (Thinking Machines Lab), experimental. `kindi convert` accepts the IQ2_M GGUF (about 7.5 GiB),
+  and `kindi serve` runs it with its chat template, streaming, thinking levels, tool calls, the sampling values from
+  the GGUF and prompt reuse. All 3,072 experts fit in VRAM on an 8 GB card. The
+  server answers one request at a time for this model: a second request waits for the first. On a GTX 1080 (8 GB,
+  full VRAM) it reads a 512-token prompt at 120.9 tokens/s and writes at 19.8 tokens/s with a 2,048-token context.
+  On an RTX 3080 10 GB, a context of 32,768 tokens fits.
+- **Drafting for sampled requests in Flash-Next.** A request with temperature above 0, top-k, top-p, min-p or a
+  repeat penalty now drafts with the MTP head. Each draft is kept with the probability that plain sampling gives
+  that token, so the distribution of the output does not change. Greedy requests keep the 0.7.0 stream exactly.
+  `KINDI_FN_DRAFT_SAMPLED=0` turns it off.
+- **One CPU thread for each physical core.** Where Kindi picks CPU threads itself (the dense CPU engines, the
+  Flash-Next expert pool, the DeepSeek expert pools), it takes one logical CPU for each physical core. Environment
+  settings still override it. On a Ryzen 9 7940HS, 8 threads decode at 11.5 tokens/s and 16 threads at 10.0 to 10.8.
+
+### Fixed
+
+- Inkling 2 Mini hung on RTX 20, 30 and 40 cards (compute capability 7.0 and later) because two warp shuffles named
+  lanes that never reach them. Both shuffles now name the lanes that run.
+- `tools/check_warp_masks.py` lists every warp shuffle and barrier under a condition that changes inside a warp and
+  fails on any that is not reviewed. The release checks run it. The expert kernels now stop with a clear error when
+  a model has a shape they cannot handle, in place of a hang.
+- The native Windows package stays at 0.7.0: 0.7.1 has no new Windows build.
+- `install.sh` and `kindi cards` stop with a clear message when the NVIDIA driver and library versions differ, and
+  `install.sh` names the package when `apt-get` cannot install Docker or the NVIDIA container toolkit. It no longer
+  takes an `nvidia` runtime entry in `daemon.json` for an installed toolkit.
+
+
 ## 0.7.0 (2026-11-22)
 
 0.7.0 adds Qwen3.8-Flash-Next, a 125B mixture-of-experts model that runs on one 8 GB card. It also adds AMD RDNA2
