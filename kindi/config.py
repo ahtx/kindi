@@ -113,7 +113,17 @@ def load(explicit=None, overrides=None):
     if cfg["model_name"] == "auto":
         manifest = os.path.join(cfg["pack"], "kindi_pack.json")
         m = json.load(open(manifest)) if os.path.isfile(manifest) else {}
-        if m.get("backend") in ("kindi_gemma4", "kindi_lightning", "kindi_qwen4exp", "kindi_inkling2"):
+        # which family claims the pack is the adapters' answer, not a second list here.
+        from .modelids import adapter_model_id
+
+        claimed = adapter_model_id(m)
+        if claimed:
+            cfg["model_name"] = m.get("model_id") or claimed
+        elif m.get("backend") in ("kindi_gemma4", "kindi_lightning", "kindi_qwen4exp",
+                                   "kindi_inkling2"):
+            # The contract alone has no family adapters yet. Keep the fallback these manifests had
+            # before the registry, so merging the contract cannot rename an existing Gemma 4 or
+            # Lightning pack through the Bonsai size inference.
             cfg["model_name"] = m.get("model_id", "gemma4")
         else:
             # the GGUF's general.name, then its file name: some files name the model only "Hf"
