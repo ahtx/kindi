@@ -255,6 +255,35 @@ def _stream_to_card(path, chunk=1 << 26):
     return out
 
 
+def _stream_ranges_to_card(path, ranges, chunk=1 << 26):
+    """The given (element offset, element count) uint32 ranges of a file -> one device array, in order.
+
+    A partial (tandem) shard reads its own tensors out of the full 5-trit cache, so it never writes a
+    second multi-GB cache file next to the pack and never copies another backend's weights to the card.
+    Each range is copied in chunks, so the host never holds more than one chunk.
+    """
+    total = sum(int(n) for _, n in ranges)
+    out = cp.empty(total, dtype=cp.uint32)
+    o = 0
+    with open(path, "rb") as f:
+        for off, n in ranges:
+            f.seek(4 * int(off))
+            got = 0
+            while got < int(n):
+                a = np.fromfile(f, dtype=np.uint32, count=min(chunk, int(n) - got))
+                if not a.size:
+                    raise SystemExit("kindi: the 5-trit cache %s is shorter than its index says" % path)
+                out[o:o + a.size].set(a)
+                o += a.size
+                got += a.size
+    return out
+
+
+def g5_words(R, C):
+    """uint32 words of one tensor's 5-trit blob: 7 per (128-column group, row) - see g5_blob."""
+    return (int(C) // 128) * int(R) * 7
+
+
 def _ranges(*rs):
     return np.concatenate([np.arange(a, b) for a, b in rs]).astype(np.int64)
 
@@ -350,6 +379,11 @@ class Shard(object):
         self.NFF = self.g1 - self.g0
         self.CONV_CH = 2 * self.NK * self.HK + self.NV * self.HK
         self.NATT = self.NL // self.dims["full_attention_interval"]
+        # partial (tandem) shards own a subset: the K/V lists keep the pack's own attention index with
+        # None for the other backend's layers, and only the owned layers' state is allocated
+        self.owned = tp.layers
+        self.owned_attn = [il for il in tp.layers if (il + 1) % self.dims["full_attention_interval"] == 0]
+        self.NATT_own = len(self.owned_attn)
         self.R_head = tp.head_split[card + 1] - tp.head_split[card]
         with cp.cuda.Device(card):
             self.k = Kernels()
@@ -376,7 +410,7 @@ class Shard(object):
         gv0 = c * NV * HK                                                              # grouped GDN output columns
         h0, kvh0, a0 = c * self.NH, c * self.NHKV, c * self.NH * HD
         tern, flt = {}, {}
-        for il in range(self.NL):
+        for il in tp.layers:
             p = "blk.%d." % il
             if (il + 1) % self.dims["full_attention_interval"]:
                 tern[p + "attn_qkv.weight"] = (_ranges(*(qk_rows + v_rows)), None)
@@ -395,7 +429,8 @@ class Shard(object):
             tern[p + "ffn_gate.weight"] = (_ranges((self.g0, self.g1)), None)
             tern[p + "ffn_up.weight"] = (_ranges((self.g0, self.g1)), None)
             tern[p + "ffn_down.weight"] = (None, (self.d0, self.d1))
-        tern["output.weight"] = (_ranges((tp.head_split[c], tp.head_split[c + 1])), None)
+        if tp.need_head:
+            tern["output.weight"] = (_ranges((tp.head_split[c], tp.head_split[c + 1])), None)
         self.cols = {"sV": (gv0, gv0 + NV * HK), "sA": (a0, a0 + self.NH * HD), "sF": (self.g0, self.g1)}
         return tern, flt
 
@@ -512,15 +547,37 @@ class Shard(object):
             if self.g5l and not lane:
                 raise SystemExit("kindi: the lane-layout cache %s is missing; delete %s to rebuild both" % (lpath, cpath))
             del bparts, dparts
-            self.bc = _stream_to_card(lpath if lane else cpath)       # 256 MB at a time
-            self.dp = cp.zeros(1, dtype=cp.uint16)
-            self.w = {n: ("g5", self.bc[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
             # row-layout decode weights plus the lane-layout copy for the chunked prompt GEMM (k_mm_g5n needs it):
             # KINDI_G5_DUAL=1, the default on HIP, where the card's memory is the host's (unified memory)
             self.wl = None
-            if dual and os.path.exists(lpath):
-                self.bcl = _stream_to_card(lpath)
-                self.wl = {n: ("g5", self.bcl[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
+            if self.tp.partial:
+                # only this shard's tensors: their byte ranges out of the full cache (the cache is keyed by
+                # the pack and the split, not by the layer set, so a tandem placement reuses it)
+                src = lpath if lane else cpath
+                missing = [n for n in tern if n not in offs]
+                if missing:
+                    raise SystemExit("kindi: the 5-trit cache %s has no entry for %s; delete it to rebuild"
+                                     % (ipath, missing[0]))
+                ranges, local, o = [], {}, 0
+                for n in tern:
+                    off, R, C = offs[n]
+                    ln = g5_words(R, C)
+                    ranges.append((off, ln))
+                    local[n] = (o, R, C)
+                    o += ln
+                self.bc = _stream_ranges_to_card(src, ranges)
+                self.dp = cp.zeros(1, dtype=cp.uint16)
+                self.w = {n: ("g5", self.bc[o:], i32(R), i32(C)) for n, (o, R, C) in local.items()}
+                if dual and os.path.exists(lpath):
+                    self.bcl = _stream_ranges_to_card(lpath, ranges)
+                    self.wl = {n: ("g5", self.bcl[o:], i32(R), i32(C)) for n, (o, R, C) in local.items()}
+            else:
+                self.bc = _stream_to_card(lpath if lane else cpath)       # 256 MB at a time
+                self.dp = cp.zeros(1, dtype=cp.uint16)
+                self.w = {n: ("g5", self.bc[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
+                if dual and os.path.exists(lpath):
+                    self.bcl = _stream_to_card(lpath)
+                    self.wl = {n: ("g5", self.bcl[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
         else:
             bc, dp = bc_all, dp_all
             del bc_all, dp_all
@@ -538,6 +595,10 @@ class Shard(object):
         self._f = {}
         for name, rec in tp.idx["tensors"].items():
             if "f32_off" not in rec:
+                continue
+            if name.startswith("blk.") and int(name.split(".")[1]) not in tp._layer_set:
+                continue                       # a partial shard never reads the other backend's norms
+            if name in ("output_norm.weight", "output.weight") and not tp.need_head:
                 continue
             off = rec["f32_off"] // 4
             a = np.asarray(tp.flm[off:off + rec["rows"] * rec["ne0"]])
@@ -586,12 +647,18 @@ class Shard(object):
         self.qq, self.qd = cp.zeros(self.NH * HD, dtype=cp.int8), z(self.NH * HD // 32)
         self.aout = cp.zeros(1, dtype=cp.int32)
         interval = self.dims["full_attention_interval"]
+        # None for the layers another backend owns: their state is never allocated or touched here
         self.M = [cp.zeros((self.NV, HK, HK) if (il + 1) % interval else (1,), dtype=cp.float32)
-                  for il in range(self.NL)]
-        self.conv = [z(3 * self.CONV_CH) for _ in range(self.NL)]
+                  if il in self.tp._layer_set else None for il in range(self.NL)]
+        self.conv = [z(3 * self.CONV_CH) if il in self.tp._layer_set else None for il in range(self.NL)]
+        self._oh = self.tp._layer_set                # short alias for the plan builders
 
     def per_pos_bytes(self):
-        kv = self.NATT * 2 * self.NHKV * (self.HD + self.HD // 32 * 2)      # q8_0 K and V
+        if getattr(self.tp, "kv", "q8_0") == "k8v4":
+            # K q8_0 plus V4: 32 four-bit values packed in 16 bytes with one fp16 scale
+            kv = self.NATT_own * self.NHKV * (self.HD + self.HD // 32 * 2 + self.HD // 2 + self.HD // 32 * 2)
+        else:
+            kv = self.NATT_own * 2 * self.NHKV * (self.HD + self.HD // 32 * 2)      # q8_0 K and V
         return kv + self.NH * 4 + (self.NH * self.HD * 4) // 256 + self.dims["rope_dim"] * 4 + 64
 
     def free_bytes(self):
@@ -609,18 +676,28 @@ class Shard(object):
             self.cos_t = cp.asarray(np.cos(th).astype(np.float32))
             self.sin_t = cp.asarray(np.sin(th).astype(np.float32))
             # one allocation per array kind, a view per layer: 64 separate arrays each lose up to a 2 MiB page to
-            # rounding, which the context fit does not see
+            # rounding, which the context fit does not see. A partial shard allocates only its own attention
+            # layers and keeps None in the other slots (the pack's attention index).
             def kv(dt, last):
-                a = cp.zeros((self.NATT, rows, self.NHKV, last), dtype=dt)
-                return [a[i] for i in range(self.NATT)]
-            self.Kq, self.Vq = kv(cp.int8, self.HD), kv(cp.int8, self.HD)
+                if not self.NATT_own:
+                    return [None] * self.NATT
+                a = cp.zeros((self.NATT_own, rows, self.NHKV, last), dtype=dt)
+                out = [None] * self.NATT
+                for i, il in enumerate(self.owned_attn):
+                    out[self.tp._kvi[il]] = a[i]
+                return out
+            if getattr(self.tp, "kv", "q8_0") == "k8v4":
+                self.Kq, self.Vq = kv(cp.int8, self.HD), kv(cp.uint8, self.HD // 2)
+            else:
+                self.Kq, self.Vq = kv(cp.int8, self.HD), kv(cp.int8, self.HD)
             self.Kd, self.Vd = kv(cp.float16, self.HD // 32), kv(cp.float16, self.HD // 32)
             cp.get_default_pinned_memory_pool().free_all_blocks()
 
     def reset(self):
         with cp.cuda.Device(self.card):
             for a in self.M + self.conv + self.Kq + self.Kd + self.Vq + self.Vd:
-                a.fill(0)
+                if a is not None:
+                    a.fill(0)
 
     # ------------------------------------------------------------------ the plan
     def build_plans(self):
@@ -817,13 +894,60 @@ class Shard(object):
                     ffn(P, il)
             return P
 
-        s.plan_feed = body_plan(True)
-        body = body_plan(False)
-        head = Plan()
-        mixin(head, "output_norm.weight")
-        gemv(head, ["output.weight"], s.xp, [s.y])
-        head.add(K.k_argmax, (1,), (1024,), (s.y, i32(s.R_head), s.aout))
-        s.plan_body, s.plan_head = body, head
+        if tp.partial:
+            # One self-contained plan per owned block. The other backend resolves the residual between
+            # blocks, so every plan starts from a complete hidden state (k_rmsfold with add=0 reads h only)
+            # and its own down-projection is flushed by TPEngine.flush() before the next plan is launched.
+            s.plan_embed = None
+            s.plan_layers, s.plan_start, s.plan_end, s.plan_pend = {}, {}, {}, {}
+            if tp.need_embed:
+                E = Plan()
+                emb = tp.emb
+                E.add(K.k_deq_emb4, (D // HB,), (512,), (np.uint64(emb["bc"]), np.uint64(emb["dp"]), s.sD, st["h"],
+                                                             Dyn("tok", 0, 1), i32(D), i32(HB)))
+                s.plan_embed = E
+            if tp.layers:
+                s.plan_embed_buf = st["h"]      # the embedding writes the first block's input
+                s.plan_entry_buf = st["h"]      # and so does the other backend when it hands the stream over
+            for il in tp.layers:
+                st["pending"] = 0               # the runtime flushed the previous block's residual add
+                buf = st["h"]                   # the residual stream this plan reads (and flushes into)
+                P = Plan()
+                if (il + 1) % s.dims["full_attention_interval"] == 0:
+                    attn(P, il, tp._kvi[il])
+                else:
+                    gdn(P, il)
+                ffn(P, il)
+                # Resolve the block's own down-projection inside the plan: the next plan (and the other
+                # backend, at a handoff) starts from a complete residual, and no CuPy call sits in the
+                # per-token loop - a CuPy elementwise add per block cost ~0.2 ms, 17% of a 2B token.
+                n = st["pending"]
+                if n:
+                    if n > 1:
+                        P.add(K.k_sumparts, ((D + 255) // 256,), (256,), (s.part, s.y, i32(D), i32(n)))
+                    P.add(K.k_padd, ((D + 255) // 256,), (256,), (st["h"], s.y, i32(D)))
+                s.plan_layers[il] = P
+                s.plan_pend[il] = 0             # resolved above; flush() is only a safety net
+                # mixin swaps h and h2 after the attention residual, so a block ends with the stream in
+                # the other buffer: the next plan (and set_hidden) must use this one, not a fixed hA
+                s.plan_start[il], s.plan_end[il] = buf, st["h"]
+            s.plan_head = None
+            if tp.need_head:
+                st["pending"] = 0
+                H = Plan()
+                mixin(H, "output_norm.weight")
+                gemv(H, ["output.weight"], s.xp, [s.y])
+                H.add(K.k_argmax, (1,), (1024,), (s.y, i32(s.R_head), s.aout))
+                s.plan_head, s.plan_head_buf = H, st["h"]
+            s.plan_body = s.plan_feed = None
+        else:
+            s.plan_feed = body_plan(True)
+            body = body_plan(False)
+            head = Plan()
+            mixin(head, "output_norm.weight")
+            gemv(head, ["output.weight"], s.xp, [s.y])
+            head.add(K.k_argmax, (1,), (1024,), (s.y, i32(s.R_head), s.aout))
+            s.plan_body, s.plan_head = body, head
         drv = _drv()
         c = ctypes.c_void_p()
         cp.cuda.Device(s.card).synchronize()
@@ -839,9 +963,16 @@ class Shard(object):
 # ====================================================================================== the engine
 
 class TPEngine(object):
-    """Same interface as Engine (reset, feed, step, generate) over two cards."""
+    """Same interface as Engine (reset, feed, step, generate) over two cards.
 
-    def __init__(self, pack, ctx=24576, clusters=None, log=print):
+    ``layers=`` gives the engine only one backend's half of a tandem split: the other layers' tensors
+    never reach the card, their K/V is never allocated and their f32 norms are never read, so the
+    offloaded layers really free VRAM. Such an engine steps one block at a time - ``begin(tok)``,
+    ``layer(il, pos)``, ``flush()``, ``get_hidden()``/``set_hidden()``, ``finish()`` - because the other
+    backend runs the layers in between; a full engine keeps its one monolithic plan.
+    """
+
+    def __init__(self, pack, ctx=24576, clusters=None, log=print, layers=None, embed=None, head=None):
         from .sched import blocking_sync
         blocking_sync(log)
         t0 = time.time()
@@ -849,12 +980,53 @@ class TPEngine(object):
         self.W = int(os.environ.get("KINDI_CARDS") or min(2, rt.getDeviceCount()))
         if self.W not in (1, 2) or rt.getDeviceCount() < self.W:
             raise SystemExit("kindi: the plan engine runs on 1 or 2 cards (%d found)" % rt.getDeviceCount())
+        if layers is not None and self.W != 1:
+            raise SystemExit("kindi: a tandem GPU owner runs on one card; set KINDI_CARDS=1")
         man = self.man = json.load(open(os.path.join(pack, "kindi_pack.json")))
         self.pack = pack
         self.dims = dict(DEFAULT_DIMS, **man.get("dimensions", {}))
         self.HB = int(man.get("hadamard_block", 512))
         self.D, self.NL = self.dims["width"], self.dims["layers"]
+        self.kv = "q8_0"          # the plan engine always uses q8_0 K/V
         self.NHg, self.NHKVg, self.HD = self.dims["heads"], self.dims["kv_heads"], self.dims["head_dim"]
+        # A tandem split gives this engine only the layers it runs: see the class docstring. The layer
+        # lists below stay indexed by the original layer number, with None for the other backend's
+        # layers, so cache.checkpoint and the tandem cache view keep working unchanged.
+        if layers is None:
+            self.layers = tuple(range(self.NL))
+        else:
+            raw = tuple(int(x) for x in layers)
+            if (not raw or len(set(raw)) != len(raw) or raw != tuple(sorted(raw))
+                    or raw[0] < 0 or raw[-1] >= self.NL):
+                raise SystemExit("kindi: the plan engine's layer range must be a non-empty, sorted list "
+                                 "of distinct layer numbers in 0..%d (got %r)" % (self.NL - 1, layers))
+            self.layers = raw
+        self.partial = self.layers != tuple(range(self.NL))
+        self._layer_set = frozenset(self.layers)
+        self.need_embed = (0 in self._layer_set) if embed is None else bool(embed)
+        self.need_head = (self.NL - 1 in self._layer_set) if head is None else bool(head)
+        if self.need_embed and 0 not in self._layer_set:
+            raise SystemExit("kindi: the plan engine's embedding needs layer 0 in its layer range")
+        if self.need_head and self.NL - 1 not in self._layer_set:
+            raise SystemExit("kindi: the plan engine's output head needs the last layer in its range")
+        self._pending = 0                      # pending down-projection parts; partial engines only
+        self._buf = None                       # the device buffer holding the residual (partial engines)
+        self._kvi = {}                         # global layer -> attention index (the pack's own numbering)
+        for _il in range(self.NL):
+            if (_il + 1) % self.dims["full_attention_interval"] == 0:
+                self._kvi[_il] = len(self._kvi)
+        if os.environ.get("KINDI_FD", "0") == "1" and not fd_supported(self.dims):
+            log("kindi: KINDI_FD=1 is disabled for the 4B's 2560-wide plan (the split decode attention diverges); "
+                "using the standard decode attention")
+            os.environ["KINDI_FD"] = "0"
+        if self.kv == "k8v4" and self.HD != 256:
+            raise SystemExit("kindi: KINDI_KV=k8v4 needs a head size of 256 (this pack has %d); the V4 value "
+                             "kernels cover 8 blocks of 32 features" % self.HD)
+        if self.kv == "k8v4":
+            if os.environ.get("KINDI_ATT_TC", "0") == "1":
+                log("kindi: KINDI_KV=k8v4 keeps the V4 flash chunk attention (the tensor-core prompt attention is q8-only)")
+            if os.environ.get("KINDI_FD", "0") == "1":
+                log("kindi: KINDI_KV=k8v4 keeps the per-query verify attention (the split flash-decode path is q8-only)")
         self.NKg, self.HK = self.dims["groups"], self.dims["state_size"]
         self.NVg = self.dims["gdn_inner"] // self.HK
         self.NFFg = self.dims["ffn"]
@@ -892,11 +1064,16 @@ class TPEngine(object):
                       for w in (self.D, self.NVg * self.HK, self.NHg * self.HD, self.NFFg)}
         self.vocab = json.load(open(os.path.join(pack, "vocab.json")))
         self._host_buffers()
-        self._embedding()
+        self.emb = None
+        if self.need_embed:
+            self._embedding()
+        else:
+            log("plan engine: the other backend embeds (no token_embd on this side)")
         self.cards = [Shard(self, c, log) for c in range(self.W)]
         # the context: what the card with less free memory can hold
         from . import chunk as _chunk
-        _chunk.reserve(self)                       # the chunked prompt path's buffers, before the context fit
+        if not self.partial:
+            _chunk.reserve(self)               # the chunked prompt path's buffers, before the context fit
         reserve = int(os.environ.get("KINDI_MEM_RESERVE_MB", "32")) * 2 ** 20
         ns = _slots.wanted() if self.W == 1 else 1
         if ns > 1:
@@ -906,8 +1083,12 @@ class TPEngine(object):
         else:
             fit = min((s.free_bytes() - reserve) // s.per_pos_bytes() for s in self.cards) // 256 * 256
         self.ctx = int(min(int(ctx), fit))
-        if self.ctx < 1024:
-            raise SystemExit("kindi: not enough GPU memory for a 1024-token context")
+        # A tandem owner only has to hold the context the split asked for: it has no chunked prompt path
+        # and no batch plan, so the 1024-token floor of the full engine (which needs room for those) does
+        # not apply. A partial engine still refuses a context that rounds away to nothing.
+        floor = 256 if self.partial else 1024
+        if self.ctx < floor:
+            raise SystemExit("kindi: not enough GPU memory for a %d-token context" % floor)
         if self.ctx < int(ctx):
             log("context reduced from %d to %d tokens to fit the GPU memory" % (int(ctx), self.ctx))
         for s in self.cards:
@@ -915,13 +1096,22 @@ class TPEngine(object):
         for s in self.cards:
             with cp.cuda.Device(s.card):
                 s.build_plans()
+        if self.partial:
+            self._buf = self.cards[0].plan_entry_buf
         self.NB = int(os.environ.get("KINDI_BATCH", "4"))          # prompt tokens per batch (1: off; at most 6)
-        if 1 < self.NB <= 6:
+        self.batch_ok = False
+        self.chunk, self.chunk_ok = {}, False
+        if self.partial:
+            # a tandem owner is stepped one block per token by the other backend; the batched prompt
+            # path and the chunked prompt path both replay the full model and cannot apply
+            self.NB = 1
+        elif 1 < self.NB <= 6:
             for s in self.cards:
                 with cp.cuda.Device(s.card):        # kernel handles belong to the device that is current
                     s.plan_batch = build_batch_plan(s, self.NB)
             self.batch_ok = True
-        _chunk.build(self)
+        if not self.partial:
+            _chunk.build(self)
         self.ylog_n, self.ylog_map = VOCAB, None
         self._state_views()
         self.slots = None
@@ -1011,14 +1201,119 @@ class TPEngine(object):
 
     # ------------------------------------------------------------------ driver
     def reset(self):
+        self._pending = 0
         for s in self.cards:
             s.reset()
+
+    # ------------------------------------------------------------------ tandem: one block at a time
+    def _launch(self, plan, tok, pos):
+        """Replay one plan on its card; a partial (tandem) engine is always one card."""
+        s = self.cards[0]
+        plan.set(tok, pos)
+        drv = _drv()
+        L = drv.cuLaunchKernel
+        prev = ctypes.c_void_p()
+        drv.cuCtxGetCurrent(ctypes.byref(prev))          # restored at the end: CuPy follows the current context
+        drv.cuCtxSetCurrent(s.ctxh)
+        try:
+            for seg in plan.segs:
+                for fn, g, b, arr, _ in seg:
+                    if L(fn, g[0], g[1], g[2], b[0], b[1], b[2], 0, None, arr, None):
+                        raise RuntimeError("kindi: a kernel launch failed on card %d" % s.card)
+        finally:
+            drv.cuCtxSetCurrent(prev)
+
+    def begin(self, tok):
+        """Embed one token into the residual stream; layer() runs this side's blocks afterwards."""
+        if not self.partial or not self.need_embed:
+            raise RuntimeError("kindi: this engine does not embed for a tandem split")
+        s = self.cards[0]
+        self._pending = 0
+        self._launch(s.plan_embed, int(tok), 0)
+        self._buf = s.plan_embed_buf            # where the next plan reads the stream
+
+    def layer(self, il, pos):
+        """Run one complete block on the residual, which holds the full input entering it."""
+        il, pos = int(il), int(pos)
+        if il not in self._layer_set:
+            raise IndexError("layer %d is not owned by this engine" % il)
+        if not 0 <= pos < self.ctx:
+            raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
+        s = self.cards[0]
+        self.flush()
+        self._launch(s.plan_layers[il], 0, pos)
+        self._pending = s.plan_pend[il]
+        self._buf = s.plan_end[il]              # the block's residual add lands in this buffer
+
+    def flush(self):
+        """Materialize the residual add the last block left in its down-projection buffer."""
+        n = int(self._pending)
+        if not n:
+            return
+        s = self.cards[0]
+        with cp.cuda.Device(s.card):
+            if n > 1:
+                s.k.k_sumparts(((self.D + 255) // 256,), (256,), (s.part, s.y, i32(self.D), i32(n)))
+            self._buf[:self.D] += s.y[:self.D]
+        self._pending = 0
+
+    def get_hidden(self):
+        """The residual after the last block, as a NumPy array for the other backend."""
+        self.flush()
+        s = self.cards[0]
+        with cp.cuda.Device(s.card):
+            return cp.asnumpy(self._buf[:self.D]).copy()
+
+    def set_hidden(self, values):
+        """Accept the other backend's residual as this backend's layer input.
+
+        The partial plans alternate their residual buffer: a block starts in one of hA/hB and
+        leaves its residual in the other.  ``self._buf`` follows that alternation, so writing it
+        here would put the handoff in the wrong buffer after the first token; the next block
+        would read its previous input.  Fill every block's start buffer instead, then reset the
+        cursor to the entry buffer.  Two small copies per handoff keep arbitrary explicit layer
+        sets (and therefore more than one handoff) correct.
+        """
+        x = np.asarray(values, dtype=np.float32)
+        if x.shape != (self.D,):
+            raise ValueError("hidden state has shape %r, expected (%d,)" % (x.shape, self.D))
+        self.flush()
+        s = self.cards[0]
+        with cp.cuda.Device(s.card):
+            xg = cp.asarray(x)
+            seen = set()
+            for buf in s.plan_start.values():
+                if id(buf) in seen:
+                    continue
+                seen.add(id(buf))
+                buf[:self.D] = xg
+        self._buf = s.plan_entry_buf
+        self._pending = 0
+
+    def finish(self):
+        """Output norm and exact head on the residual after this side's last block -> greedy token."""
+        if not self.partial or not self.need_head:
+            raise RuntimeError("kindi: this engine does not own the output head of a tandem split")
+        self.flush()
+        s = self.cards[0]
+        self._buf = s.plan_head_buf
+        self._launch(s.plan_head, 0, 0)
+        best = self.head_split[0] + int(s.aout[0])
+        self._check()
+        self._best, self._ylog_ok = best, False
+        return best
+
+    def head(self):
+        return self.finish()
 
     def _run(self, tok, pos, head):
         """Replay one token on both cards, segment by segment, alternating cards (both halves of an exchange are
         launched before either card's next segment). Every 8 segments a card records an event, and the host waits
         for the event of 16 segments back: the host never fills a card's launch queue while that card waits in an
         exchange whose other half is not launched yet."""
+        if self.partial:
+            raise RuntimeError("kindi: a tandem plan engine is stepped one block at a time "
+                               "(begin/layer/get_hidden/set_hidden/finish)")
         if pos >= self.ctx:
             raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
         drv = _drv()
@@ -1140,10 +1435,19 @@ class Dist(object):
 def _state_views(self):
     cs = self.cards
     c0 = cs[0]
-    self.M = [Dist([(s.card, s.M[i]) for s in cs]) for i in range(self.NL)]
-    self.conv = [Dist([(s.card, s.conv[i]) for s in cs]) for i in range(self.NL)]
-    self.Kc = [Dist([x for s in cs for x in ((s.card, s.Kq[i]), (s.card, s.Kd[i]))], rows=True) for i in range(c0.NATT)]
-    self.Vc = [Dist([x for s in cs for x in ((s.card, s.Vq[i]), (s.card, s.Vd[i]))], rows=True) for i in range(c0.NATT)]
+    # A partial (tandem) engine owns only some layers: the rest stay None here, and cache checkpoints or
+    # the tandem cache view read only the arrays this side owns (the lists keep the pack's own indexes).
+    def dist(parts, rows=False):
+        parts = [p for p in parts if p[1] is not None]
+        return Dist(parts, rows=rows) if parts else None
+
+    self.M = [dist([(s.card, s.M[i]) for s in cs]) for i in range(self.NL)]
+    self.conv = [dist([(s.card, s.conv[i]) for s in cs]) for i in range(self.NL)]
+    self.Kc = [dist([x for s in cs for x in ((s.card, s.Kq[i]), (s.card, s.Kd[i]))], rows=True)
+               for i in range(c0.NATT)]
+    self.Vc = [dist([x for s in cs for x in ((s.card, s.Vq[i]), (s.card, s.Vd[i]))], rows=True)
+               for i in range(c0.NATT)]
+    self.g5, self.g5l = c0.g5, c0.g5l
     self.hsl, self.shortlist = None, 0
     self.k = c0.k                                 # the sampler's kernels run on card 0
     with cp.cuda.Device(0):
