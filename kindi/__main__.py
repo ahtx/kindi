@@ -8,6 +8,7 @@
   kindi chat                    chat in the terminal (no server needed)
   kindi head exact|fast         choose the output head of a running server (next request, no restart)
   kindi info                    show the configuration, the pack and the GPU
+  kindi intel-info              read-only Intel probe: CPU, display, NPU, Level Zero and OpenVINO
 Global options: --config FILE, --pack DIR, --state-dir DIR, --ctx N."""
 import argparse
 import json
@@ -74,6 +75,17 @@ def cmd_bench(cfg, a):
     _setup_gpu_env(cfg)
     from .bench import run
     return run(cfg, log=log)
+
+
+def cmd_intel_info(cfg, a):
+    """Read-only Intel M1 probe; it never loads a backend or enters an engine path."""
+    from . import intel
+    report = intel.probe()
+    if getattr(a, "json", False):
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    print(intel.render(report))
+    return 0
 
 
 def cmd_serve(cfg, a):
@@ -248,6 +260,8 @@ def main(argv=None):
     s = sub.add_parser("head", help="exact or fast output head for a running server")
     s.add_argument("mode", choices=("exact", "fast"))
     sub.add_parser("info", help="show configuration, pack and GPU")
+    s = sub.add_parser("intel-info", help="read-only Intel M1 probe: CPU, display, NPU, Level Zero and OpenVINO")
+    s.add_argument("--json", action="store_true", help="print the report as JSON")
     s = sub.add_parser("models", help="list the models and what fits this machine")
     s.add_argument("--json", action="store_true", help="one JSON list (id, what, size_gb, fits, downloaded)")
     s = sub.add_parser("cards", help="list every GPU: VRAM, free memory, PCIe link, bandwidth, supported or not")
@@ -272,7 +286,7 @@ def main(argv=None):
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
-            "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route}[a.cmd](cfg, a)
+            "intel-info": cmd_intel_info, "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route}[a.cmd](cfg, a)
 
 
 if __name__ == "__main__":
