@@ -27,6 +27,9 @@ Kindi reads its settings in this order - later sources win:
 | `host` | `127.0.0.1` | address to listen on; `0.0.0.0` serves your network - then also set `api_key` |
 | `port` | `8093` | |
 | `api_key` | (empty) | if set, every `/v1` request needs `Authorization: Bearer <api_key>`; `/health` stays open |
+| `queue_max` | `64` | generation requests (chat completions, messages) that may wait while every decode slot is busy; the next one gets HTTP 429 `server_busy` with `Retry-After: 1` before its prompt is read. `0`: no cap |
+| `max_body_mb` | `32` | a larger request body gets HTTP 413 `request_too_large`; the body is not read past the cap |
+| `rate_limit_per_min` | `0` | at most this many `/v1` requests per client address in any 60 s; more get HTTP 429 `rate_limit_exceeded` with the seconds to wait in `Retry-After`. `0`: off |
 | `model_name` | `auto` | the model id `/v1/models` reports; `auto` takes it from the pack (bonsai2-2b, bonsai2-4b or bonsai2-9b); clients may send any model name |
 
 ### Engine

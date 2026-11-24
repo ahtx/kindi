@@ -12,6 +12,9 @@ host = 127.0.0.1
 port = 8093
 # api_key = choose-a-long-random-string
 model_name = auto
+# queue_max = 64              # generation requests waiting for a slot; more get HTTP 429 server_busy (0: no cap)
+# max_body_mb = 32            # a larger request body gets HTTP 413
+# rate_limit_per_min = 0      # per client address; more get HTTP 429 rate_limit_exceeded (0: off)
 
 # --- engine
 ctx = 24576

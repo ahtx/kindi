@@ -824,6 +824,17 @@ def create_app(cfg, log=print):
                                                                         thread_name_prefix="kindi-slot")
     model_id = cfg["model_name"]
     app = FastAPI(title="Kindi", version=__version__)
+    from .admission import Admission
+    adm = []                     # the middleware instance, for /health (Starlette builds it at the first request)
+
+    class _Admission(Admission):
+        def __init__(self, inner, **kw):
+            Admission.__init__(self, inner, **kw)
+            adm.append(self)
+    # PR #63: a cap on waiting requests, on the body size and (optional) on the rate per client
+    app.add_middleware(_Admission, queue_max=cfg.get("queue_max", 64), max_body_mb=cfg.get("max_body_mb", 32),
+                       rate_limit_per_min=cfg.get("rate_limit_per_min", 0),
+                       running=lambda: len(getattr(K, "slot_views", None) or ()) or 1)
 
     def _err(code, msg, typ="invalid_request_error"):
         return JSONResponse(apierr.body(msg, typ), status_code=code)
@@ -893,7 +904,8 @@ def create_app(cfg, log=print):
         busy = next((e for e in each if e), None)
         return dict({"ok": True, "kindi": __version__, "commit": COMMIT, "model": model_id, "ctx": K.eng.ctx, "lora": getattr(K.eng, "lora_hash", None),
                      "head": K.head_active(), "uptime_s": round(time.time() - K.t0), "busy": busy, "stats": K.stats,
-                     "drafting": K.drafting(), "queue": dict(SCHED.counts(), yields=getattr(K, "yields", 0)),
+                     "drafting": K.drafting(), "queue": dict(SCHED.counts(), yields=getattr(K, "yields", 0),
+                                                            **(adm[-1].stats() if adm else {})),
                      "slots": {"n": len(views), "busy": sum(1 for e in each if e),
                                "each": [e or {"phase": "idle"} for e in each]},
                      "last": dict(LAST) or None,

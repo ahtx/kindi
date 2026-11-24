@@ -18,6 +18,9 @@ DEFAULTS = {
     "port": "8093",
     "api_key": "",                      # if set, clients must send Authorization: Bearer <api_key>
     "model_name": "auto",              # infer the reported id from the selected pack
+    "queue_max": "64",                  # generation requests that may wait for a slot; more get HTTP 429 (0: no cap)
+    "max_body_mb": "32",                # largest request body; a larger one gets HTTP 413
+    "rate_limit_per_min": "0",          # requests per client address in any minute; more get HTTP 429 (0: off)
     # engine
     "ctx": "24576",                     # requested context; each backend clamps it to available device memory
     "slots": "1",                       # requests written at the same time (decode slots, plan engine with KINDI_TC=1)
@@ -49,7 +52,7 @@ DEFAULTS = {
     "repeat_last_n": "64",              # the tokens that repeat_penalty looks at (-1: the whole context)
 }
 
-INT_KEYS = {"repeat_stop", "lookup", "port", "ctx", "slots", "fast_clusters", "checkpoint_every", "checkpoint_budget_mb", "prefix_max", "prefix_min", "park_max",
+INT_KEYS = {"queue_max", "max_body_mb", "rate_limit_per_min", "repeat_stop", "lookup", "port", "ctx", "slots", "fast_clusters", "checkpoint_every", "checkpoint_budget_mb", "prefix_max", "prefix_min", "park_max",
             "turn_save", "turn_keep", "turn_disk_mb", "turn_min",
             "max_tokens", "top_k", "repeat_last_n"}
 FLOAT_KEYS = {"temperature", "top_p", "min_p", "repeat_penalty"}
