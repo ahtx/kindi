@@ -29,8 +29,12 @@ class Sampler(object):
         self.cv = cp.zeros(CAP, dtype=cp.float32)
         self.cn = cp.zeros(1, dtype=cp.int32)
 
-    def __call__(self, greedy_tok, temperature, top_p, top_k, rng, min_p=0.0, penalty=None):
-        """penalty: None, or (repeat_penalty, the recent tokens)"""
+    def __call__(self, greedy_tok, temperature, top_p, top_k, rng, min_p=0.0, penalty=None, allowed=None):
+        """penalty: None, or (repeat_penalty, the recent tokens). allowed: None, or an
+        array of token ids the active grammar accepts; it constrains the pick through the
+        full logits, always."""
+        if allowed is not None:
+            return self._constrained(allowed, temperature, top_p, top_k, rng, min_p, penalty)
         if penalty is not None and penalty[0] > 1.0 and temperature <= 0 and greedy_tok not in penalty[1]:
             return greedy_tok                # the penalty only lowers the recent tokens: the best token stays
         if penalty is not None:
@@ -73,6 +77,23 @@ class Sampler(object):
         z = host(yl[:nl]).astype(np.float64)
         ok = cand >= 0
         return cand[ok], z[ok]
+
+    def _constrained(self, allowed, temperature, top_p, top_k, rng, min_p, penalty):
+        """The next token inside a constrained reply (JSON grammar): the full logits,
+        intersected with the ids the grammar accepts at this state. Penalties still apply
+        inside the allowed set. An empty intersection is a grammar/model mismatch - a loud
+        error, not a silent free choice."""
+        cand, z = self._logits()
+        if penalty is not None:
+            z = penalize(cand, z, penalty[0], penalty[1])
+        keep = np.isin(cand, np.asarray(allowed, dtype=np.int64))
+        cand, z = cand[keep], z[keep]
+        if cand.size == 0:
+            raise ValueError("constrained sampling: no allowed token in the model's candidates")
+        if temperature <= 0:
+            return int(cand[int(np.argmax(z))])
+        band = z >= z.max() - BAND_T * temperature
+        return self._pick(cand[band], z[band], temperature, top_p, int(top_k or 0), rng, min_p)
 
     def _penalized(self, temperature, top_p, top_k, rng, min_p, rp, recent):
         cand, z = self._logits()
