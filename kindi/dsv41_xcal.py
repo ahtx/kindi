@@ -80,7 +80,8 @@ def decide(m, env=None):
 def card_uuids():
     """the UUIDs of the visible CUDA devices, in CUDA order (device 0 = the main card)"""
     try:
-        cu = ctypes.CDLL("libcuda.so.1")
+        from .gpudrv import libcuda           # nvcuda.dll on native Windows (PR #47)
+        cu = libcuda()
         if cu.cuInit(0) != 0:
             return []
         n = ctypes.c_int()
