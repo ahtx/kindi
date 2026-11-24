@@ -20,6 +20,8 @@ import sys
 import time
 import urllib.request
 
+from kindi import apierr
+
 HOP = {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "host", "content-length"}
 
 
@@ -88,7 +90,7 @@ class Router(object):
         except Exception as e:  # noqa: BLE001 - one bad request never stops the router
             self.log("error: %r" % e)
             try:
-                await self._reply(writer, 502, {"error": {"message": "kindi route: %s" % e, "type": "server_error"}})
+                await self._reply(writer, 502, apierr.body("kindi route: %s" % e, "server_error"))
             except Exception:  # noqa: BLE001
                 pass
         finally:
@@ -116,11 +118,11 @@ class Router(object):
                 hdr.append((k.strip(), v.strip()))
         hl = {k.lower(): v for k, v in hdr}
         if hl.get("transfer-encoding", "").lower() == "chunked":
-            return await self._reply(writer, 411, {"error": {"message": "send a Content-Length", "type": "invalid_request_error"}})
+            return await self._reply(writer, 411, apierr.body("send a Content-Length"))
         n = int(hl.get("content-length") or 0)
         body = await reader.readexactly(n) if n else b""
         if self.key and hl.get("authorization", "") != "Bearer %s" % self.key:
-            return await self._reply(writer, 401, {"error": {"message": "wrong or missing API key", "type": "invalid_request_error"}})
+            return await self._reply(writer, 401, apierr.body("wrong or missing API key", "authentication_error"))
         p = path.split("?", 1)[0]
         if method == "GET" and p in ("/v1/models", "/models"):
             return await self._reply(writer, 200, await asyncio.get_event_loop().run_in_executor(None, self.models))
@@ -139,14 +141,14 @@ class Router(object):
             try:
                 model = json.loads(body.decode("utf-8")).get("model")
             except (ValueError, AttributeError):
-                return await self._reply(writer, 400, {"error": {"message": "the body is not JSON", "type": "invalid_request_error"}})
+                return await self._reply(writer, 400, apierr.body("the body is not JSON"))
         name = await asyncio.get_event_loop().run_in_executor(None, self.pick, model)
         if name is None:
             avail = [m["id"] for m in (await asyncio.get_event_loop().run_in_executor(None, self.models))["data"]]
-            return await self._reply(writer, 404, {"error": {
-                "message": "no server for model %r; the models here: %s" % (model, ", ".join(avail)) if model else
+            return await self._reply(writer, 404, apierr.body(
+                "no server for model %r; the models here: %s" % (model, ", ".join(avail)) if model else
                 "several servers: say which one with \"model\" (%s)" % ", ".join(avail),
-                "type": "invalid_request_error", "code": "model_not_found"}})
+                code="model_not_found", param="model"))
         base = self.backends[name][0]
         hostport = base.split("//", 1)[1].rstrip("/")
         host, _, port = hostport.partition(":")

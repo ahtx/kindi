@@ -82,7 +82,20 @@ def forced_call_prefix(name):
     return "<tool_call>\n<function=" + (name + ">\n" if name else "")
 
 
+def check_messages(req):
+    """messages is a list of objects, each with a string role (PR #58: a string here was an HTTP 500)"""
+    if not isinstance(req, dict):
+        raise RequestError("the request body must be a JSON object", None)
+    m = req.get("messages")
+    if not isinstance(m, list):
+        raise RequestError("messages must be a list of {\"role\": ..., \"content\": ...} objects", "messages")
+    for i, x in enumerate(m):
+        if not isinstance(x, dict) or not isinstance(x.get("role"), str):
+            raise RequestError("messages[%d] must be an object with a string \"role\"" % i, "messages")
+
+
 def check(req, can_force):
-    """both checks; -> (tools, force)"""
+    """all checks; -> (tools, force)"""
+    check_messages(req)
     check_response_format(req)
     return tool_choice(req, can_force)

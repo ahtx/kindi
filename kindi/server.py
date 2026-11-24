@@ -10,7 +10,7 @@ import uuid
 
 import numpy as np
 
-from . import COMMIT, __version__, chat
+from . import COMMIT, __version__, apierr, chat
 from .cache import Cancelled, Runner
 from .engine import EOS
 from .sampling import Sampler
@@ -826,14 +826,31 @@ def create_app(cfg, log=print):
     app = FastAPI(title="Kindi", version=__version__)
 
     def _err(code, msg, typ="invalid_request_error"):
-        return JSONResponse({"error": {"message": msg, "type": typ, "code": typ}}, status_code=code)
+        return JSONResponse(apierr.body(msg, typ), status_code=code)
+
+    # FastAPI's own errors (an unknown path, a wrong method, a body its validation refuses) in the same OpenAI body
+    # (PR #58); by default they are {"detail": ...}, which OpenAI clients do not read
+    from fastapi.exceptions import RequestValidationError
+    from starlette.exceptions import HTTPException as _HTTPError
+
+    @app.exception_handler(_HTTPError)
+    async def _http_error(request, e):
+        typ = "not_found_error" if e.status_code == 404 else "invalid_request_error"
+        return JSONResponse(apierr.body(e.detail, typ), status_code=e.status_code, headers=getattr(e, "headers", None))
+
+    @app.exception_handler(RequestValidationError)
+    async def _invalid(request, e):
+        errs = e.errors()
+        loc = [str(x) for x in (errs[0].get("loc") or ()) if x != "body"] if errs else []
+        msg = "; ".join("%s: %s" % (".".join(str(x) for x in r.get("loc", ())), r.get("msg", "")) for r in errs)
+        return JSONResponse(apierr.body(msg or "invalid request", param=".".join(loc) or None), status_code=422)
 
     def _bad(e):
         """a ValueError of a request as HTTP 400; an oai.RequestError also names the field (#38)"""
         p = getattr(e, "param", None)
         if p:
-            return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error", "param": p,
-                                           "code": "unsupported_" + p}}, status_code=400)
+            code = "unsupported_" + p if p in ("tool_choice", "response_format") else None
+            return JSONResponse(apierr.body(e, code=code, param=p), status_code=400)
         return _err(400, str(e))
 
     def _auth(request):
@@ -895,8 +912,7 @@ def create_app(cfg, log=print):
             return {}
 
     def _overflow(e):
-        return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error", "param": "messages",
-                                       "code": "context_length_exceeded"}}, status_code=400)
+        return JSONResponse(apierr.overflow(e), status_code=400)
 
     @app.get("/v1/models")
     def models(request: Request):
@@ -957,6 +973,11 @@ def create_app(cfg, log=print):
             req = await request.json()
         except Exception:  # noqa: BLE001
             return _err(400, "the body is not JSON")
+        from . import oai
+        try:
+            oai.check_messages(req)
+        except ValueError as e:
+            return _bad(e)
         cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
         # every request is counted before it waits for the engine: a prompt that does not fit gets its HTTP 400 at
         # once (a queued request used to wait for the request ahead of it, then fail), and a dry run ends here
@@ -1042,12 +1063,11 @@ def create_app(cfg, log=print):
                                 inc = (req.get("stream_options") or {}).get("include_usage")
                                 yield chunk({}, info["finish"], info["usage"] if inc else None)
                     except OverflowError as e:
-                        yield "data: " + json.dumps({"error": {"message": str(e), "type": "invalid_request_error",
-                                                               "code": "context_length_exceeded"}}) + "\n\n"
+                        yield "data: " + json.dumps(apierr.overflow(e)) + "\n\n"
                     except ValueError as e:
-                        yield "data: " + json.dumps({"error": {"message": str(e), "type": "invalid_request_error"}}) + "\n\n"
+                        yield "data: " + json.dumps(apierr.body(e)) + "\n\n"
                     except Exception as e:
-                        yield "data: " + json.dumps({"error": {"message": "kindi: %s" % e, "type": "server_error"}}) + "\n\n"
+                        yield "data: " + json.dumps(apierr.body("kindi: %s" % e, "server_error")) + "\n\n"
                         _after_engine_error(V, e)
                     yield "data: [DONE]\n\n"
                     if not cancel.is_set():
@@ -1115,13 +1135,11 @@ def create_app(cfg, log=print):
         def failed(e):
             """(status, body) of a request that raised"""
             if isinstance(e, OverflowError):
-                return 400, {"error": {"message": str(e), "type": "invalid_request_error", "param": "messages",
-                                       "code": "context_length_exceeded"}}
+                return 400, apierr.overflow(e)
             if isinstance(e, ValueError):
-                return 400, {"error": {"message": str(e), "type": "invalid_request_error",
-                                       "code": "invalid_request_error"}}
+                return 400, apierr.body(e)
             _after_engine_error(K, e)
-            return 500, {"error": {"message": "kindi: %s" % e, "type": "server_error", "code": "server_error"}}
+            return 500, apierr.body("kindi: %s" % e, "server_error")
 
         loop = asyncio.get_event_loop()
         # kindi_keepalive (or the header X-Kindi-Keepalive: 1): a non-streaming client behind a proxy with an idle
@@ -1139,8 +1157,7 @@ def create_app(cfg, log=print):
                         yield " "
                     try:
                         info = fut.result()
-                        out = answer(info) if info is not None else {"error": {"message": "request cancelled",
-                                                                               "type": "cancelled"}}
+                        out = answer(info) if info is not None else apierr.body("request cancelled", "cancelled")
                     except Exception as e:  # noqa: BLE001
                         out = failed(e)[1]
                     yield json.dumps(out, ensure_ascii=False)
