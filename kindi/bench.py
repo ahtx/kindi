@@ -48,6 +48,10 @@ def run(cfg, log=print):
             return 2
         from .lightning_cli import bench
         return bench(cfg, man, log=log)
+    mon = None
+    if cfg.get("sample_vram") and cp is not None:      # PR #51: the peak of the whole run, every card this process sees
+        from .vram import Monitor, visible_buses
+        mon = Monitor(visible_buses(cp), cfg.get("vram_sample_s") or 0.5).start()
     cl = os.path.join(pack, "head_clusters.npz")
     eng = make_engine(pack, ctx=cfg["ctx"], clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log)
     if cp is not None:
@@ -58,6 +62,8 @@ def run(cfg, log=print):
         log("CPU engine: %s threads, %d-token context" % (os.environ.get("OMP_NUM_THREADS", os.cpu_count()), eng.ctx))
         sync = lambda: None                    # noqa: E731 - the CPU engine returns when the work is done
     eng.reset()
+    if mon is not None:
+        mon.mark("prompt reading")
 
     def timed(fn, n):
         fn(0)                                  # warm-up (first launches compile/load kernels)
@@ -76,10 +82,16 @@ def run(cfg, log=print):
     if skip:
         log("generation curve: positions %s are past the %d-token context and are not measured" % (
             ", ".join(str(p) for p in skip), eng.ctx))
+    if mon is not None:
+        mon.mark("generation")
     for name, M in modes:
         eng.shortlist = M
         for p in pos:
             ms = timed(lambda i: eng.step(2000 + i, p + i), 10)
             log("generation (%s head) at position %5d: %5.1f tokens/s" % (name, p, 1000 / ms))
     eng.shortlist = 0
+    if mon is not None:
+        mon.stop()
+        for ln in mon.lines():
+            log(ln)
     return 0

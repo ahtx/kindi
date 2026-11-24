@@ -72,6 +72,7 @@ def cmd_verify(cfg, a):
 
 def cmd_bench(cfg, a):
     _setup_gpu_env(cfg)
+    cfg = type(cfg)(cfg, sample_vram=bool(getattr(a, "sample_vram", False)), vram_sample_s=getattr(a, "vram_sample_s", None))
     from .bench import run
     return run(cfg, log=log)
 
@@ -230,7 +231,9 @@ def main(argv=None):
     s.add_argument("--clusters", type=int, default=1024)
     s.add_argument("--iters", type=int, default=12)
     sub.add_parser("verify", help="check against llama.cpp's reference output")
-    sub.add_parser("bench", help="measure speed")
+    s = sub.add_parser("bench", help="measure speed")
+    s.add_argument("--sample-vram", action="store_true", help="log each card's VRAM peak during the run (nvidia-smi)")
+    s.add_argument("--vram-sample-s", type=float, metavar="SECONDS", help="the sampling interval (default 0.5)")
     s = sub.add_parser("inkling", help="run experimental Inkling 2 Mini text inference")
     s.add_argument("gguf", help="local Inkling 2 Mini GGUF")
     s.add_argument("prompt")
