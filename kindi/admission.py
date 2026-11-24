@@ -20,8 +20,16 @@ import time
 GENERATE = ("/v1/chat/completions", "/v1/messages")
 
 
-def _body(message, typ, code):
-    return {"error": {"message": message, "type": typ, "param": None, "code": code}}
+ANTHROPIC = {"server_busy": (529, "overloaded_error"), "rate_limit_exceeded": (429, "rate_limit_error"),
+             "request_too_large": (413, "request_too_large")}
+
+
+def _body(path, status, message, typ, code):
+    """(status, body): OpenAI's error body, or Anthropic's on /v1/messages (busy is its overloaded 529 there)"""
+    if path.startswith("/v1/messages"):
+        st, t = ANTHROPIC[code]
+        return st, {"type": "error", "error": {"type": t, "message": message}}
+    return status, {"error": {"message": message, "type": typ, "param": None, "code": code}}
 
 
 class RateLimiter(object):
@@ -67,7 +75,8 @@ class Admission(object):
                 "rate_limit_per_min": self.limiter.per_min}
 
     @staticmethod
-    async def _reply(send, status, body, headers=()):
+    async def _reply(send, sb, headers=()):
+        status, body = sb
         raw = json.dumps(body).encode()
         h = [(b"content-type", b"application/json"), (b"content-length", str(len(raw)).encode())]
         h += [(k.encode(), v.encode()) for k, v in headers]
@@ -81,13 +90,13 @@ class Admission(object):
         client = (scope.get("client") or ("unknown", 0))[0]
         wait = self.limiter.wait_s(client)
         if wait:
-            return await self._reply(send, 429, _body("too many requests from %s: at most %d a minute; retry in %d s"
-                                                      % (client, self.limiter.per_min, wait), "rate_limit_exceeded",
-                                                      "rate_limit_exceeded"), [("Retry-After", str(wait))])
+            msg = "too many requests from %s: at most %d a minute; retry in %d s" % (client, self.limiter.per_min, wait)
+            return await self._reply(send, _body(path, 429, msg, "rate_limit_exceeded", "rate_limit_exceeded"),
+                                     [("Retry-After", str(wait))])
         # the body, up to the cap: a declared length past it is refused before a byte is read
         n = dict(scope.get("headers") or []).get(b"content-length")
         if n is not None and n.isdigit() and int(n) > self.max_body:
-            return await self._too_large(send)
+            return await self._too_large(send, path)
         parts, size, more = [], 0, True
         while more:
             m = await receive()
@@ -96,7 +105,7 @@ class Admission(object):
             parts.append(m.get("body", b""))
             size += len(parts[-1])
             if size > self.max_body:
-                return await self._too_large(send)
+                return await self._too_large(send, path)
             more = m.get("more_body", False)
         body, sent = b"".join(parts), [False]
 
@@ -109,18 +118,16 @@ class Admission(object):
             return await self.app(scope, replay, send)
         if self.queue_max and self.held >= self.running() + self.queue_max:
             self.refused_busy += 1
-            return await self._reply(send, 429, _body("the server is busy: %d requests running or waiting (%d decode "
-                                                      "slot(s) + queue_max %d); retry shortly"
-                                                      % (self.held, self.running(), self.queue_max),
-                                                      "server_busy", "server_busy"), [("Retry-After", "1")])
+            msg = ("the server is busy: %d requests running or waiting (%d decode slot(s) + queue_max %d); retry"
+                   % (self.held, self.running(), self.queue_max))
+            return await self._reply(send, _body(path, 429, msg, "server_busy", "server_busy"), [("Retry-After", "1")])
         self.held += 1                                      # one event loop: no lock needed
         try:
             await self.app(scope, replay, send)
         finally:
             self.held -= 1
 
-    async def _too_large(self, send):
+    async def _too_large(self, send, path):
         self.refused_large += 1
-        return await self._reply(send, 413, _body("the request body is larger than max_body_mb (%d MiB)"
-                                                  % (self.max_body >> 20), "invalid_request_error",
-                                                  "request_too_large"))
+        msg = "the request body is larger than max_body_mb (%d MiB)" % (self.max_body >> 20)
+        return await self._reply(send, _body(path, 413, msg, "invalid_request_error", "request_too_large"))

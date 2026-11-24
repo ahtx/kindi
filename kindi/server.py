@@ -1,4 +1,4 @@
-"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model and its real context (context_length, max_model_len, meta.n_ctx)\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls;\n                               dry_run=true -> the exact prompt_tokens, no generation\n  POST /v1/tokenize            {"content": text} or {"messages": [...], "tools": [...]} -> count, tokens\n  POST /v1/detokenize          {"tokens": [...]} -> text\n\nA prompt that does not fit is an HTTP 400 (code context_length_exceeded, OpenAI's wording) before the request waits\nfor the engine. A stream gets an SSE comment ": kindi progress {...}" every KINDI_KEEPALIVE_S (10) seconds while\nnothing else goes out; kindi_keepalive=true gives a non-streaming request spaces before its JSON. After each answer\nthe end-of-turn state is saved to disk in the background (turn_save, see cache.Turns).\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking); a stream then carries the thinking as\ndelta.reasoning_content. thinking_budget_tokens (or thinking_budget) caps it: at the budget the server closes the\nthinking itself and the model goes on to answer. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
+"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model and its real context (context_length, max_model_len, meta.n_ctx)\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls;\n                               dry_run=true -> the exact prompt_tokens, no generation\n  POST /v1/tokenize            {"content": text} or {"messages": [...], "tools": [...]} -> count, tokens\n  POST /v1/detokenize          {"tokens": [...]} -> text\n  POST /v1/messages            the Anthropic Messages API on the same chat path (tools, thinking, streaming);\n                               /v1/messages/count_tokens counts the prompt (kindi/anthropic.py)\n\nA prompt that does not fit is an HTTP 400 (code context_length_exceeded, OpenAI's wording) before the request waits\nfor the engine. A stream gets an SSE comment ": kindi progress {...}" every KINDI_KEEPALIVE_S (10) seconds while\nnothing else goes out; kindi_keepalive=true gives a non-streaming request spaces before its JSON. After each answer\nthe end-of-turn state is saved to disk in the background (turn_save, see cache.Turns).\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking); a stream then carries the thinking as\ndelta.reasoning_content. thinking_budget_tokens (or thinking_budget) caps it: at the budget the server closes the\nthinking itself and the model goes on to answer. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
 import asyncio
 import codecs
 import concurrent.futures
@@ -1193,6 +1193,108 @@ def create_app(cfg, log=print):
         # the save of the turn's end state runs on the engine thread after this answer is sent, before the next request
         SCHED.submit(K.after_turn, PRIO_TURN)
         return answer(info)
+
+    # ------------------------------------------------------------------ the Anthropic Messages API (PR #64)
+    # A Messages request is translated to a chat request and run by completions() above, streamed, so it shares the
+    # slots, the queue, priorities, the prompt cache, tool calls and thinking; kindi/anthropic.py maps the chunks back.
+    from starlette.requests import Request as _Request
+    from . import anthropic as A
+
+    def _a_err(status, msg):
+        st, body = A.error(status, msg)
+        return JSONResponse(body, status_code=st)
+
+    def _a_auth(request):
+        key = cfg["api_key"]
+        return not key or request.headers.get("x-api-key", "") == key or _auth(request)
+
+    async def _a_chat(request, chat):
+        """run a chat request through completions() as if it came over HTTP; the outer request's disconnect
+        reaches it, so a client that goes away stops the engine as on the chat endpoint"""
+        raw = json.dumps(chat).encode()
+        hs = [(k, v) for k, v in request.scope["headers"] if k not in (b"content-length", b"authorization",
+                                                                         b"x-api-key", b"content-type")]
+        hs += [(b"content-length", str(len(raw)).encode()), (b"content-type", b"application/json")]
+        if cfg["api_key"]:
+            hs.append((b"authorization", ("Bearer " + cfg["api_key"]).encode()))
+        sent = [False]
+
+        async def receive():
+            if not sent[0]:
+                sent[0] = True
+                return {"type": "http.request", "body": raw, "more_body": False}
+            return await request.receive()
+        return await completions(_Request(dict(request.scope, headers=hs, path="/v1/chat/completions"), receive))
+
+    async def _a_body(request):
+        if not _a_auth(request):
+            return None, _a_err(401, "invalid API key (send x-api-key)")
+        try:
+            return await request.json(), None
+        except Exception:  # noqa: BLE001
+            return None, _a_err(400, "the body is not JSON")
+
+    @app.post("/v1/messages/count_tokens")
+    async def anthropic_count(request: Request):
+        body, bad = await _a_body(request)
+        if bad is not None:
+            return bad
+        try:
+            chat = A.to_chat(dict(body, max_tokens=1) if isinstance(body, dict) else body)
+        except A.BadRequest as e:
+            return _a_err(400, str(e))
+        r = await _a_chat(request, dict(chat, stream=False, dry_run=True))
+        if isinstance(r, dict):
+            return {"input_tokens": r["usage"]["prompt_tokens"]}
+        st, b = A.from_openai_error(r.status_code, json.loads(r.body))
+        return JSONResponse(b, status_code=st)
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(request: Request):
+        body, bad = await _a_body(request)
+        if bad is not None:
+            return bad
+        try:
+            chat = A.to_chat(body)
+        except A.BadRequest as e:
+            return _a_err(400, str(e))
+        r = await _a_chat(request, chat)
+        if not isinstance(r, StreamingResponse):
+            st, b = A.from_openai_error(r.status_code, json.loads(r.body))
+            return JSONResponse(b, status_code=st)
+        tr = A.Translator(body.get("model") or model_id)
+
+        async def events():
+            it = r.body_iterator
+            try:
+                for e in tr.start():
+                    yield e
+                async for item in it:
+                    for ln in (item.decode() if isinstance(item, bytes) else item).split("\n"):
+                        for e in tr.line(ln):
+                            yield e
+                for e in tr.end():
+                    yield e
+            finally:
+                await it.aclose()                 # a client that went away: the chat relay stops the engine
+        if body.get("stream"):
+            return StreamingResponse(events(), media_type="text/event-stream")
+        # not streamed: collect the events, and stop the engine if the client goes away meanwhile
+        gen = events()
+        task = asyncio.ensure_future(_drain(gen))
+        while not task.done():
+            done, _ = await asyncio.wait([task], timeout=1.0)
+            if not done and await request.is_disconnected():
+                task.cancel()
+                await gen.aclose()
+                return _a_err(400, "request cancelled")
+        if tr.failed:
+            return JSONResponse(tr.failed[1], status_code=tr.failed[0])
+        return tr.message()
+
+    async def _drain(gen):
+        async for _ in gen:
+            pass
 
     return app
 
