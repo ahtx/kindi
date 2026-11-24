@@ -36,6 +36,7 @@ import cupy as cp
 from . import tp as _tp
 from . import chunk as _chunk
 from . import tc as _tc
+from . import tc_turing as _tc_turing
 from . import sampling
 from . import mtp as _mtp
 from . import dspine as _dsp
@@ -142,7 +143,9 @@ def fd_ch():
 
 
 class SpecKernels(object):
-    def __init__(self):
+    def __init__(self, turing=False):
+        """turing: tc.cu / tca.cu built for sm_75 (tc_turing.py, KINDI_TC_TURING)"""
+        self.turing = turing
         base = open(os.path.join(HERE, "kindi.cu"), encoding="utf-8").read()
         # NVRTC's own expf on sm_80+ CUDA cards (KINDI_KEXPF=1: kindi.cu's kexpf). With kexpf the 9B tc path
         # differed from llama.cpp at a 0.31-logit point (CMP 170HX, prompt 1 token 36) and passes without it; the
@@ -193,6 +196,10 @@ class SpecKernels(object):
                 assert tcf.count(old) == 1, old
                 tcf = tcf.replace(old, new)
             mod = cp.RawModule(code=base + "\n" + tcs + "\n" + wr + "\n" + own + "\n" + tcf)
+        elif turing:
+            # Turing (PR #75): the same sources with KINDI_TURING (m8n8k16 products, no cp.async), compute_75 PTX
+            tcf += chr(10) + open(os.path.join(HERE, "tca.cu"), encoding="utf-8").read()
+            mod = _tc_turing.load_module(_tc_turing.source(base + "\n" + wr + "\n" + own + "\n" + tcs + "\n" + tcf))
         else:
             tcf += chr(10) + open(os.path.join(HERE, "tca.cu"), encoding="utf-8").read()
             p = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)
@@ -1770,10 +1777,17 @@ def install(log=print):
     _tp.Shard._slices, _tp.Shard.build_plans = _slices, _bplans
 
     def _load(self):
-        if not (self.tp.W in (1, 2) and self.g5l and _tc.supported(self.card) and load_stream(self)):
+        # Turing (PR #75, KINDI_TC_TURING=1; force: any card from sm_75 up, for checks): one card only for now
+        turing = self.tp.W == 1 and _tc_turing.supported(self.card) and (_tc_turing.forced()
+                                                                         or not _tc.supported(self.card))
+        ok = self.tp.W in (1, 2) and self.g5l and (turing or _tc.supported(self.card))
+        if not (ok and load_stream(self)):
             o_load(self)
-        if self.tp.W in (1, 2) and self.g5l and _tc.supported(self.card):
-            self.sk = SpecKernels()
+        if ok:
+            self.sk = SpecKernels(turing=turing)
+            if turing:
+                self.log("card %d: tensor-core kernels built for Turing (sm_75 m8n8k16, KINDI_TC_TURING=%s)"
+                         % (self.card, os.environ.get("KINDI_TC_TURING")))
             repack(self, self.log)
 
     def _reserve(eng):

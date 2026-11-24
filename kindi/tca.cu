@@ -21,6 +21,16 @@ __device__ __forceinline__ unsigned int atc_h2(float lo, float hi){
   return r;
 }
 
+#ifdef KINDI_TURING
+/* Turing (tc.cu KINDI_TURING): the int8 product as tc.cu's TC_MMA (exact); the fp16 one as two m16n8k8 (A a0 a1 =
+   k 0..7, a2 a3 = k 8..15; B b0 = k 0..7, b1 = k 8..15) */
+#define ATC_MMA_S8(c, a0, a1, a2, a3, b0, b1) TC_MMA(c, a0, a1, a2, a3, b0, b1)
+#define ATC_M168(c, a0, a1, b) \
+  asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};" \
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(b))
+#define ATC_MMA_F16(c, a0, a1, a2, a3, b0, b1) do { ATC_M168(c, a0, a1, b0); ATC_M168(c, a2, a3, b1); } while(0)
+__device__ __forceinline__ void tc_cp8(void* s, const void* g){ *(uint2*)s = __ldg((const uint2*)g); }
+#else
 #define ATC_MMA_S8(c, a0, a1, a2, a3, b0, b1) \
   asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" \
       : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
@@ -31,6 +41,7 @@ __device__ __forceinline__ unsigned int atc_h2(float lo, float hi){
 __device__ __forceinline__ void tc_cp8(void* s, const void* g){
   asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" :: "r"(tc_smem(s)), "l"(g));
 }
+#endif
 
 __device__ __forceinline__ void atc_stage_k(unsigned char* Ks, unsigned short* dk, const uint2* __restrict__ Kq,
                                             const unsigned short* __restrict__ Kd, int p0, int nblk, int n_kv, int kv){

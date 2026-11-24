@@ -19,12 +19,26 @@
 
 __device__ __forceinline__ float tc_h2f(unsigned short h){ float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
 
+#ifdef KINDI_TURING
+/* Turing (sm_75, KINDI_TC_TURING; PR #75, atimelessrage): no m16n8k32, so each one is four m8n8k16 on the same
+   registers. m16n8k32 A: a0 = rows g8, k 0..15; a1 = rows g8 + 8, k 0..15; a2 / a3 = the same rows, k 16..31; B: b0
+   = k 0..15, b1 = k 16..31; D: c0 c1 = row g8, c2 c3 = row g8 + 8. m8n8k16 takes one A word (row g8, k 4t ..), one B
+   word and the row's two D words, so the four give the same exact integer sums: bit-identical products. */
+#define TC_M8(x0, x1, a, b, T) \
+  asm("mma.sync.aligned.m8n8k16.row.col.s32." T ".s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};" \
+      : "+r"(x0), "+r"(x1) : "r"(a), "r"(b))
+#define TC_MMA(c, a0, a1, a2, a3, b0, b1) do { TC_M8(c[0], c[1], a0, b0, "s8"); TC_M8(c[2], c[3], a1, b0, "s8"); \
+  TC_M8(c[0], c[1], a2, b1, "s8"); TC_M8(c[2], c[3], a3, b1, "s8"); } while(0)
+#define TC_MMAU(c, a0, a1, a2, a3, b0, b1) do { TC_M8(c[0], c[1], a0, b0, "u8"); TC_M8(c[2], c[3], a1, b0, "u8"); \
+  TC_M8(c[0], c[1], a2, b1, "u8"); TC_M8(c[2], c[3], a3, b1, "u8"); } while(0)
+#else
 #define TC_MMA(c, a0, a1, a2, a3, b0, b1) \
   asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" \
       : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
 #define TC_MMAU(c, a0, a1, a2, a3, b0, b1) \
   asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" \
       : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
+#endif
 
 __device__ __forceinline__ unsigned int tc_mask(unsigned int src, unsigned int p){ return 3u * ((src * p) & 0x00FF00FFu); }
 
@@ -256,6 +270,14 @@ __device__ __forceinline__ unsigned int tc_smem(const void* p){
   asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p));
   return a;
 }
+#ifdef KINDI_TURING
+/* Turing has no cp.async: the staging is plain loads and stores, ordered by the same __syncthreads() */
+__device__ __forceinline__ void tc_cp16(void* s, const void* g){ *(uint4*)s = __ldg((const uint4*)g); }
+__device__ __forceinline__ void tc_cp4(void* s, const void* g){ *(unsigned int*)s = __ldg((const unsigned int*)g); }
+__device__ __forceinline__ void tc_commit(){}
+__device__ __forceinline__ void tc_wait1(){}
+__device__ __forceinline__ void tc_wait0(){}
+#else
 __device__ __forceinline__ void tc_cp16(void* s, const void* g){
   asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(tc_smem(s)), "l"(g));
 }
@@ -265,6 +287,7 @@ __device__ __forceinline__ void tc_cp4(void* s, const void* g){
 __device__ __forceinline__ void tc_commit(){ asm volatile("cp.async.commit_group;"); }
 __device__ __forceinline__ void tc_wait1(){ asm volatile("cp.async.wait_group 1;"); }
 __device__ __forceinline__ void tc_wait0(){ asm volatile("cp.async.wait_group 0;"); }
+#endif
 
 __device__ __forceinline__ void tcs_load(TCS& S, int buf, const uint4* __restrict__ XQ, const float* __restrict__ XS,
                                          const int* __restrict__ XA, int NG, int gb, int ntok){
