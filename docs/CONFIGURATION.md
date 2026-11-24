@@ -115,6 +115,7 @@ These variables have no config key. Use them to test or to compare.
 | `KINDI_STREAM_LOAD` | `1` | the plan engine loads the cached 5-trit weights in 256 MB parts |
 | `KINDI_MEM_RESERVE_MB` | `96` (`32` for the plan engine) | GPU memory that the context fit keeps free |
 | `KINDI_FD` | `0` (`1` with drafting) | `1` = the split flash-decode attention of the 27B on one card (with `KINDI_TC=1`). When drafting is on (`KINDI_SPEC` set) with `KINDI_TC=1` and `KINDI_FD` is not set, Kindi uses `1`: with `0`, a drafted answer can differ from plain decoding at near-ties |
+| `KINDI_DRAFT_POLICY` | `0` | `1` = adapt the draft length of the tensor-core spec path (`KINDI_TC=1`, one or two cards) from measured acceptance: the controller may only shorten the engine's base k, so drafts that history says are rejected stop being paid for. Output tokens do not change, and the plain plan-engine and CPU paths are untouched |
 | `KINDI_TC_DP4A` | `0` | `1` = the Pascal dp4a kernels of the `KINDI_TC=1` path (tcp.cu) on a newer card, for tests. On sm_61 they are always used |
 | `KINDI_D1` | `0` (`1` on Pascal) | `1` = the one-pass RMS fold (Hadamard block 512 or 1024, with `KINDI_TC=1`) |
 | `KINDI_TC_HP` | `0` | `1` = the `KINDI_TC=1` products take two int8 rows per token (about 14 bits of activation precision instead of 8), at most 4 tokens per pass. The 8-bit products move the logits by up to about 0.15 from the default path, which changes the token at near-ties (#31) |
