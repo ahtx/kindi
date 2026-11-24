@@ -8,7 +8,10 @@
   kindi chat                    chat in the terminal (no server needed)
   kindi head exact|fast         choose the output head of a running server (next request, no restart)
   kindi info                    show the configuration, the pack and the GPU
-Global options: --config FILE, --pack DIR, --state-dir DIR, --ctx N."""
+Global options: --config FILE, --pack DIR, --state-dir DIR, --ctx N.
+Tandem: verify/bench/serve/chat accept --tandem cpu-first|gpu-first --tandem-cpu-layers N|LIST|gdn:N,
+where LIST is an explicit layer set (0,1,2,4 or 0-2,4-6) and gdn:N moves the first N gated-delta
+(non-attention) layers to the CPU, which keeps decode flat with context."""
 import argparse
 import json
 import os
@@ -205,6 +208,18 @@ def _malloc_tuning():
         pass                                               # not glibc: nothing to tune
 
 
+def _tandem_args(s):
+    """The dense CPU+GPU split flags, available on the commands that build an engine."""
+    s.add_argument("--tandem", choices=("off", "cpu-first", "gpu-first"), default=None,
+                   help="split the Bonsai layers between the CPU and one GPU (default: off)")
+    s.add_argument("--tandem-cpu-layers", default=None,
+                   help="layers the CPU owns in a tandem split: a count (cpu-first prefix / "
+                        "gpu-first suffix), an explicit list such as 0,1,2,4,5,6 / 0-2,4-6, "
+                        "gdn:N (the first N non-attention layers) or auto[:MiB] (the smallest "
+                        "set that makes the context fit, or refuse when no split is needed) "
+                        "(default: a quarter of the model)")
+
+
 def main(argv=None):
     args = sys.argv[1:] if argv is None else list(argv)
     if args and args[0] in ("plan", "route"):       # their own options (kindi plan --help), no config needed
@@ -228,8 +243,10 @@ def main(argv=None):
     s = sub.add_parser("fast-head", help="build the fast-head cluster file")
     s.add_argument("--clusters", type=int, default=1024)
     s.add_argument("--iters", type=int, default=12)
-    sub.add_parser("verify", help="check against llama.cpp's reference output")
-    sub.add_parser("bench", help="measure speed")
+    s = sub.add_parser("verify", help="check against llama.cpp's reference output")
+    _tandem_args(s)
+    s = sub.add_parser("bench", help="measure speed")
+    _tandem_args(s)
     s = sub.add_parser("inkling", help="run experimental Inkling 2 Mini text inference")
     s.add_argument("gguf", help="local Inkling 2 Mini GGUF")
     s.add_argument("prompt")
@@ -241,10 +258,12 @@ def main(argv=None):
     s.add_argument("--api-key", dest="api_key")
     s.add_argument("--head", choices=("exact", "fast"))
     s.add_argument("--slots", type=int, help="requests written at the same time (decode slots; one card, KINDI_TC=1)")
+    _tandem_args(s)
     s = sub.add_parser("chat", help="chat in the terminal")
     s.add_argument("--system", default="")
     s.add_argument("--temperature", type=float, default=0.7)
     s.add_argument("--max-tokens", dest="max_tokens", type=int, default=1024)
+    _tandem_args(s)
     s = sub.add_parser("head", help="exact or fast output head for a running server")
     s.add_argument("mode", choices=("exact", "fast"))
     sub.add_parser("info", help="show configuration, pack and GPU")
@@ -270,6 +289,10 @@ def main(argv=None):
         return run(a)
     ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head")}
     cfg = C.load(a.config, ov)
+    if getattr(a, "tandem", None) is not None:
+        cfg["tandem"] = a.tandem
+    if getattr(a, "tandem_cpu_layers", None) is not None:
+        cfg["tandem_cpu_layers"] = a.tandem_cpu_layers
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
             "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route}[a.cmd](cfg, a)
