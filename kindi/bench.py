@@ -49,7 +49,8 @@ def run(cfg, log=print):
         from .lightning_cli import bench
         return bench(cfg, man, log=log)
     cl = os.path.join(pack, "head_clusters.npz")
-    eng = make_engine(pack, ctx=cfg["ctx"], clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log)
+    eng = make_engine(pack, ctx=cfg["ctx"], clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log,
+                       tandem=cfg.get("tandem", "off"), cpu_layers=cfg.get("tandem_cpu_layers"))
     if cp is not None:
         free, total = cp.cuda.runtime.memGetInfo()
         log("GPU memory: %.0f MiB free of %.0f with a %d-token context" % (free / 2 ** 20, total / 2 ** 20, eng.ctx))

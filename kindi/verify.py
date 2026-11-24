@@ -94,7 +94,8 @@ def run(cfg, log=print):
     log("pack files: %s" % ("%d checked (size and sha256)" % n if n else "no record (a pack from before 0.7.0; "
                                                                           "kindi convert --force adds it)"))
     cl = os.path.join(pack, "head_clusters.npz")
-    eng = make_engine(pack, ctx=1024, clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log)
+    eng = make_engine(pack, ctx=1024, clusters=dict(np.load(cl)) if os.path.exists(cl) else None, log=log,
+                       tandem=cfg.get("tandem", "off"), cpu_layers=cfg.get("tandem_cpu_layers"))
     ok_all, tok, dt, ties = True, 0, 0.0, 0
     for i, r in enumerate(ref["prompts"]):
         sync = (lambda: cp.cuda.Device().synchronize()) if cp is not None and hasattr(eng, "k") else (lambda: None)
