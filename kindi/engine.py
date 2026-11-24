@@ -10,6 +10,7 @@ import os
 import time
 
 import numpy as np
+from .jsonio import load_json
 try:
     import cupy as cp
     _CP_ERR = None
@@ -119,7 +120,7 @@ class Engine(object):
         t0 = time.time()
         self.log = log
         self.ctx = int(ctx)
-        man = json.load(open(os.path.join(pack, "kindi_pack.json")))
+        man = load_json(os.path.join(pack, "kindi_pack.json"))
         if man.get("pack_format") != 1:
             raise SystemExit("kindi: pack format %r is not supported - re-run kindi convert" % man.get("pack_format"))
         self.dims = dict(DEFAULT_DIMS, **man.get("dimensions", {}))
@@ -146,8 +147,8 @@ class Engine(object):
                                                    prop["multiProcessorCount"], unit,
                                                    "" if prop["multiProcessorCount"] == 1 else "s",
                                                    prop["totalGlobalMem"] // 2 ** 20))
-        self.idx = json.load(open(os.path.join(pack, "index.json")))
-        self.bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
+        self.idx = load_json(os.path.join(pack, "index.json"))
+        self.bi = load_json(os.path.join(pack, "bcodes_index.json"))["tensors"]
         self.hsl = None
         self.hs_force = None
         if clusters is not None:
@@ -193,7 +194,7 @@ class Engine(object):
         # cp.asarray stages each upload through pinned host memory and CuPy keeps those blocks: give them back (the
         # 9B weights left ~4 GB of host RAM pinned)
         cp.get_default_pinned_memory_pool().free_all_blocks()
-        self.vocab = json.load(open(os.path.join(pack, "vocab.json")))
+        self.vocab = load_json(os.path.join(pack, "vocab.json"))
         z = lambda n, t=cp.float32: cp.zeros(n, dtype=t)  # noqa: E731
         Rh = VOCAB if self.hsl is None else self.hsl["Rp"]
         work = max(self.D, self.NFF, self.NV * self.HK)
@@ -602,7 +603,7 @@ def make_engine(pack, ctx=4096, clusters=None, log=print, lora=None):
         return CPUEngine(pack, ctx=ctx, log=log)
     from .sched import blocking_sync
     blocking_sync(log)                      # before the first CUDA call (KINDI_BLOCKING_SYNC=0: off)
-    man = json.load(open(os.path.join(pack, "kindi_pack.json")))
+    man = load_json(os.path.join(pack, "kindi_pack.json"))
     force = os.environ.get("KINDI_TP", "")
     weights = int(man.get("bcodes_bytes", 0)) + int(man.get("dpm_bytes", 0))
     two = cp.cuda.runtime.getDeviceCount() >= 2

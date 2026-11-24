@@ -28,6 +28,7 @@ from . import hostram
 from . import layout
 from . import slots as _slots
 from .engine import Kernels, DEFAULT_DIMS, VOCAB
+from .jsonio import load_json
 
 rt = cp.cuda.runtime
 i32, f32t = np.int32, np.float32
@@ -447,7 +448,7 @@ class Shard(object):
             # build, or a run with dual off) left HIP prompts token by token (780M 27B read 10.8 tok/s)
             # a cache without one of this card's tensors (made before the tied-head alias: the 2B / 4B's output.weight)
             # is made again
-            stale = os.path.exists(ipath) and not set(tern) <= set(json.load(open(ipath)))
+            stale = os.path.exists(ipath) and not set(tern) <= set(load_json(ipath))
             # B16: a cache records the sha256 of the bcodes.bin it was made from (g5_KEY.src); a cache of other bcodes
             # is made again, and before a cache is made the pack's files are checked in full
             from . import packcheck
@@ -507,7 +508,7 @@ class Shard(object):
                 if src:
                     with open(spath, "w") as f:
                         f.write(src + "\n")
-            offs = {n: tuple(v) for n, v in json.load(open(ipath)).items()}
+            offs = {n: tuple(v) for n, v in load_json(ipath).items()}
             lane = self.g5l and os.path.exists(lpath)
             if self.g5l and not lane:
                 raise SystemExit("kindi: the lane-layout cache %s is missing; delete %s to rebuild both" % (lpath, cpath))
@@ -849,7 +850,7 @@ class TPEngine(object):
         self.W = int(os.environ.get("KINDI_CARDS") or min(2, rt.getDeviceCount()))
         if self.W not in (1, 2) or rt.getDeviceCount() < self.W:
             raise SystemExit("kindi: the plan engine runs on 1 or 2 cards (%d found)" % rt.getDeviceCount())
-        man = self.man = json.load(open(os.path.join(pack, "kindi_pack.json")))
+        man = self.man = load_json(os.path.join(pack, "kindi_pack.json"))
         self.pack = pack
         self.dims = dict(DEFAULT_DIMS, **man.get("dimensions", {}))
         self.HB = int(man.get("hadamard_block", 512))
@@ -878,8 +879,8 @@ class TPEngine(object):
                 self.ffn_rows = self.ffn_cols = [(0, m), (m, self.NFFg)]
                 self.split_tag = "-b"
             self.head_split = [0, VOCAB // 2, VOCAB]
-        self.idx = json.load(open(os.path.join(pack, "index.json")))
-        self.bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
+        self.idx = load_json(os.path.join(pack, "index.json"))
+        self.bi = load_json(os.path.join(pack, "bcodes_index.json"))["tensors"]
         self.tied_head = "output.weight" not in self.bi   # tied embeddings (2B, 4B): the head is token_embd
         if self.tied_head:
             self.bi["output.weight"] = self.bi["token_embd.weight"]
@@ -890,7 +891,7 @@ class TPEngine(object):
         self.flm = np.memmap(os.path.join(pack, "f32.bin"), dtype=np.float32, mode="r")
         self.signs = {w: np.fromfile(os.path.join(pack, "signs_%d.f32" % w), dtype=np.float32)
                       for w in (self.D, self.NVg * self.HK, self.NHg * self.HD, self.NFFg)}
-        self.vocab = json.load(open(os.path.join(pack, "vocab.json")))
+        self.vocab = load_json(os.path.join(pack, "vocab.json"))
         self._host_buffers()
         self._embedding()
         self.cards = [Shard(self, c, log) for c in range(self.W)]

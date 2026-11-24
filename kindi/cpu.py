@@ -13,6 +13,7 @@ import os
 import time
 
 import numpy as np
+from .jsonio import load_json
 
 VOCAB = 248320
 DEFAULT_DIMS = {"layers": 24, "width": 2048, "ffn": 6144, "heads": 8, "kv_heads": 2,
@@ -100,7 +101,7 @@ class Engine(object):
         set_omp_default(threads)              # OMP_NUM_THREADS, else the physical cores (kindi.cores)
         self.lib = _lib()
         self.ctx = int(ctx)
-        man = json.load(open(os.path.join(pack, "kindi_pack.json")))
+        man = load_json(os.path.join(pack, "kindi_pack.json"))
         d = self.dims = dict(DEFAULT_DIMS, **man.get("dimensions", {}))
         self.HB = int(man.get("hadamard_block", 512))
         self.head_name = man.get("head", "token_embd.weight")
@@ -110,8 +111,8 @@ class Engine(object):
         NV = d["gdn_inner"] // HK
         CC = 2 * NK * HK + NV * HK
         interval = d["full_attention_interval"]
-        idx = json.load(open(os.path.join(pack, "index.json")))["tensors"]
-        bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
+        idx = load_json(os.path.join(pack, "index.json"))["tensors"]
+        bi = load_json(os.path.join(pack, "bcodes_index.json"))["tensors"]
         bc = np.memmap(os.path.join(pack, "bcodes.bin"), dtype=np.uint8, mode="r")
         dp = np.memmap(os.path.join(pack, "dpm.bin"), dtype=np.float16, mode="r")
         self.keep = []                    # every array the C side points at
@@ -189,7 +190,7 @@ class Engine(object):
         self.ylog, self.ylog_n, self.ylog_map = self.logits, VOCAB, None
         self.hsl, self.shortlist = None, 0
         self.shortlist = 0
-        self.vocab = json.load(open(os.path.join(pack, "vocab.json")))
+        self.vocab = load_json(os.path.join(pack, "vocab.json"))
         (log or (lambda *a: None))("kindi-cpu ready: %s, %s threads, ctx %d (%.1fs)" % (
             man.get("model"), os.environ.get("OMP_NUM_THREADS", os.cpu_count()), self.ctx, time.time() - t0))
 
