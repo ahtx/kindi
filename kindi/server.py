@@ -127,7 +127,9 @@ class Kindi(object):
             cl_path = os.path.join(pack, "head_clusters.npz")
             if os.path.exists(cl_path):
                 clusters = dict(np.load(cl_path))
-            self.eng = make_engine(pack, ctx=cfg["ctx"], clusters=clusters, log=log)
+            from . import lora as _lora
+            self.eng = make_engine(pack, ctx=cfg["ctx"], clusters=clusters, log=log,
+                                   lora=_lora.resolve(cfg.get("lora", ""), pack, log=log))
             self.tok = Tok(self.eng.vocab, os.path.join(pack, "merges.txt"))
             self.runner = Runner(self.eng, cfg, self.pack_id, log, progress=self.busy)
             self.sample = Sampler(self.eng)
@@ -872,7 +874,7 @@ def create_app(cfg, log=print):
         views = getattr(K, "slot_views", None) or [K]
         each = [_busy(v.busy) for v in views]
         busy = next((e for e in each if e), None)
-        return dict({"ok": True, "kindi": __version__, "commit": COMMIT, "model": model_id, "ctx": K.eng.ctx,
+        return dict({"ok": True, "kindi": __version__, "commit": COMMIT, "model": model_id, "ctx": K.eng.ctx, "lora": getattr(K.eng, "lora_hash", None),
                      "head": K.head_active(), "uptime_s": round(time.time() - K.t0), "busy": busy, "stats": K.stats,
                      "drafting": K.drafting(), "queue": dict(SCHED.counts(), yields=getattr(K, "yields", 0)),
                      "slots": {"n": len(views), "busy": sum(1 for e in each if e),

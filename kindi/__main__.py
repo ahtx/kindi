@@ -219,6 +219,7 @@ def main(argv=None):
     p.add_argument("--pack")
     p.add_argument("--state-dir", dest="state_dir")
     p.add_argument("--ctx", type=int)
+    p.add_argument("--lora", help="LoRA adapter: a PEFT folder, or the hash of one converted into the pack")
     p.add_argument("--version", action="version", version="kindi " + __version__)
     sub = p.add_subparsers(dest="cmd")
     s = sub.add_parser("convert", help="build the weight pack from the GGUF")
@@ -268,7 +269,7 @@ def main(argv=None):
         if a.max_tokens < 1 or (a.ctx is not None and a.ctx < 512):
             p.error("inkling requires --max-tokens >= 1 and --ctx >= 512")
         return run(a)
-    ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head")}
+    ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head", "lora")}
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,

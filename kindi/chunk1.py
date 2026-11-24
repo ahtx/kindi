@@ -86,6 +86,12 @@ def _gemm(eng, name, X, ldx, Y, ldy, T):
     else:
         f((gx, gy, sp), (256,), (W, S, i32(R), i32(C), X, i32(ldx), c["SPL"], i32(R), i32(T)))
         CK.k_sumsplits(((T * R + 255) // 256,), (256,), (c["SPL"], Y, i32(ldy), i32(R), i32(T), i32(sp)))
+    if eng.lora_by_name:
+        ab = eng.lora_rows(name)
+        if ab is not None:                    # the adapter: Y += (X A'^T) B'^T, fp32 (cuBLAS)
+            Xv = X[:T * ldx].reshape(T, ldx)[:, :C]
+            Yv = Y[:T * ldy].reshape(T, ldy)[:, :R]
+            Yv += (Xv @ ab[0].T) @ ab[1].T
 
 
 def _T(kern, grid, block, args, strides, T):

@@ -21,6 +21,7 @@ DEFAULTS = {
     # engine
     "ctx": "24576",                     # requested context; each backend clamps it to available device memory
     "slots": "1",                       # requests written at the same time (decode slots, plan engine with KINDI_TC=1)
+    "lora": "",                         # LoRA adapter: a PEFT folder / file, or the hash of one converted into the pack
     "head": "exact",                    # exact | fast (shortlist head, ~15% faster, approximate)
     "fast_clusters": "256",             # clusters scored by the fast head
     # prompt cache
@@ -108,6 +109,8 @@ def load(explicit=None, overrides=None):
             cfg[k] = float(v)
         elif k in PATH_KEYS:
             cfg[k] = os.path.abspath(os.path.expanduser(v))
+        elif k == "lora" and v:
+            cfg[k] = os.path.expanduser(v)
         else:
             cfg[k] = v
     if cfg["model_name"] == "auto":

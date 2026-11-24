@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.7.2 (2026-11-24)
+
+Everything in 0.7.1 and 0.7.0 stays. This includes Qwen3.8-Flash-Next, AMD RDNA2 support, native Windows, several
+requests at once and card placement. Kindi 0.7.2 adds LoRA adapters for the ternary Bonsai models and two fixes from
+atimelessrage.
+
+### New
+
+- **LoRA adapters.** `kindi --lora FOLDER serve` loads a PEFT adapter and runs the model with it. The folder holds
+  `adapter_config.json` and `adapter_model.safetensors`. The tensor names can be Hugging Face Qwen3.5 names or GGUF
+  names. Kindi folds the adapter into the rotated activations once, at load. No extra rotation runs for each token.
+  Kindi stores the converted adapter in the pack, and you can name it again by its hash. An adapter on a projection
+  adds one small kernel after each adapted product. Kindi merges adapters on `ssm_alpha` and `ssm_beta` into the
+  float weights at load. They cost nothing for each token. The embeddings and the output head are not adapted.
+  - On a Quadro K1200 with the 4B and a rank-16 adapter, the adapter costs 2.15 ms for each token. The model writes
+    35.9 tokens/s. Without an adapter it writes 39.6 tokens/s.
+  - The K420 test used a random rank-32 adapter on all 12 module types. Kindi gave the same tokens as the float
+    Hugging Face and PEFT reference in 240 of 240 teacher-forced tests. The largest logit difference was 0.003.
+
+### Fixed
+
+- Kindi reads pack and cache JSON files with `kindi.jsonio.load_json`, which closes the file. On Windows, an open file
+  could block a `kindi convert` or a cache rewrite that ran at the same time. Thank you to atimelessrage (PR #50).
+- Every error from `kindi serve` and `kindi route` has the OpenAI error body (`{"error": {"message", "type", "param",
+  "code"}}`), also in streams. The 404, 405 and 422 answers of the web framework use it too. A `messages` value of the
+  wrong type gives a 400 with `param` `messages`, in place of an HTTP 500. Thank you to atimelessrage (PR #58).
+
 ## 0.7.1 (2026-11-23)
 
 0.7.1 keeps everything in 0.7.0 (Qwen3.8-Flash-Next, AMD RDNA2, native Windows, several requests at once and card

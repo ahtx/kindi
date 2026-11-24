@@ -10,7 +10,7 @@ You start a container, and it gets the model, builds the pack once and starts th
 | `ghcr.io/ahtx/kindi:rocm7` | AMD RDNA 3.5 graphics (ROCm 7 in the image; tested: Radeon 840M, Radeon 8060S) |
 
 `cuda`, `rocm6`, `rocm7` and `latest` move to each new release. To keep one release, use the version tag, for
-example `ghcr.io/ahtx/kindi:0.7.1-cuda`. Each release tag points to an image that passed `kindi verify` (the
+example `ghcr.io/ahtx/kindi:0.7.2-cuda`. Each release tag points to an image that passed `kindi verify` (the
 token-for-token check against llama.cpp) on a real card before it was published. Kindi 0.6.0: `0.6.0-cuda` on NVIDIA GeForce RTX 3080; `0.6.0-rocm6` on AMD Radeon Graphics (with HSA_OVERRIDE_GFX_VERSION=11.0.2); `0.6.0-rocm7` on AMD Radeon 780M Graphics (RDNA3, run with HSA_OVERRIDE_GFX_VERSION=11.0.2).
 
 The images are the same as the ones that the [one-command installer](INSTALL.md) builds. The installer also selects
@@ -63,7 +63,7 @@ The settings go in the environment or in a `.env` file beside the compose file:
 | Setting | Default | |
 |---|---|---|
 | `KINDI_MODEL` | `bonsai-4b` | a model id, or a GGUF file in the container (see below) |
-| `KINDI_TAG` | `cuda` (`rocm6` in `compose.amd.yaml`) | the image tag, for example `0.7.1-cuda` |
+| `KINDI_TAG` | `cuda` (`rocm6` in `compose.amd.yaml`) | the image tag, for example `0.7.2-cuda` |
 | `KINDI_PORT` | `8093` | the port on the host |
 | `KINDI_BIND` | `127.0.0.1` | `0.0.0.0` serves the network: then set `KINDI_API_KEY` |
 | `KINDI_API_KEY` | empty | clients must then send `Authorization: Bearer <key>` |

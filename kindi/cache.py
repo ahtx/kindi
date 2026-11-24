@@ -225,6 +225,8 @@ def engine_fingerprint(eng, cfg):
         "head": cfg.get("head", "exact"),
         "code": {},
     }
+    if getattr(c0, "lora_hash", None):              # an adapter (kindi.lora); absent = the same key as before
+        d["lora"] = c0.lora_hash
     for name in _ARITH:
         p = os.path.join(here, name)
         if os.path.exists(p):

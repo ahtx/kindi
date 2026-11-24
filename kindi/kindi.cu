@@ -2240,3 +2240,159 @@ extern "C" __global__ void __launch_bounds__(256) k_g5n4(const uint4* __restrict
   /* 256 threads, 4 tiles (64 rows) per warp: the measured best on the GTX 1080 */
   g5n_core<4>(W, y, R, NG, x);
 }
+
+
+/* ---------------------------------------------------------------- LoRA adapter (kindi/lora.py) */
+
+__device__ __forceinline__ float dot8h(const uint4 w, const float* u){
+  return h2f((unsigned short)(w.x & 0xffff)) * u[0] + h2f((unsigned short)(w.x >> 16)) * u[1]
+       + h2f((unsigned short)(w.y & 0xffff)) * u[2] + h2f((unsigned short)(w.y >> 16)) * u[3]
+       + h2f((unsigned short)(w.z & 0xffff)) * u[4] + h2f((unsigned short)(w.z >> 16)) * u[5]
+       + h2f((unsigned short)(w.w & 0xffff)) * u[6] + h2f((unsigned short)(w.w >> 16)) * u[7];
+}
+
+extern "C" __global__ void __launch_bounds__(1024) k_lora(
+    const float* __restrict__ x, int C, const uint4* __restrict__ A, int NR, int r,
+    const uint4* __restrict__ B, float* y0, int R0, float* y1, int R1, float* y2, int R2){
+  /* y_i += B_i (A_i x) for up to three adapted tensors with the same input x [C] (the folded activation the ternary
+     GEMV just read). A: their A' rows concatenated, [NR = n r][C] fp16; B: their B' rows (scale folded in)
+     concatenated, R0 + R1 + R2 rows of r fp16 in 32-row tiles [tile][r / 8][32 rows] of 8 halves (a warp's load
+     is 512 contiguous bytes); r a multiple of 8, C of 8, NR <= 256. x is staged in shared memory up to C = 10240
+     (the 4B's FFN product is 9216 wide; 45 KB of the 48 KB per block); wider inputs are read from global memory.
+     Phase 1 (down): x in shared memory; each rank row is split into nseg column segments, one warp per (row,
+     segment), 4 loads in flight per lane; the NR values in shared memory. Every block computes all of them (one
+     block per multiprocessor). Phase 2 (up): one thread per output row, 4 rows in flight, added to the GEMV result.
+     fp32 sums. The work is latency-bound (a few hundred KB per launch), hence the unrolling. */
+  __shared__ float xs[10240];
+  __shared__ float tp[1024];
+  __shared__ float t[256];
+  const int j = threadIdx.x, lane = j & 31, wp = j >> 5, nw = blockDim.x >> 5;
+  const int C8 = C >> 3, r8 = r >> 3;
+  const bool stage = C <= 10240;
+  if(stage) for(int c = j; c < C; c += blockDim.x) xs[c] = x[c];
+  const float* xv = stage ? (const float*)xs : x;
+  __syncthreads();
+  const int nseg = NR < nw ? nw / NR : 1;
+  const int seg = (C8 + nseg - 1) / nseg;
+  for(int task = wp; task < NR * nseg; task += nw){
+    const int k = task % NR, sg = task / NR;
+    const uint4* a = A + (long long)k * C8;
+    const int c0 = sg * seg, c1 = min(C8, c0 + seg);
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    int c = c0 + lane;
+    for(; c + 96 < c1; c += 128){
+      const uint4 w0 = KLDG(a + c), w1 = KLDG(a + c + 32), w2 = KLDG(a + c + 64), w3 = KLDG(a + c + 96);
+      acc0 += dot8h(w0, xv + 8 * c);
+      acc1 += dot8h(w1, xv + 8 * (c + 32));
+      acc2 += dot8h(w2, xv + 8 * (c + 64));
+      acc3 += dot8h(w3, xv + 8 * (c + 96));
+    }
+    for(; c < c1; c += 32) acc0 += dot8h(KLDG(a + c), xv + 8 * c);
+    const float acc = wsum_f((acc0 + acc1) + (acc2 + acc3));
+    if(lane == 0) tp[sg * NR + k] = acc;
+  }
+  __syncthreads();
+  for(int k = j; k < NR; k += blockDim.x){
+    float v = 0.f;
+    for(int sg = 0; sg < nseg; ++sg) v += tp[sg * NR + k];
+    t[k] = v;
+  }
+  __syncthreads();
+  const int RT = R0 + R1 + R2, step = gridDim.x * blockDim.x;
+  for(int g0 = blockIdx.x * blockDim.x + j; g0 < RT; g0 += 4 * step){
+    float acc[4];
+    float* yp[4];
+#pragma unroll
+    for(int u = 0; u < 4; ++u){
+      const int g = g0 + u * step;
+      acc[u] = 0.f;
+      yp[u] = 0;
+      if(g < RT){
+        int row = g, i = 0;
+        float* y = y0;
+        if(row >= R0){ row -= R0; i = 1; y = y1; if(row >= R1){ row -= R1; i = 2; y = y2; } }
+        const uint4* b = B + (long long)(g >> 5) * r8 * 32 + (g & 31);
+        for(int q = 0; q < r8; ++q) acc[u] += dot8h(KLDG(b + 32 * q), t + i * r + 8 * q);
+        yp[u] = y + row;
+      }
+    }
+#pragma unroll
+    for(int u = 0; u < 4; ++u) if(yp[u]) *yp[u] += acc[u];
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(512) k_lora2(
+    const float* __restrict__ x, int C, const uint4* __restrict__ A, int NR, int r,
+    const uint4* __restrict__ B, float* y0, int R0, float* y1, int R1, float* y2, int R2,
+    float* tp, unsigned long long* bar, int nseg){
+  /* k_lora with the down products split over the whole grid instead of repeated in every block (K1200: the
+     repeated A reads were 80% of the adapter's time). Phase 1: task = (rank row k, column segment sg), one warp
+     each over all warps of the grid, x read from global memory (L2); partial sums to tp[sg][k]. Then a grid
+     barrier: all blocks must be resident (the engine launches at most 2 blocks of 512 threads per multiprocessor,
+     no large shared arrays), and launches on one stream never overlap, so a 64-bit counter that only grows works
+     without a reset (each block waits for the next multiple of gridDim.x). Phase 2 as in k_lora. */
+  __shared__ float t[256];
+  const int j = threadIdx.x, lane = j & 31;
+  const int C8 = C >> 3, r8 = r >> 3;
+  const int nw = (gridDim.x * blockDim.x) >> 5, gw = (blockIdx.x * blockDim.x + j) >> 5;
+  const int seg = (C8 + nseg - 1) / nseg;
+  for(int task = gw; task < NR * nseg; task += nw){
+    const int k = task % NR, sg = task / NR;
+    const uint4* a = A + (long long)k * C8;
+    const int c0 = sg * seg, c1 = min(C8, c0 + seg);
+    float acc0 = 0.f, acc1 = 0.f;
+    int c = c0 + lane;
+    for(; c + 32 < c1; c += 64){
+      const uint4 w0 = KLDG(a + c), w1 = KLDG(a + c + 32);
+      const float4 u0 = KLDG((const float4*)x + 2 * c), u1 = KLDG((const float4*)x + 2 * c + 1);
+      const float4 v0 = KLDG((const float4*)x + 2 * (c + 32)), v1 = KLDG((const float4*)x + 2 * (c + 32) + 1);
+      const float uu[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+      const float vv[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+      acc0 += dot8h(w0, uu);
+      acc1 += dot8h(w1, vv);
+    }
+    for(; c < c1; c += 32){
+      const float4 u0 = KLDG((const float4*)x + 2 * c), u1 = KLDG((const float4*)x + 2 * c + 1);
+      const float uu[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+      acc0 += dot8h(KLDG(a + c), uu);
+    }
+    const float acc = wsum_f(acc0 + acc1);
+    if(lane == 0) tp[sg * NR + k] = acc;
+  }
+  __syncthreads();
+  if(j == 0){
+    __threadfence();
+    const unsigned long long old = atomicAdd(bar, 1ULL);
+    const unsigned long long target = (old / gridDim.x + 1) * gridDim.x;
+    while(*(volatile unsigned long long*)bar < target) ;
+    __threadfence();
+  }
+  __syncthreads();
+  for(int k = j; k < NR; k += blockDim.x){
+    float v = 0.f;
+    for(int sg = 0; sg < nseg; ++sg) v += ((volatile float*)tp)[sg * NR + k];
+    t[k] = v;
+  }
+  __syncthreads();
+  const int RT = R0 + R1 + R2, step = gridDim.x * blockDim.x;
+  for(int g0 = blockIdx.x * blockDim.x + j; g0 < RT; g0 += 4 * step){
+    float acc[4];
+    float* yp[4];
+#pragma unroll
+    for(int u = 0; u < 4; ++u){
+      const int g = g0 + u * step;
+      acc[u] = 0.f;
+      yp[u] = 0;
+      if(g < RT){
+        int row = g, i = 0;
+        float* y = y0;
+        if(row >= R0){ row -= R0; i = 1; y = y1; if(row >= R1){ row -= R1; i = 2; y = y2; } }
+        const uint4* b = B + (long long)(g >> 5) * r8 * 32 + (g & 31);
+        for(int q = 0; q < r8; ++q) acc[u] += dot8h(KLDG(b + 32 * q), t + i * r + 8 * q);
+        yp[u] = y + row;
+      }
+    }
+#pragma unroll
+    for(int u = 0; u < 4; ++u) if(yp[u]) *yp[u] += acc[u];
+  }
+}

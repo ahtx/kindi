@@ -61,7 +61,7 @@ KERNELS = ("k_g4", "k_g4l", "k_fold_fwht", "k_rmsfold", "k_smfold", "k_l2w", "k_
            "k_attn_sq8t", "k_attn_vq8u", "k_attn_vq8g", "k_xrmsN", "k_attn_vq8w", "k_g5r4", "k_g5r8", "k_attn_sq8d", "k_g5r1", "k_g5r2", "k_g5n4",
            "k_g5r1s", "k_g5r2s", "k_g5r4s", "k_g5r8s",
            "k_g5a1", "k_g5a2", "k_g5a4", "k_g5a8",
-           "k_g5a1s", "k_g5a2s", "k_g5a4s", "k_g5a8s")
+           "k_g5a1s", "k_g5a2s", "k_g5a4s", "k_g5a8s", "k_lora", "k_lora2")
 
 
 
@@ -115,7 +115,7 @@ class Engine(object):
     """One sequence at a time. step(tok, pos) -> next token (greedy) with the logits left in self.ylog;
     feed(tok, pos) processes a prompt token without the output head."""
 
-    def __init__(self, pack, ctx=4096, clusters=None, log=print):
+    def __init__(self, pack, ctx=4096, clusters=None, log=print, lora=None):
         t0 = time.time()
         self.log = log
         self.ctx = int(ctx)
@@ -187,6 +187,9 @@ class Engine(object):
         # output; 2048 = D on the 2B, 4096 != D on the 4B) and NFF (FFN down)
         sg = lambda w: cp.asarray(np.fromfile(os.path.join(pack, "signs_%d.f32" % w), dtype=np.float32))  # noqa: E731
         self.sD, self.sV, self.sA, self.sF = sg(self.D), sg(self.NV * self.HK), sg(self.NH * self.HD), sg(self.NFF)
+        self.lora_hash, self.lora, self.lora_by_name, self.lora_args = None, None, {}, {}
+        if lora is not None and lora[0]:
+            self.load_lora(*lora)
         # cp.asarray stages each upload through pinned host memory and CuPy keeps those blocks: give them back (the
         # 9B weights left ~4 GB of host RAM pinned)
         cp.get_default_pinned_memory_pool().free_all_blocks()
@@ -252,8 +255,103 @@ class Engine(object):
             v = self._f32[name] = self.fl[off:off + rec["rows"] * rec["ne0"]]
         return v
 
+    def load_lora(self, key, tensors):
+        """A LoRA adapter (kindi.lora.resolve): per GEMV call of adapted tensors, their folded A' rows and their B'
+        rows concatenated (ranks padded to a common multiple of 8), for one k_lora launch after the GEMV. The chunked
+        prompt path (kindi.chunk1) reads the same arrays per tensor (lora_by_name)."""
+        calls = []
+        for il in range(self.NL):
+            p = "blk.%d." % il
+            if (il + 1) % self.dims["full_attention_interval"] == 0:
+                calls += [(p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"), (p + "attn_output.weight",)]
+            else:
+                calls += [(p + "attn_qkv.weight", p + "attn_gate.weight"), (p + "ssm_out.weight",)]
+            calls += [(p + "ffn_gate.weight", p + "ffn_up.weight"), (p + "ffn_down.weight",)]
+        tensors = dict(tensors)
+        merged = [n for n, v in tensors.items() if isinstance(v[0], str) and v[0] == "merge"]
+        for n in merged:                          # ssm_alpha / ssm_beta: W += s B A in the fp32 copy on the card
+            f = self.f32(n)
+            f += cp.asarray(tensors.pop(n)[1].reshape(-1))
+        left = set(tensors)
+        self.lora, nbytes = {}, 0
+        for names in calls:
+            have = [i for i, n in enumerate(names) if n in tensors]
+            if not have:
+                continue
+            left -= {names[i] for i in have}
+            C = int(self.w[names[have[0]]][3])
+            rc = -(-max(tensors[names[i]][0].shape[0] for i in have) // 8) * 8
+            if rc * len(have) > 256:
+                raise SystemExit("kindi: adapter on %s does not fit one k_lora launch (rank x tensors <= 256)"
+                                 % names[have[0]])
+            A = np.zeros((len(have) * rc, C), dtype=np.float16)
+            Bs, Rs = [], []
+            for k, i in enumerate(have):
+                a, b = tensors[names[i]]
+                A[k * rc:k * rc + a.shape[0]] = a
+                bp = np.zeros((b.shape[0], rc), dtype=np.float16)
+                bp[:, :b.shape[1]] = b
+                Bs.append(bp)
+                Rs.append(b.shape[0])
+            B = np.concatenate(Bs)
+            B = np.concatenate([B, np.zeros((-len(B) % 32, rc), dtype=np.float16)])    # 32-row tiles (k_lora)
+            B = B.reshape(-1, 32, rc // 8, 8).transpose(0, 2, 1, 3)
+            Ad, Bd = cp.asarray(A), cp.asarray(np.ascontiguousarray(B))
+            nbytes += Ad.nbytes + Bd.nbytes
+            lo = (have, Ad, np.int32(len(have) * rc), np.int32(rc), Bd, Rs)
+            self.lora[tuple(names)] = lo
+            r0 = 0
+            for k, i in enumerate(have):
+                self.lora_by_name[names[i]] = (lo, k, r0)
+                r0 += Rs[k]
+        if left:
+            raise SystemExit("kindi: the adapter has tensors Kindi does not adapt: %s" % ", ".join(sorted(left)[:4]))
+        self.lora_hash = key
+        # k_lora2: the down products split over the grid, 2 blocks of 512 threads per multiprocessor (all resident:
+        # its grid barrier needs that); k_lora: every block repeats them. One multiprocessor (K420) has nothing to
+        # split: k_lora (4B r16 write 9.06 vs 8.67 tok/s); more (K1200: 35.9 vs 33.2): k_lora2. KINDI_LORA_KERNEL=1|2
+        nmp = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)["multiProcessorCount"]
+        self.lora_kern = int(os.environ.get("KINDI_LORA_KERNEL", "1" if nmp == 1 else "2"))
+        self.lora_grid = min(int(os.environ.get("KINDI_LORA_BLOCKS", "0")) or 2 * nmp, 2 * nmp)
+        self.lora_tp = cp.zeros(256 * 64, dtype=cp.float32)
+        self.lora_bar = cp.zeros(1, dtype=cp.uint64)
+        self.log("LoRA adapter %s: %d tensors in %d launches per token, %.1f MiB%s" % (
+            key, len(tensors), len(self.lora), nbytes / 2 ** 20,
+            ", %d merged into fp32 weights" % len(merged) if merged else ""))
+
+    def lora_add(self, lo, x, outs):
+        """k_lora for one adapted GEMV call. The argument tuple is kept per call site (the same input and output
+        buffers every token), so the per-token Python cost is one dict lookup and the launch."""
+        key = (id(lo), id(x)) + tuple(id(o) for o in outs)
+        args = self.lora_args.get(key)
+        if args is None:
+            have, A, NR, rc, B, Rs = lo
+            ys = [outs[i] for i in have] + [outs[have[0]]] * (3 - len(have))
+            Rs = [np.int32(R) for R in Rs] + [np.int32(0)] * (3 - len(have))
+            args = (x, np.int32(A.shape[1]), A, NR, rc, B, ys[0], Rs[0], ys[1], Rs[1], ys[2], Rs[2])
+            if self.lora_kern == 2:
+                nw = self.lora_grid * 16
+                args += (self.lora_tp, self.lora_bar, np.int32(max(1, min(64, nw // int(NR)))))
+            self.lora_args[key] = args
+        if self.lora_kern == 2:
+            self.k.k_lora2((self.lora_grid,), (512,), args)
+        else:
+            self.k.k_lora((self.nsm,), (1024,), args)
+
+    def lora_rows(self, name):
+        """(A' [r][C] fp32, B' [R][r] fp32) of one adapted tensor, or None (the chunked prompt path; made per call:
+        a few hundred KB)"""
+        e = self.lora_by_name.get(name)
+        if e is None:
+            return None
+        (have, A, NR, rc, B, Rs), k, r0 = e
+        rc = int(rc)
+        Bu = B.transpose(0, 2, 1, 3).reshape(-1, rc)[r0:r0 + Rs[k]]
+        return A[k * rc:(k + 1) * rc].astype(cp.float32), Bu.astype(cp.float32)
+
     def gemv(self, names, x, outs, parts_ok=False):
-        """Up to three ternary tensors with the same input in one launch."""
+        """Up to three ternary tensors with the same input in one launch (+ their adapter, if any)."""
+        lo = self.lora.get(tuple(names)) if self.lora else None
         a = [self.w[n] for n in names]
         args = []
         for i in range(3):
@@ -267,11 +365,15 @@ class Engine(object):
             # every row, so a phase has 4x the work for the same table build and barriers; then add the parts
             args[2] = self.part
             self.k.k_g4((1, self.nsm), (1024,), tuple(args) + (x, a[0][3]))
-            if parts_ok:                          # the next rmsfold adds the parts (a block output in self.part)
+            if parts_ok and lo is None:           # the next rmsfold adds the parts (a block output in self.part)
                 return self.nsm
             self.k.k_sumparts(((R0 + 255) // 256,), (256,), (self.part, outs[0], np.int32(R0), np.int32(self.nsm)))
+            if lo is not None:
+                self.lora_add(lo, x, outs)
             return 1
         self.k.k_g4((self.nsm,), (1024,), tuple(args) + (x, a[0][3]))
+        if lo is not None:
+            self.lora_add(lo, x, outs)
         return 1
 
     def fold_args(self, width):
@@ -476,7 +578,7 @@ def tc_hp_for(man):
     return "1" if hb == 4096 else None
 
 
-def make_engine(pack, ctx=4096, clusters=None, log=print):
+def make_engine(pack, ctx=4096, clusters=None, log=print, lora=None):
     """Engine on one GPU, or the two-card tensor parallel engine (kindi.tp) when the weights do not fit one card and
     two GPUs are present. KINDI_TP=1 / 0 forces the choice."""
     from .packcheck import check, PackError
@@ -495,6 +597,8 @@ def make_engine(pack, ctx=4096, clusters=None, log=print):
         from .cpu import Engine as CPUEngine
         if clusters is not None:
             log("the fast head is not available on the CPU: exact head")
+        if lora is not None and lora[0]:
+            raise SystemExit("kindi: LoRA adapters need the GPU engine (not the CPU engine yet)")
         return CPUEngine(pack, ctx=ctx, log=log)
     from .sched import blocking_sync
     blocking_sync(log)                      # before the first CUDA call (KINDI_BLOCKING_SYNC=0: off)
@@ -524,5 +628,7 @@ def make_engine(pack, ctx=4096, clusters=None, log=print):
         spec.install(log)                       # KINDI_TC=1: tensor-core plans (one sm_80+ card); no-op otherwise
         if clusters is not None:
             log("the fast head is not available with two cards: exact head")
+        if lora is not None and lora[0]:
+            raise SystemExit("kindi: LoRA adapters need the single-card engine (not the plan engine yet)")
         return TPEngine(pack, ctx=ctx, log=log)
-    return Engine(pack, ctx=ctx, clusters=clusters, log=log)
+    return Engine(pack, ctx=ctx, clusters=clusters, log=log, lora=lora)

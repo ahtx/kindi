@@ -19,7 +19,7 @@
 # password or a key. Copyright (c) 2026 Amir Husain. SPDX-License-Identifier: AGPL-3.0-only.
 set -euo pipefail
 
-KINDI_VERSION="0.7.1"
+KINDI_VERSION="0.7.2"
 # the image tag (kindi:TAG); KINDI_IMAGE_TAG sets another one, so a test install never replaces an image that other
 # containers on the machine use
 IMAGE_TAG="${KINDI_IMAGE_TAG:-$KINDI_VERSION}"
