@@ -476,9 +476,78 @@ def tc_hp_for(man):
     return "1" if hb == 4096 else None
 
 
+# the `backend` values make_engine_legacy can build for. A dense Bonsai pack
+# writes none: only family converters/writers set the key, so an absent/empty
+# value is the dense family.
+DENSE_BACKENDS = (None, "")
+
+
+def adapter_model_id(man):
+    """The registry model id a backend adapter claims for this pack manifest, or None.
+
+    A manifest two adapters claim is contradictory, so it is refused rather than
+    resolved to whichever hook runs first (that would silently build the other
+    family's engine).
+    """
+    from .modelids import adapter_model_id as _resolve
+
+    return _resolve(man)
+
+
 def make_engine(pack, ctx=4096, clusters=None, log=print):
-    """Engine on one GPU, or the two-card tensor parallel engine (kindi.tp) when the weights do not fit one card and
-    two GPUs are present. KINDI_TP=1 / 0 forces the choice."""
+    """Build the engine for a pack, through its backend adapter when one claims it.
+
+    A pack whose manifest names a family resolves through that family's adapter
+    in the backend registry. ``KINDI_LEGACY_ENGINE_PATH=1`` forces the dense
+    builder for the dense family. A pack that names another family no adapter
+    serves is refused instead of quietly building the dense engine, and a dense
+    pack that no adapter claims is the one fallback that stays valid and is
+    logged.
+    """
+    man = None
+    try:
+        with open(os.path.join(pack, "kindi_pack.json")) as f:
+            man = json.load(f)
+    except Exception:  # noqa: BLE001 - leave broken packs to the legacy builder's error
+        man = None
+    family = man.get("backend") if isinstance(man, dict) else None
+    if os.environ.get("KINDI_LEGACY_ENGINE_PATH") == "1":
+        if family not in DENSE_BACKENDS:
+            raise SystemExit(
+                "kindi: %s is a %r pack and KINDI_LEGACY_ENGINE_PATH=1 asks for the dense engine "
+                "builder, which cannot build that family. Unset the variable to use its adapter."
+                % (pack, family))
+        log("kindi: KINDI_LEGACY_ENGINE_PATH=1: the legacy dense engine builder, no backend adapter")
+        return make_engine_legacy(pack, ctx=ctx, clusters=clusters, log=log)
+    if isinstance(man, dict):
+        model_id = adapter_model_id(man)
+        if model_id:
+            from .backends import resolve
+
+            backend = resolve(model_id, config=dict(pack=pack, ctx=ctx, clusters=clusters, log=log))
+            log("kindi: %s -> the %s backend (%s)" % (pack, backend.capabilities.name, model_id))
+            return backend.engine
+        if family not in DENSE_BACKENDS:
+            raise SystemExit(
+                "kindi: %s is a %r pack and no backend adapter serves that family, so the gateway "
+                "would build the dense Bonsai engine for it (the wrong engine). `kindi serve` and "
+                "`kindi verify` route by `backend`." % (pack, family))
+        if "bcodes_bytes" not in man:
+            raise SystemExit(
+                "kindi: %s has no `backend` field and no dense Bonsai weight fields "
+                "(bcodes_bytes): it is not a pack this version can build - re-run "
+                "`kindi convert` or `kindi use`" % (pack,))
+        log("kindi: %s declares no backend and no adapter claims it (model %r): the legacy dense "
+            "builder, which has no registry identity - check the manifest's `model`/`source_file`"
+            % (pack, man.get("model")))
+    return make_engine_legacy(pack, ctx=ctx, clusters=clusters, log=log)
+
+
+def make_engine_legacy(pack, ctx=4096, clusters=None, log=print):
+    """The pre-T4.2 engine builder (the ``KINDI_LEGACY_ENGINE_PATH=1`` path, and what the
+    backend adapters delegate to): an engine on one GPU, or the two-card tensor parallel
+    engine (kindi.tp) when the weights do not fit one card and two GPUs are present.
+    KINDI_TP=1 / 0 forces the choice."""
     from .packcheck import check, PackError
     try:
         check(pack, "size")                 # B16: a pack file that changed size after kindi convert stops here
