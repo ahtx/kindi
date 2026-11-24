@@ -1,4 +1,9 @@
-"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model and its real context (context_length, max_model_len, meta.n_ctx)\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls;\n                               dry_run=true -> the exact prompt_tokens, no generation\n  POST /v1/tokenize            {"content": text} or {"messages": [...], "tools": [...]} -> count, tokens\n  POST /v1/detokenize          {"tokens": [...]} -> text\n\nA prompt that does not fit is an HTTP 400 (code context_length_exceeded, OpenAI's wording) before the request waits\nfor the engine. A stream gets an SSE comment ": kindi progress {...}" every KINDI_KEEPALIVE_S (10) seconds while\nnothing else goes out; kindi_keepalive=true gives a non-streaming request spaces before its JSON. After each answer\nthe end-of-turn state is saved to disk in the background (turn_save, see cache.Turns).\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking); a stream then carries the thinking as\ndelta.reasoning_content. thinking_budget_tokens (or thinking_budget) caps it: at the budget the server closes the\nthinking itself and the model goes on to answer. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
+"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model and its real context (context_length, max_model_len, meta.n_ctx)\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls;\n                               dry_run=true -> the exact prompt_tokens, no generation\n  POST /v1/tokenize            {"content": text} or {"messages": [...], "tools": [...]} -> count, tokens\n  POST /v1/detokenize          {"tokens": [...]} -> text
+  GET  /sessions               chat sessions from state_dir/sessions (?status=&tag= filters); host-only
+  POST /sessions               create a session ({"title": ..., "messages": [{"role": ..., "content": ...}], ...})
+  GET  /sessions/<id>          one session with its messages; /sessions/<id>/export is raw markdown
+  POST /sessions/<id>/status   move a session through triage ({"status": "open"|"needs-review"|"resolved"})
+  POST /sessions/<id>/tags     add a tag ({"tag": "..."}); /sessions/<id>/read clears unread\n\nA prompt that does not fit is an HTTP 400 (code context_length_exceeded, OpenAI's wording) before the request waits\nfor the engine. A stream gets an SSE comment ": kindi progress {...}" every KINDI_KEEPALIVE_S (10) seconds while\nnothing else goes out; kindi_keepalive=true gives a non-streaming request spaces before its JSON. After each answer\nthe end-of-turn state is saved to disk in the background (turn_save, see cache.Turns).\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking); a stream then carries the thinking as\ndelta.reasoning_content. thinking_budget_tokens (or thinking_budget) caps it: at the budget the server closes the\nthinking itself and the model goes on to answer. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
 import asyncio
 import codecs
 import concurrent.futures
@@ -812,7 +817,7 @@ def _make_engine(cfg, log):
 
 def create_app(cfg, log=print):
     from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse, StreamingResponse
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
 
     K = GPU_THREAD.submit(_make_engine, cfg, log).result()
     if getattr(K, "slot_views", None):
@@ -823,8 +828,11 @@ def create_app(cfg, log=print):
     model_id = cfg["model_name"]
     app = FastAPI(title="Kindi", version=__version__)
 
-    def _err(code, msg, typ="invalid_request_error"):
-        return JSONResponse({"error": {"message": msg, "type": typ, "code": typ}}, status_code=code)
+    def _err(code, msg, typ="invalid_request_error", param=None):
+        error = {"message": msg, "type": typ, "code": typ}
+        if param is not None:
+            error["param"] = param
+        return JSONResponse({"error": error}, status_code=code)
 
     def _bad(e):
         """a ValueError of a request as HTTP 400; an oai.RequestError also names the field (#38)"""
@@ -1162,6 +1170,161 @@ def create_app(cfg, log=print):
         # the save of the turn's end state runs on the engine thread after this answer is sent, before the next request
         SCHED.submit(K.after_turn, PRIO_TURN)
         return answer(info)
+
+    # Chat sessions (REQ-0016): the host-only store `kindi chat` records and the `kindi sessions` CLI reads.
+    # These routes never touch the engine, the GPU or the prompt cache.
+    from .sessions import STATUSES as SESSION_STATUSES
+    from .sessions import SessionStore
+    from .sessions import slug as session_slug
+
+    # Each request gets its own store, so the lock must live in the app: two concurrent
+    # status/tag posts would otherwise race their read-modify-write.
+    _SESSIONS_LOCK = threading.Lock()
+
+    def _session_store():
+        root = cfg.get("state_dir") or os.path.join(os.getcwd(), ".kindi")
+        return SessionStore(os.path.join(root, "sessions"))
+
+    def _session_summary(rec):
+        return {"id": rec.get("id"), "title": rec.get("title"), "status": rec.get("status"),
+                "tags": rec.get("tags") or [], "created": rec.get("created"), "updated": rec.get("updated"),
+                "unread": bool(rec.get("unread")), "protected": bool(rec.get("protected")),
+                "message_count": len(rec.get("messages") or [])}
+
+    def _valid_session_id(sid):
+        return isinstance(sid, str) and len(sid) == 12 and all(c in "0123456789abcdef" for c in sid)
+
+    def _session_or_none(sid):
+        """The record for sid, or an error response. Only the store's 12-hex ids reach a file read."""
+        if not _valid_session_id(sid):
+            return None, _err(400, "invalid session id", "invalid_request_error", param="id")
+        try:
+            return _session_store().get(sid), None
+        except KeyError:
+            return None, _err(404, "no session %r" % sid, "not_found", param="id")
+
+    @app.get("/sessions")
+    def sessions_list(request: Request, status: str = None, tag: str = None):
+        if not _auth(request):
+            return _err(401, "invalid API key", "authentication_error")
+        if status is not None and status not in SESSION_STATUSES:
+            return _err(400, "status must be one of %s (got %r)" % (list(SESSION_STATUSES), status),
+                        "invalid_request_error", param="status")
+        with _SESSIONS_LOCK:
+            rows = _session_store().list(status=status, tag=tag)
+        return {"sessions": [_session_summary(r) for r in rows]}
+
+    @app.post("/sessions", status_code=201)
+    async def sessions_create(request: Request):
+        if not _auth(request):
+            return _err(401, "invalid API key", "authentication_error")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return _err(400, "the body is not JSON")
+        if not isinstance(body, dict):
+            return _err(400, "the body must be a JSON object")
+        title = body.get("title", "")
+        if not isinstance(title, str):
+            return _err(400, "title must be a string", "invalid_request_error", param="title")
+        tags = body.get("tags", [])
+        if not isinstance(tags, list) or any(not isinstance(t, str) for t in tags):
+            return _err(400, "tags must be a list of strings", "invalid_request_error", param="tags")
+        status = body.get("status", "open")
+        if status not in SESSION_STATUSES:
+            return _err(400, "status must be one of %s (got %r)" % (list(SESSION_STATUSES), status),
+                        "invalid_request_error", param="status")
+        protected = body.get("protected", False)
+        if not isinstance(protected, bool):
+            return _err(400, "protected must be true or false", "invalid_request_error", param="protected")
+        raw_messages = body.get("messages", [])
+        if not isinstance(raw_messages, list):
+            return _err(400, "messages must be a list", "invalid_request_error", param="messages")
+        messages = []
+        for i, message in enumerate(raw_messages):
+            if not isinstance(message, dict):
+                return _err(400, "messages[%d] must be an object" % i, "invalid_request_error", param="messages")
+            role, content = message.get("role"), message.get("content")
+            if role not in ("system", "user", "assistant", "tool"):
+                return _err(400, "messages[%d].role must be system, user, assistant or tool" % i,
+                            "invalid_request_error", param="messages")
+            if not isinstance(content, str):
+                return _err(400, "messages[%d].content must be a string" % i,
+                            "invalid_request_error", param="messages")
+            messages.append((role, content))
+        with _SESSIONS_LOCK:
+            rec = _session_store().create(title=title, messages=messages, tags=tags,
+                                          status=status, protected=protected)
+        return rec
+
+    @app.get("/sessions/{sid}")
+    def sessions_show(request: Request, sid: str):
+        if not _auth(request):
+            return _err(401, "invalid API key", "authentication_error")
+        with _SESSIONS_LOCK:
+            rec, err = _session_or_none(sid)
+        if err is not None:
+            return err
+        return rec
+
+    @app.get("/sessions/{sid}/export")
+    def sessions_export(request: Request, sid: str):
+        if not _auth(request):
+            return _err(401, "invalid API key", "authentication_error")
+        with _SESSIONS_LOCK:
+            rec, err = _session_or_none(sid)
+            if err is not None:
+                return err
+            text = _session_store().export_markdown(rec)
+            name = "%s-%s.md" % (rec["created"][:10], session_slug(rec["title"]) or rec["id"])
+        return Response(text, media_type="text/markdown; charset=utf-8",
+                        headers={"Content-Disposition": 'attachment; filename="%s"' % name})
+
+    async def _sessions_post(request: Request, sid: str, action):
+        if not _auth(request):
+            return _err(401, "invalid API key", "authentication_error")
+        if action == "read":
+            with _SESSIONS_LOCK:
+                rec, err = _session_or_none(sid)
+                if err is not None:
+                    return err
+                return _session_summary(_session_store().mark_read(rec["id"]))
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return _err(400, "the body is not JSON")
+        if not isinstance(body, dict):
+            return _err(400, "the body must be a JSON object")
+        if action == "status":
+            status = body.get("status")
+            if status not in SESSION_STATUSES:
+                return _err(400, "status must be one of %s (got %r)" % (list(SESSION_STATUSES), status),
+                            "invalid_request_error", param="status")
+        else:
+            tag = body.get("tag")
+            if not isinstance(tag, str) or not tag.strip():
+                return _err(400, "tag must be a non-empty string", "invalid_request_error", param="tag")
+        with _SESSIONS_LOCK:
+            rec, err = _session_or_none(sid)
+            if err is not None:
+                return err
+            store = _session_store()
+            if action == "status":
+                return _session_summary(store.set_status(rec["id"], body.get("status")))
+            return _session_summary(store.add_tag(rec["id"], body.get("tag")))
+
+    async def _sessions_status(request: Request, sid: str):
+        return await _sessions_post(request, sid, "status")
+
+    async def _sessions_tags(request: Request, sid: str):
+        return await _sessions_post(request, sid, "tags")
+
+    async def _sessions_read(request: Request, sid: str):
+        return await _sessions_post(request, sid, "read")
+
+    app.add_api_route("/sessions/{sid}/status", _sessions_status, methods=["POST"])
+    app.add_api_route("/sessions/{sid}/tags", _sessions_tags, methods=["POST"])
+    app.add_api_route("/sessions/{sid}/read", _sessions_read, methods=["POST"])
 
     return app
 
