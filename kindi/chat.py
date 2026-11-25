@@ -41,12 +41,15 @@ def _argval(v):
     return str(v)
 
 
+_XHIGH_INSTR = ("Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
+                 "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity "
+                 "in the final answer.")
 REASONING_EFFORTS = {
-    "xhigh": ("Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
-              "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer."),
+    "xhigh": _XHIGH_INSTR,
     "medium": "",
-    "low": ("Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion "
-            "without unnecessary elaboration."),
+    # Bonsai 2.5 27B's card does not support `low`: selecting it makes the model behave close to `xhigh`, and the
+    # template's own `low` text is not what the model was trained on, so `low` renders the `xhigh` instruction.
+    "low": _XHIGH_INSTR,
 }
 
 

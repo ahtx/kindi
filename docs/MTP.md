@@ -78,3 +78,11 @@ Set `KINDI_SPEC=0` to turn off all speculation. To keep the 2B drafter and stop 
 The installer turns on `KINDI_SPEC=auto` only on tensor-core profiles. For the 27B, auto needs only the 2B
 drafter. For the 2B, the installer downloads the head file and checks its sha256. If that fails, it prints one
 line, and the 2B runs without MTP.
+
+## The 27B's head in the same file
+
+Prism ML's Bonsai 2.5 27B `-mtp` GGUF stores its draft head as a 65th block of the model file
+(`blk.64`: one layer plus `nextn.{eh_proj,enorm,hnorm,shared_head_norm}`, quantized Q4_0 inside the
+PTQ1_0 file). `kindi convert` builds the 64-layer language model from that file, skips the head's
+tensors and records them in `kindi_pack.json` under `mtp_head`. Nothing drafts with that head yet,
+so both 2.5 files give the same pack and the same output; see [BONSAI-2.5-27B.md](BONSAI-2.5-27B.md).

@@ -27,6 +27,17 @@ MODELS = {
     "bonsai-27b": dict(file="Ternary-Bonsai-2-27B-PTQ1_0.gguf", repo="prism-ml/Ternary-Bonsai-2-27B-gguf",
                        sha="53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3", size=5946648928,
                        one=7600, two=3800, what="Ternary-Bonsai-2 27B (ternary weights)"),
+    # Ternary-Bonsai-2.5 27B: same geometry as the 2 27B (64 layers), a different card. Two files share the
+    # release: the plain one and one with the MTP draft head as a 65th block, which converts to the same
+    # 64-layer pack (see docs/BONSAI-2.5-27B.md).
+    "bonsai-2.5-27b": dict(file="Ternary-Bonsai-2.5-27B-PTQ1_0.gguf", repo="prism-ml/Ternary-Bonsai-2.5-27B-GGUF",
+                           sha="929560ec9d37cf3cadd4b00cc87b51c570082a628dd830b4692dc0b2ed18dbbe", size=5993834848,
+                           one=7600, two=3800, what="Ternary-Bonsai-2.5 27B (agentic, ternary weights)"),
+    "bonsai-2.5-27b-mtp": dict(file="Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf",
+                               repo="prism-ml/Ternary-Bonsai-2.5-27B-GGUF",
+                               sha="e0fc5f3d47b9c926d52677d303b19df356a2376614b3e1cb9973865fc04ca431",
+                               size=6232818944, one=7600, two=3800,
+                               what="Ternary-Bonsai-2.5 27B with MTP draft head (agentic)"),
     "nemotron-e4b": dict(file="NVIDIA-Nemotron-3.5-Bolt-E4B-UD-Q3_K_XL.gguf", repo="unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF",
                          sha="3f8032b9d2c18536c4ac51b97959a563cc27434de99823640c98147edc62ce9b", size=4219133120,
                          one=3300, two=2400, what="NVIDIA Nemotron 3.5 Bolt E4B (Gemma 4), UD-Q3_K_XL"),
