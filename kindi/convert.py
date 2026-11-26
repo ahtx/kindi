@@ -12,6 +12,7 @@ bcodes_index.json, kindi_pack.json."""
 import hashlib
 import json
 import os
+import re
 import time
 
 import numpy as np
@@ -30,6 +31,9 @@ PROFILES = {
 PACK_FORMAT = 1
 
 
+_HEAD_MARK = re.compile(r"blk\.(\d+)\.nextn\.eh_proj\.weight$")
+
+
 def mtp_head_block(profile, names):
     """The extra block of a Ternary-Bonsai ``-mtp`` GGUF, or None.
 
@@ -37,18 +41,23 @@ def mtp_head_block(profile, names):
     one decoder layer plus ``nextn.{eh_proj,enorm,hnorm,shared_head_norm}``. Everything before it is
     the 64-layer language model, so the pack is built from those blocks and the head is recorded in
     the manifest instead of being converted into a model layer.
+
+    The block is found by its own ``nextn.eh_proj.weight`` marker, at a block index that is a known
+    language model's layer count - not by assuming the metadata's block count includes the head. A
+    file whose count already excludes it (64 while ``blk.64`` exists) is the same model as the one
+    Prism ships today (65), where the count does include it; both resolve to 64.
     """
     if not profile or profile[0] is None:
         return None
-    n = int(profile[0]) - 1
-    if (n,) + tuple(profile[1:]) not in PROFILES:
-        return None
+    dims = tuple(profile[1:])
     names = set(names)
-    if "blk.%d.nextn.eh_proj.weight" % n not in names:
-        return None
-    if any(x.startswith("blk.%d." % (n + 1)) for x in names):
-        return None
-    return n
+    for n in sorted({int(m.group(1)) for m in map(_HEAD_MARK.match, names) if m}):
+        if (n,) + dims not in PROFILES:
+            continue                       # not a known model's layer count, so not its head
+        if any(x.startswith("blk.%d." % (n + 1)) for x in names):
+            continue                       # a real layer sits past it: this is not a -mtp file
+        return n
+    return None
 
 
 def trits_from_raw(raw):
@@ -127,15 +136,14 @@ def convert(gguf_path, out_dir, log=print):
     profile = (g.kv.get("qwen35.block_count"), g.kv.get("qwen35.embedding_length"),
                g.kv.get("qwen35.feed_forward_length"), g.kv.get("qwen35.attention.head_count"),
                g.kv.get("qwen35.attention.head_count_kv"), g.kv.get("qwen35.ssm.group_count"))
-    mtp_block = None
-    if profile not in PROFILES:
-        mtp_block = mtp_head_block(profile, [t[0] for t in g.tensors])
-        if mtp_block is None:
-            raise SystemExit("kindi convert: unsupported Ternary-Bonsai-2/2.5 dimensions %r" % (profile,))
+    mtp_block = mtp_head_block(profile, [t[0] for t in g.tensors])
+    if mtp_block is not None:
         # the file is the same language model plus one head block: convert the model, not the head
         profile = (mtp_block,) + tuple(profile[1:])
         log("MTP head: blk.%d is the draft head, not a model layer; converting the %d-layer language model"
             % (mtp_block, profile[0]))
+    elif profile not in PROFILES:
+        raise SystemExit("kindi convert: unsupported Ternary-Bonsai-2/2.5 dimensions %r" % (profile,))
     # the draft head carries its own types (the 2.5 -mtp file stores blk.64 as Q4_0); it is not converted,
     # so it must not decide whether the language model's formats are supported
     types = {t[2] for t in g.tensors

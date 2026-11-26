@@ -13,7 +13,11 @@ layers, 5,120 wide, 17,408 FFN, 24 heads / 4 KV heads). The release ships two fi
 - **`kindi convert` accepts the `-mtp` file.** The 65th block is not a model layer: the converter
   builds the 64-layer pack, skips that block's tensors, excludes them from the tensor-type check
   (they are Q4_0 inside a PTQ1_0 file) and records `"mtp_head": {"block": 64, "tensors": [...]}` in
-  `kindi_pack.json`. Both files therefore produce the same pack.
+  `kindi_pack.json`. Both files therefore produce the same pack. The head is found by its own
+  `nextn.eh_proj.weight` marker at a known model's layer count rather than by trusting the
+  metadata's block count, so a file whose count already excludes the head (64 while `blk.64`
+  exists) converts the same way as Prism's 65-block one, and a real layer past the head is refused
+  instead of being dropped.
 - **Catalog entries** `bonsai-2.5-27b` and `bonsai-2.5-27b-mtp` (file, repo, sha256, size, card
   memory), so `kindi use` downloads and checks the right file.
 - **`reasoning_effort = low` renders the `xhigh` instruction.** The 2.5 card says `low` is not
@@ -37,8 +41,13 @@ engine), with the files named above:
   predicts.
 
 These checks were run in a fork with a larger test suite; this branch carries the converter,
-catalog and template changes only, and no automated test was added here because this tree has no
-test suite (`tests/` holds data only).
+catalog and template changes. The two decisions that make the intake work are pure functions, so
+`tests/test_bonsai25_intake.py` covers them without a pack, a GPU or a compiler: `mtp_head_block`
+over the plain file, Prism's 65-block count, a count that excludes the head, a layer past the head
+and a marker at a block index that is not a known model's size; and `low`/`xhigh`/`medium`
+rendering with an unknown effort refused. It needs numpy and pytest only:
+
+    python -m pytest tests/test_bonsai25_intake.py      # 8 passed
 
 ## Not verified, and what is missing here
 
