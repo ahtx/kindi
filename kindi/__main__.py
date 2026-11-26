@@ -303,6 +303,33 @@ def cmd_intel_norm(cfg, a):
     return 0 if not report["errors"] else 1
 
 
+def cmd_intel_caps(cfg, a):
+    """Device-capability probe for the Arc decode hypotheses; no kernel or model."""
+    from . import intel_caps
+
+    report = intel_caps.run_probe(loader=a.loader, device=a.device,
+                                  device_name=a.device_name)
+    if a.json:
+        print(intel_caps.dumps(report))
+    else:
+        print(intel_caps.render(report))
+    return 0 if report["result"] == "pass" else 1
+
+
+def cmd_intel_tier(cfg, a):
+    """Cold-tier gate probe: device-to-host copy rate vs a disk baseline."""
+    from . import intel_tier
+
+    report = intel_tier.run_probe(a.mib, repeats=a.repeats, loader=a.loader,
+                                  device=a.device, device_name=a.device_name,
+                                  disk_dir=a.disk_dir)
+    if a.json:
+        print(intel_tier.dumps(report))
+    else:
+        print(intel_tier.render(report))
+    return 0 if report["result"] == "pass" else 1
+
+
 def main(argv=None):
     args = sys.argv[1:] if argv is None else list(argv)
     if args and args[0] in ("plan", "route"):       # their own options (kindi plan --help), no config needed
@@ -393,6 +420,22 @@ def main(argv=None):
     s.add_argument("--no-persist", action="store_true",
                    help="skip the persistent eight-row kernel (one launch per chunk over every tensor)")
     s.add_argument("--json", action="store_true", help="print the whole report as JSON")
+    s = sub.add_parser("intel-caps", help="device caps behind the Arc decode hypotheses (no kernel, model or backend)")
+    s.add_argument("--device", type=int, default=0, help="Intel OpenCL GPU index (default 0)")
+    s.add_argument("--device-name", default=None, metavar="SUBSTR",
+                   help="pick the GPU whose name contains SUBSTR (e.g. Arc) instead of --device")
+    s.add_argument("--loader", default=None, help="OpenCL loader name/path (default: the host loader)")
+    s.add_argument("--json", action="store_true", help="print the whole report as JSON")
+    s = sub.add_parser("intel-tier", help="cold-tier gate: device-to-host copy rate vs a disk baseline (no model or backend)")
+    s.add_argument("--mib", type=int, default=64, help="copy chunk in MiB (default 64, 1-1024)")
+    s.add_argument("--repeats", type=int, default=5, help="timed copies per side (default 5, max 20)")
+    s.add_argument("--device", type=int, default=0, help="Intel OpenCL GPU index (default 0)")
+    s.add_argument("--device-name", default=None, metavar="SUBSTR",
+                   help="pick the GPU whose name contains SUBSTR (e.g. Arc) instead of --device")
+    s.add_argument("--loader", default=None, help="OpenCL loader name/path (default: the host loader)")
+    s.add_argument("--disk-dir", default=None, help="where to write the disk-baseline temp file "
+                   "(default: the system temp dir; the path is never recorded)")
+    s.add_argument("--json", action="store_true", help="print the whole report as JSON")
     s = sub.add_parser("intel-step", help="one full decode step on an Intel GPU (norm/fold + pack GEMV on the device, host math for the rest); compared against the CPU engine")
     s.add_argument("--pack", required=True, help="a pack directory written by kindi convert")
     s.add_argument("--steps", type=int, default=4, help="decode steps per prompt (default 4)")
@@ -430,7 +473,8 @@ def main(argv=None):
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
             "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route,
             "intel-cl": cmd_intel_cl, "intel-ternary": cmd_intel_ternary, "intel-norm": cmd_intel_norm,
-            "intel-pack": cmd_intel_pack, "intel-step": cmd_intel_step,
+            "intel-pack": cmd_intel_pack, "intel-caps": cmd_intel_caps,
+            "intel-tier": cmd_intel_tier, "intel-step": cmd_intel_step,
             "intel-run": cmd_intel_run}[a.cmd](cfg, a)
 
 

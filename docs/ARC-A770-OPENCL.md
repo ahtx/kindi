@@ -15,6 +15,8 @@ Intel card from the released tree.
 | `kindi intel-pack` | every ternary tensor shape of a real pack, timed, validated against the host model |
 | `kindi intel-step` | one full decode step, teacher-forced against the CPU engine |
 | `kindi intel-run` | greedy decode of a prompt on the device, no CPU engine at all |
+| `kindi intel-caps` | device caps behind the decode hypotheses (profile, extensions, alloc cap) — no kernel |
+| `kindi intel-tier` | cold-tier gate: expert-sized device-to-host copies vs a disk baseline — copies only |
 
 Everything reads the pack `kindi convert` already writes (`bcodes.bin`, `dpm.bin`, `f32.bin`,
 `signs_*.f32`, `bcodes_index.json`, `kindi_pack.json`), so no pack-format change is involved.
@@ -31,6 +33,16 @@ Both token sequences are the ones the CPU engine produces from the same packs, s
 is correct where it runs. It is **not fast**: the step pays one blocking read per GEMV group and
 leaves the delta rule, conv, attention, softmax and the FFN elementwise on the host, which is why a
 27B token costs ~0.8 s here.
+
+## Gate probes (no kernel, model or support claim)
+
+- `intel-caps` records the premises the follow-up hypotheses rest on: the OpenCL C profile
+exposes no DPAS/XMX path (that work needs SYCL/ESIMD), and a 27B code buffer does not fit the
+driver's per-allocation cap, so the step chunks codes on tensor boundaries.
+- `intel-tier` gates whether A770 VRAM could serve as the MoE cold-expert store instead of
+NVMe: byte-exact sustained device-to-host copies against a same-host disk baseline. The gate
+clears only on a clear multiple with the chunk fitting the cap; the first live run does not
+clear it against a warm page-cache baseline, so no tier is wired.
 
 ## Notes
 
