@@ -8,12 +8,20 @@ import time
 
 
 def reference_for(pack):
-    """the reference file of the pack's model (by the size in its source file name), or None"""
+    """the reference file of the pack's model, or None.
+
+    The key is the release plus the size from the manifest (2b, 4b, 9b, 27b, 2.5-27b). The release
+    matters: a Bonsai 2.5 pack compared against Bonsai 2's reference would report a port failure that
+    is really a wrong reference, so an unseen release finds no file and says so.
+    """
     here = os.path.dirname(os.path.abspath(__file__))
     man = json.load(open(os.path.join(pack, "kindi_pack.json")))
-    m = re.search(r"-(\d+)B[-_.]", man.get("source_file", "") + ".") or re.search(r"(\d+)B", man.get("model", ""))
+    src = str(man.get("source_file") or "")
+    m = re.search(r"-(\d+)B[-_.]", src + ".") or re.search(r"(\d+)B", str(man.get("model") or ""))
     size = (m.group(1) + "b") if m else "2b"
-    p = os.path.join(here, "reference.json" if size == "2b" else "reference-%s.json" % size)
+    release = "2.5-" if "bonsai-2.5" in (src + " " + str(man.get("model") or "")).lower() else ""
+    key = release + size
+    p = os.path.join(here, "reference.json" if key == "2b" else "reference-%s.json" % key)
     return p if os.path.exists(p) else None
 
 
