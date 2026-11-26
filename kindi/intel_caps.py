@@ -39,6 +39,9 @@ from .intel_cl import (
 CL_DEVICE_EXTENSIONS = 0x1030
 CL_DEVICE_MAX_MEM_ALLOC_SIZE = 0x1010
 CL_DEVICE_LOCAL_MEM_SIZE = 0x1023
+CL_DEVICE_UUID_KHR = 0x105A
+CL_DEVICE_UUID_SIZE = 16
+CL_DEVICE_PCI_BUS_KHR = 0x410F
 
 PROBE = "intel-caps"
 SCHEMA = 1
@@ -76,6 +79,62 @@ def _mib(value):
     return None if value is None else value // (1024 * 1024)
 
 
+def _query_bytes(getter, handle, param, size):
+    """Raw bytes, or None: a short write is a failed read, not a prefix."""
+    buffer = ctypes.create_string_buffer(size)
+    written = ctypes.c_size_t(0)
+    code = int(getter(handle, param, size, buffer, ctypes.byref(written)))
+    if code != 0 or int(written.value) != size:
+        return None
+    return buffer.raw[:size]
+
+
+def _device_identity(lib, device, extensions):
+    """Which hardware identity this device offers, and the raw values.
+
+    The driver's device order is not stable (the iGPU and the Arc swap indices
+    between runs), so a run must prove which card its numbers came from. The
+    preference is the UUID, then the PCI bus id, then the (name, memory,
+    driver) triple the report already carries. A missing extension, a short
+    UUID write or an empty bus id is recorded as None, never as a guess: on
+    this host's driver the UUID query succeeds yet writes only a stub, and the
+    bus id comes back empty, so neither KHR extension identifies the card.
+    """
+    lowered = [ext.lower() for ext in extensions]
+    uuid = pci_bus = None
+    uuid_stub = pci_empty = False
+    if "cl_khr_device_uuid" in lowered:
+        raw = _query_bytes(lib.clGetDeviceInfo, device, CL_DEVICE_UUID_KHR,
+                           CL_DEVICE_UUID_SIZE)
+        if raw is None:
+            uuid_stub = True
+        else:
+            uuid = raw.hex()
+    if "cl_khr_pci_bus_info" in lowered:
+        bus, _ = _query(lib.clGetDeviceInfo, device, CL_DEVICE_PCI_BUS_KHR)
+        if bus:
+            pci_bus = bus
+        else:
+            pci_empty = True
+    if uuid is not None:
+        source = "uuid"
+    elif pci_bus is not None:
+        source = "pci"
+    else:
+        source = "name-memory"
+    notes = []
+    if uuid_stub:
+        notes.append("cl_khr_device_uuid is advertised but the query does not "
+                     "return 16 bytes on this device")
+    if pci_empty:
+        notes.append("cl_khr_pci_bus_info is advertised but the bus id is empty "
+                     "on this device")
+    if source == "name-memory":
+        notes.append("identity is the (name, memory, driver) triple; neither KHR "
+                     "identity extension is usable here")
+    return uuid, pci_bus, source, notes
+
+
 def _caps_report(lib, device):
     name, _ = _query(lib.clGetDeviceInfo, device, CL_DEVICE_NAME)
     vendor, _ = _query(lib.clGetDeviceInfo, device, CL_DEVICE_VENDOR)
@@ -84,6 +143,7 @@ def _caps_report(lib, device):
     opencl_c, _ = _query(lib.clGetDeviceInfo, device, CL_DEVICE_OPENCL_C_VERSION)
     extensions = _extensions(lib, device)
     lowered = [ext.lower() for ext in extensions]
+    uuid, pci_bus, identity, identity_notes = _device_identity(lib, device, extensions)
     global_mem = _scalar(lib, device, CL_DEVICE_GLOBAL_MEM_SIZE, ctypes.c_uint64)
     max_alloc = _scalar(lib, device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, ctypes.c_uint64)
     local_mem = _scalar(lib, device, CL_DEVICE_LOCAL_MEM_SIZE, ctypes.c_uint64)
@@ -94,6 +154,8 @@ def _caps_report(lib, device):
     return {
         "name": name,
         "vendor": vendor,
+        "uuid": uuid,
+        "pci_bus": pci_bus,
         "driver_version": driver,
         "device_version": version,
         "opencl_c_version": opencl_c,
@@ -121,6 +183,8 @@ def _caps_report(lib, device):
                                      else max_alloc_mib >= CODES_27B_MIB),
             "chunking_required": (None if max_alloc_mib is None
                                   else max_alloc_mib < CODES_27B_MIB),
+            "device_identity": identity,
+            "identity_notes": identity_notes,
         },
     }
 
@@ -200,6 +264,9 @@ def render(report):
     device = report.get("device") or {}
     lines.append("device [%s]: %s" % (report.get("device_index"),
                                       device.get("name") or "unknown"))
+    lines.append("  uuid=%s pci_bus=%s identity=%s" % (
+        device.get("uuid") or "unknown", device.get("pci_bus") or "unknown",
+        (device.get("premises") or {}).get("device_identity")))
     lines.append("  driver=%s opencl_c=%s" % (device.get("driver_version") or "unknown",
                                               device.get("opencl_c_version") or "unknown"))
     lines.append("  compute_units=%s clock_mhz=%s global_mem_mib=%s max_alloc_mib=%s" % (

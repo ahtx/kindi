@@ -46,11 +46,16 @@ def _put_bytes(data, size, pointer, size_ret):
 class FakeOpenCL(object):
     """Enough of the OpenCL loader for capability queries: no kernel entry points."""
 
+    UUID = bytes(range(16))
+
     def __init__(self, device_count=1, vendor="Intel(R) Corporation",
                  name="Intel(R) Arc(TM) A770 Graphics",
                  opencl_c="OpenCL C 1.2 ",
-                 extensions="cl_khr_fp64 cl_khr_subgroups",
-                 max_alloc_mib=4095):
+                 extensions=("cl_khr_fp64 cl_khr_subgroups cl_khr_device_uuid"
+                             " cl_khr_pci_bus_info"),
+                 max_alloc_mib=4095, uuid_bytes=None, pci_bus=""):
+        self.uuid_bytes = uuid_bytes
+        self.pci_bus = pci_bus
         self.device_count = device_count
         self.vendor = vendor
         self.name = name
@@ -92,6 +97,12 @@ class FakeOpenCL(object):
                  0x1030: (self.extensions + "\x00").encode("utf-8")}
         if param in texts:
             return _put_bytes(texts[param], size, value, size_ret)
+        if param == 0x105A:
+            return _put_bytes(self.uuid_bytes if self.uuid_bytes is not None
+                              else self.UUID, size, value, size_ret)
+        if param == 0x410F:
+            return _put_bytes((self.pci_bus + "\x00").encode("utf-8"), size,
+                              value, size_ret)
         scalars = {0x1002: ctypes.c_uint32(512), 0x100C: ctypes.c_uint32(2100),
                    0x101F: ctypes.c_uint64(16 * 1024 ** 3),
                    0x1010: ctypes.c_uint64(self.max_alloc_mib * 1024 * 1024),
@@ -123,6 +134,31 @@ def test_caps_pass_reports_premises_and_chunking():
     assert premises["single_27b_codes_fit"] is False
     assert premises["chunking_required"] is True
     assert report["warnings"] == []
+    assert device["uuid"] == FakeOpenCL.UUID.hex()
+    assert device["pci_bus"] is None
+    assert device["premises"]["device_identity"] == "uuid"
+
+
+def test_caps_uuid_absent_without_the_extension():
+    report = _run(FakeOpenCL(extensions="cl_khr_fp64"))
+    assert report["result"] == "pass"
+    assert report["device"]["uuid"] is None
+    assert report["device"]["premises"]["device_identity"] == "name-memory"
+
+
+def test_caps_short_uuid_is_not_an_identity():
+    report = _run(FakeOpenCL(uuid_bytes=b"\x40\x00\x00\x00"))
+    assert report["result"] == "pass"
+    assert report["device"]["uuid"] is None
+    assert report["device"]["premises"]["device_identity"] == "name-memory"
+
+
+def test_caps_pci_bus_identifies_when_uuid_is_a_stub():
+    report = _run(FakeOpenCL(uuid_bytes=b"\x40\x00\x00\x00",
+                              pci_bus="0000:03:00.0"))
+    assert report["result"] == "pass"
+    assert report["device"]["pci_bus"] == "0000:03:00.0"
+    assert report["device"]["premises"]["device_identity"] == "pci"
 
 
 def test_caps_fit_when_alloc_cap_clears_codes():

@@ -27,7 +27,7 @@ Everything reads the pack `kindi convert` already writes (`bcodes.bin`, `dpm.bin
 |---|---|
 | `intel-run`, Bonsai 2 2B, `"The capital of France is"` | 4 tokens `[11751, 13, 198, 760]` = `" Paris.\nThe"`, **147.14 ms/step**, 516 enqueues/step |
 | `intel-run`, Bonsai 2.5 27B, same prompt | 3 tokens `[11751, 13, 248046]` = `" Paris.<|im_end|>"`, **831.29 ms/step**, 1366 enqueues/step |
-| `pytest tests/test_intel_*.py` | 41 passed, no GPU needed |
+| `pytest tests/test_intel_*.py` | 55 passed, no GPU needed |
 
 Both token sequences are the ones the CPU engine produces from the same packs, so the device path
 is correct where it runs. It is **not fast**: the step pays one blocking read per GEMV group and
@@ -38,11 +38,18 @@ leaves the delta rule, conv, attention, softmax and the FFN elementwise on the h
 
 - `intel-caps` records the premises the follow-up hypotheses rest on: the OpenCL C profile
 exposes no DPAS/XMX path (that work needs SYCL/ESIMD), and a 27B code buffer does not fit the
-driver's per-allocation cap, so the step chunks codes on tensor boundaries.
+driver's per-allocation cap, so the step chunks codes on tensor boundaries. The live run
+corrects one premise in the other direction: `cl_khr_fp16` and the Intel subgroup extensions
+are advertised - but advertisement is not arithmetic, so no fp16/subgroup work starts until a
+kernel proves it against a host reference. The probe also records the hardware identity
+strictly: neither KHR identity extension delivers on this driver (stub UUID, empty PCI bus id),
+so the report carries both as null and identifies the card by its (name, memory, driver) triple.
+Evidence: the live A770 run ([caps page](benchmarks/2026-11-26-i7-8086k-arc-a770-caps/)).
 - `intel-tier` gates whether A770 VRAM could serve as the MoE cold-expert store instead of
 NVMe: byte-exact sustained device-to-host copies against a same-host disk baseline. The gate
-clears only on a clear multiple with the chunk fitting the cap; the first live run does not
-clear it against a warm page-cache baseline, so no tier is wired.
+clears only on a clear multiple with the chunk fitting the cap; the first live run missed
+against a warm page-cache baseline, and a re-check against the unbuffered `kindi io` disk rate
+on the same host still misses, so no tier is wired and the item is closed as measured.
 
 ## Notes
 
