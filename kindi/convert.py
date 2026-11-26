@@ -47,8 +47,12 @@ def trits_from_raw(raw):
 
 
 def phase_bytes(tr):
-    """(nb, 128) trits -> (nb, 32) bytes, byte s = t0 + 3 t1 + 9 t2 + 27 t3 of elements 4s .. 4s+3."""
-    g = tr.reshape(-1, 32, 4).astype(np.int32)
+    """(nb, N) trits -> (nb, N/4) bytes, byte s = t0 + 3 t1 + 9 t2 + 27 t3 of elements 4s .. 4s+3.
+
+    Per row, so a batch wider than one 128-column phase is packed phase by phase; for the N=128
+    case the bytes are the same ones the earlier (nb*32) reshape produced."""
+    tr = np.asarray(tr)
+    g = tr.reshape(tr.shape[0], -1, 4).astype(np.int32)
     return (g[:, :, 0] + 3 * g[:, :, 1] + 9 * g[:, :, 2] + 27 * g[:, :, 3]).astype(np.uint8)
 
 

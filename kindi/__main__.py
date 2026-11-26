@@ -205,6 +205,131 @@ def _malloc_tuning():
         pass                                               # not glibc: nothing to tune
 
 
+def cmd_intel_cl(cfg, a):
+    """Runtime-compiled OpenCL vector-add and GEMM on an Intel GPU; no model."""
+    from . import intel_cl
+
+    report = intel_cl.run_smoke(a.n, dim=a.dim, repeats=a.repeats, loader=a.loader,
+                                device=a.device, device_name=a.device_name)
+    if a.json:
+        print(intel_cl.dumps(report))
+    else:
+        for line in intel_cl.render(report):
+            print(line)
+    return 0 if report["result"] == "pass" else 1
+
+
+def cmd_intel_ternary(cfg, a):
+    """Packed ternary GEMV probe on an Intel GPU; no backend, model or support claim."""
+    from . import intel_ternary
+
+    report = intel_ternary.run_probe(a.rows, cols=a.cols, repeats=a.repeats, loader=a.loader,
+                                     device=a.device, parts=a.parts, device_name=a.device_name,
+                                     kernel=a.kernel)
+    if a.json:
+        print(intel_ternary.dumps(report))
+    else:
+        for line in intel_ternary.render(report):
+            print(line)
+    return 0 if report["result"] == "pass" else 1
+
+
+def cmd_intel_step(cfg, a):
+    """cmd_kindi `intel-step`: one full decode step of the pack on an Intel GPU, tested against the CPU engine."""
+    from . import intel_step
+
+    report = intel_step.run_step(a.pack, None, a.steps, loader=a.loader, device=a.device,
+                                 device_name=a.device_name)
+    if a.json:
+        print(intel_step.dumps(report))
+    else:
+        print(intel_step.render(report))
+    return 0 if report.get("ok") else 1
+
+
+def cmd_intel_run(cfg, a):
+    """cmd_kindi `intel-run`: greedy decode of a prompt on an Intel GPU (no CPU engine)."""
+    from . import intel_step
+
+    tok = intel_step.load_tokenizer(a.pack)
+    text = a.prompt
+    if a.chat:
+        from . import chat
+        with open(os.path.join(a.pack, "kindi_pack.json"), encoding="utf-8") as f:
+            manifest = json.load(f)
+        variant = chat.template_variant(manifest)
+        body, generation = chat.render([{"role": "user", "content": a.prompt}], variant=variant,
+                                       enable_thinking=False)
+        text = body + generation
+    ids = tok.encode(text)
+    if not ids:
+        raise SystemExit("intel-run: the prompt encodes to no tokens")
+    report = intel_step.run_generate(a.pack, ids, a.tokens, loader=a.loader, device=a.device,
+                                     device_name=a.device_name, ctx=a.ctx, tok=tok)
+    report["prompt"] = a.prompt
+    report["chat"] = bool(a.chat)
+    if a.json:
+        print(intel_step.dumps(report))
+    else:
+        print(intel_step.render_generate(report))
+    return 0 if report.get("ok") else 1
+
+
+def cmd_intel_pack(cfg, a):
+    """Time a converted pack's ternary shapes on an Intel GPU; no model run or support claim."""
+    from . import intel_pack
+
+    report = intel_pack.run_pack(a.pack, repeats=a.repeats, loader=a.loader, device=a.device,
+                                 device_name=a.device_name, parts=a.parts, persist=not a.no_persist)
+    if a.json:
+        print(intel_pack.dumps(report))
+    else:
+        for line in intel_pack.render(report):
+            print(line)
+    return 0 if report["result"] == "pass" else 1
+
+
+def cmd_intel_norm(cfg, a):
+    """Time the decode step's norm+fold and the embedding row on an Intel GPU; no model run."""
+    from . import intel_layer
+
+    report = intel_layer.run_norm(a.pack, repeats=a.repeats, loader=a.loader, device=a.device,
+                                  device_name=a.device_name, trials=a.trials)
+    if a.json:
+        print(intel_layer.dumps(report))
+    else:
+        for line in intel_layer.render(report):
+            print(line)
+    return 0 if not report["errors"] else 1
+
+
+def cmd_intel_caps(cfg, a):
+    """Device-capability probe for the Arc decode hypotheses; no kernel or model."""
+    from . import intel_caps
+
+    report = intel_caps.run_probe(loader=a.loader, device=a.device,
+                                  device_name=a.device_name)
+    if a.json:
+        print(intel_caps.dumps(report))
+    else:
+        print(intel_caps.render(report))
+    return 0 if report["result"] == "pass" else 1
+
+
+def cmd_intel_tier(cfg, a):
+    """Cold-tier gate probe: device-to-host copy rate vs a disk baseline."""
+    from . import intel_tier
+
+    report = intel_tier.run_probe(a.mib, repeats=a.repeats, loader=a.loader,
+                                  device=a.device, device_name=a.device_name,
+                                  disk_dir=a.disk_dir)
+    if a.json:
+        print(intel_tier.dumps(report))
+    else:
+        print(intel_tier.render(report))
+    return 0 if report["result"] == "pass" else 1
+
+
 def main(argv=None):
     args = sys.argv[1:] if argv is None else list(argv)
     if args and args[0] in ("plan", "route"):       # their own options (kindi plan --help), no config needed
@@ -257,6 +382,79 @@ def main(argv=None):
     s.add_argument("rest", nargs=argparse.REMAINDER)
     s = sub.add_parser("route", help="one OpenAI endpoint in front of the plan's servers (kindi route --help)", add_help=False)
     s.add_argument("rest", nargs=argparse.REMAINDER)
+    s = sub.add_parser("intel-cl", help="compile and run OpenCL vector-add/GEMM on an Intel GPU (no model, no backend)")
+    s.add_argument("--n", type=int, default=1048576, help="vector-add elements (default 1048576, max 16777216)")
+    s.add_argument("--dim", type=int, default=128, help="square GEMM dimension (default 128, 8-512)")
+    s.add_argument("--repeats", type=int, default=5, help="timed GEMM launches (default 5, max 50)")
+    s.add_argument("--device", type=int, default=0, help="Intel OpenCL GPU index (default 0)")
+    s.add_argument("--device-name", default=None, metavar="SUBSTR",
+                   help="pick the GPU whose name contains SUBSTR (e.g. Arc) instead of --device")
+    s.add_argument("--loader", default=None, help="OpenCL loader name/path (default: the host loader)")
+    s.add_argument("--json", action="store_true", help="print the whole report as JSON")
+    s = sub.add_parser("intel-ternary", help="packed ternary GEMV probe on an Intel GPU (no backend)")
+    s.add_argument("--rows", type=int, default=2048, help="GEMV rows (default 2048)")
+    s.add_argument("--cols", type=int, default=2048, help="GEMV columns (default 2048, multiple of 128)")
+    s.add_argument("--repeats", type=int, default=20, help="timed launches (default 20, max 200)")
+    s.add_argument("--seed", type=int, default=1234)
+    s.add_argument("--device", type=int, default=0, help="Intel OpenCL GPU index (default 0)")
+    s.add_argument("--device-name", default=None, metavar="SUBSTR",
+                   help="pick the GPU whose name contains SUBSTR (e.g. Arc) instead of --device")
+    s.add_argument("--loader", default=None, help="OpenCL loader name/path (default: the host loader)")
+    s.add_argument("--json", action="store_true", help="print the whole report as JSON")
+    s = sub.add_parser("intel-norm", help="time the norm+fold and the embedding row of a decode on an Intel GPU")
+    s.add_argument("--pack", required=True, help="a pack directory written by kindi convert")
+    s.add_argument("--repeats", type=int, default=20, help="timed launches (default 20, max 200)")
+    s.add_argument("--device", type=int, default=0, help="Intel OpenCL GPU index (default 0)")
+    s.add_argument("--device-name", default=None, metavar="SUBSTR",
+                   help="pick the GPU whose name contains SUBSTR (e.g. Arc) instead of --device")
+    s.add_argument("--loader", default=None, help="OpenCL loader name/path (default: the host loader)")
+    s.add_argument("--json", action="store_true", help="print the whole report as JSON")
+    s = sub.add_parser("intel-pack", help="time a converted pack's ternary shapes on an Intel GPU")
+    s.add_argument("--pack", required=True, help="a pack directory written by kindi convert")
+    s.add_argument("--repeats", type=int, default=10, help="timed launches per shape (default 10, max 200)")
+    s.add_argument("--parts", default=None, help="comma-separated row-part counts to try (default: 1,2,4,8)")
+    s.add_argument("--device", type=int, default=0, help="Intel OpenCL GPU index (default 0)")
+    s.add_argument("--device-name", default=None, metavar="SUBSTR",
+                   help="pick the GPU whose name contains SUBSTR (e.g. Arc) instead of --device")
+    s.add_argument("--loader", default=None, help="OpenCL loader name/path (default: the host loader)")
+    s.add_argument("--no-persist", action="store_true",
+                   help="skip the persistent eight-row kernel (one launch per chunk over every tensor)")
+    s.add_argument("--json", action="store_true", help="print the whole report as JSON")
+    s = sub.add_parser("intel-caps", help="device caps behind the Arc decode hypotheses (no kernel, model or backend)")
+    s.add_argument("--device", type=int, default=0, help="Intel OpenCL GPU index (default 0)")
+    s.add_argument("--device-name", default=None, metavar="SUBSTR",
+                   help="pick the GPU whose name contains SUBSTR (e.g. Arc) instead of --device")
+    s.add_argument("--loader", default=None, help="OpenCL loader name/path (default: the host loader)")
+    s.add_argument("--json", action="store_true", help="print the whole report as JSON")
+    s = sub.add_parser("intel-tier", help="cold-tier gate: device-to-host copy rate vs a disk baseline (no model or backend)")
+    s.add_argument("--mib", type=int, default=64, help="copy chunk in MiB (default 64, 1-1024)")
+    s.add_argument("--repeats", type=int, default=5, help="timed copies per side (default 5, max 20)")
+    s.add_argument("--device", type=int, default=0, help="Intel OpenCL GPU index (default 0)")
+    s.add_argument("--device-name", default=None, metavar="SUBSTR",
+                   help="pick the GPU whose name contains SUBSTR (e.g. Arc) instead of --device")
+    s.add_argument("--loader", default=None, help="OpenCL loader name/path (default: the host loader)")
+    s.add_argument("--disk-dir", default=None, help="where to write the disk-baseline temp file "
+                   "(default: the system temp dir; the path is never recorded)")
+    s.add_argument("--json", action="store_true", help="print the whole report as JSON")
+    s = sub.add_parser("intel-step", help="one full decode step on an Intel GPU (norm/fold + pack GEMV on the device, host math for the rest); compared against the CPU engine")
+    s.add_argument("--pack", required=True, help="a pack directory written by kindi convert")
+    s.add_argument("--steps", type=int, default=4, help="decode steps per prompt (default 4)")
+    s.add_argument("--device", type=int, default=0, help="Intel OpenCL GPU index (default 0)")
+    s.add_argument("--device-name", default=None, metavar="SUBSTR",
+                   help="pick the GPU whose name contains SUBSTR (e.g. Arc) instead of --device")
+    s.add_argument("--loader", default=None, help="OpenCL loader name/path (default: the host loader)")
+    s.add_argument("--json", action="store_true", help="print the whole report as JSON")
+    s = sub.add_parser("intel-run", help="greedy-decode a prompt on an Intel GPU: the device step in a loop, no CPU engine")
+    s.add_argument("--pack", required=True, help="a pack directory written by kindi convert")
+    s.add_argument("--prompt", required=True, help="prompt text (with --chat it is wrapped in the pack's chat template)")
+    s.add_argument("--tokens", type=int, default=16, help="tokens to generate (default 16)")
+    s.add_argument("--chat", action="store_true", help="render the prompt as a user message with the pack's chat template")
+    s.add_argument("--ctx", type=int, default=2048, help="context length (default 2048)")
+    s.add_argument("--device", type=int, default=0, help="Intel OpenCL GPU index (default 0)")
+    s.add_argument("--device-name", default=None, metavar="SUBSTR",
+                   help="pick the GPU whose name contains SUBSTR (e.g. Arc) instead of --device")
+    s.add_argument("--loader", default=None, help="OpenCL loader name/path (default: the host loader)")
+    s.add_argument("--json", action="store_true", help="print the whole report as JSON")
     s = sub.add_parser("use", help="download a model, build its pack and select it")
     s.add_argument("model")
     s.add_argument("--gguf", help="use this GGUF file instead of downloading it")
@@ -273,7 +471,11 @@ def main(argv=None):
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
-            "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route}[a.cmd](cfg, a)
+            "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route,
+            "intel-cl": cmd_intel_cl, "intel-ternary": cmd_intel_ternary, "intel-norm": cmd_intel_norm,
+            "intel-pack": cmd_intel_pack, "intel-caps": cmd_intel_caps,
+            "intel-tier": cmd_intel_tier, "intel-step": cmd_intel_step,
+            "intel-run": cmd_intel_run}[a.cmd](cfg, a)
 
 
 if __name__ == "__main__":
