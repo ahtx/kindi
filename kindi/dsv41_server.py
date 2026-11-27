@@ -368,6 +368,7 @@ class Engine(object):
         self.a = a
         self.enc = load_encoding(a.encoding)
         self.model = dsv41.Model(a.model, ctx=a.ctx, tmax=a.tmax)
+        self.model.adaptive_prefill = a.adaptive_prefill
         if a.dspark:
             self.model.dspark_load(a.dspark)
         self.lock = Gate()                              # one request at a time, chat before background
@@ -793,7 +794,10 @@ class Engine(object):
             spark = False                               # no DSpark rejection sampling in this engine: plain sampling
         if spark:
             kw = dict(samp, rng=rng) if temp > 0 else {}
-            M.generate_dspark(None, maxn, lg=lg, on_tokens=on_tokens, auto=True, cal=self.cal, stats=stats, **kw)
+            width = getattr(self.a, "dspark_verify_width", None)
+            if width is not None:
+                kw.update(kmax=width - 1, conf_min=float("-inf"))
+            M.generate_dspark(None, maxn, lg=lg, on_tokens=on_tokens, auto=width is None, cal=self.cal, stats=stats, **kw)
         elif temp > 0:
             self._sampled(lg, maxn, on_tokens, rng, **samp)
         else:
@@ -1233,8 +1237,14 @@ def main(argv=None):
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8101)
     ap.add_argument("--ctx", type=int, default=32768)
-    ap.add_argument("--tmax", type=int, default=512)
+    ap.add_argument("--adaptive-prefill", action=argparse.BooleanOptionalAction, default=None,
+                    help="with --tmax >= 1024, pipeline 1024-token chunks for 8192+ uncached tokens; otherwise use 512")
+    ap.add_argument("--tmax", type=int, default=None, help="prompt chunk limit (default 512)")
+    ap.add_argument("--turbo", action="store_true",
+                    help="faster settings with slightly different output (python -m kindi turbo lists them)")
     ap.add_argument("--dspark", default=None, help="DSpark drafter directory (converted by kindi.dsv41_dspark)")
+    ap.add_argument("--dspark-verify-width", type=int, choices=range(1, 7),
+                    help="fix DSpark verification positions per step (target token plus up to five proposals); default: automatic")
     ap.add_argument("--cal", default="1,0", help="DSpark draft length calibration a,b")
     ap.add_argument("--encoding", default=None,
                     help="DeepSeek-V4.1 encoding.py (encoding/encoding.py of the model release; default: "
@@ -1262,6 +1272,11 @@ def main(argv=None):
     ap.add_argument("--api-key", default=os.environ.get("KINDI_API_KEY"))
     a = ap.parse_args(argv)
     a.encoding = find_encoding(a)
+    from kindi import turbo
+    if a.turbo:
+        os.environ["KINDI_TURBO"] = "1"
+    turbo.apply("deepseek", log=_log)
+    turbo.dsv_prefill(a, log=_log)
     E = Engine(a)
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(E))
 

@@ -34,9 +34,6 @@ rt = cp.cuda.runtime
 i32, f32t = np.int32, np.float32
 
 
-POW5 = np.array([1, 3, 9, 27, 81], dtype=np.uint16)
-
-
 def g5_blob(B, S):
     """B: (C/4, R) uint8, byte s = trits of columns 4s .. 4s+3 (t0 + 3 t1 + 9 t2 + 27 t3); S: (C/128, R) uint16 fp16
     scales -> uint32 words [g][r][7]: per 128-column group and row, 24 bytes of 5 trits (columns 5j .. 5j+4), 2 bytes
@@ -47,10 +44,12 @@ def g5_blob(B, S):
     out = np.empty((NG, R, 28), dtype=np.uint8)
     for r0 in range(0, R, 16384):
         r1 = min(R, r0 + 16384)
-        b = B[:, r0:r1].astype(np.uint16)
+        b = B[:, r0:r1]
         tr = np.stack([b % 3, (b // 3) % 3, (b // 9) % 3, b // 27], axis=1).reshape(NG, 128, r1 - r0)
-        b5 = (tr[:, :120].reshape(NG, 24, 5, r1 - r0) * POW5[None, None, :, None]).sum(axis=2, dtype=np.uint16)
-        b4 = (tr[:, 120:].reshape(NG, 2, 4, r1 - r0) * POW5[None, None, :4, None]).sum(axis=2, dtype=np.uint16)
+        q = tr[:, :120].reshape(NG, 24, 5, r1 - r0)
+        # Five base-3 digits fit in one byte. The final eight trits already occupy two four-trit bytes.
+        b5 = q[:, :, 0] + 3 * q[:, :, 1] + 9 * q[:, :, 2] + 27 * q[:, :, 3] + 81 * q[:, :, 4]
+        b4 = b.reshape(NG, 32, r1 - r0)[:, 30:32]
         out[:, r0:r1, :24] = b5.transpose(0, 2, 1)
         out[:, r0:r1, 24:26] = b4.transpose(0, 2, 1)
         out[:, r0:r1, 26:28] = np.ascontiguousarray(S[:, r0:r1]).view(np.uint8).reshape(NG, r1 - r0, 2)

@@ -9,18 +9,24 @@ The kernels are tc.cu and tca.cu themselves, built with KINDI_TURING defined: ev
 m8n8k16 (exact integer sums, so the products are bit-identical to the Ampere build), the fp16 attention product
 m16n8k16 becomes two m16n8k8, and cp.async (sm_80) becomes plain loads before the same barriers. So the Turing path
 has every feature of the Ampere one (the 4B's half units, KINDI_TC_HP, the b2 layout) with no second copy of the
-kernels. The PTX is compute_75 as NVRTC writes it (no .target patch); the driver builds it for the card.
+kernels. The PTX is compute_75 with tc.py's ISA 7.1 header and .target sm_75; the driver builds it for the card.
+
+Measured 11-24 on an RTX 2070 SUPER (130 W cap), ctx 8448, write tokens/s at positions 100 / 2000 / 8000 (kindi bench;
+llama.cpp PrismML c96baf4 llama-bench tg32 at the same depths, -fa 1):
+  2B: default path 179.1 at 2000; this path 333.7; llama.cpp 345.9 / 336.9 / 314.9. verify: 1 of 4 prompts differs
+      (35/40, the 8-bit near-tie of B4); with KINDI_TC_HP=1 0/40 (an HP bug on this build, open).
+  4B: KeyError 'output.weight' in tp.build_plans on a fresh 4B pack (open; the same build passed on an RTX 3080 with
+      an older 4B pack).
+  9B: default 76.3 / 75.0 / 72.0; this path 117.6 / 115.1 / 109.7, verify 4/4; llama.cpp 130.8 / 127.9 / 120.3.
+So it stays off: faster than the default Turing path, not faster than llama.cpp, and not exact on the 2B and 4B.
 
 Only TU102 / TU104 / TU106 have tensor cores (RTX 20, Titan RTX, Quadro RTX, Tesla T4, CMP 40HX). TU116 / TU117 (GTX 16,
 Quadro T400..T2000, MX) are sm_75 too but have none; the device name tells them apart.
 """
 import os
-import re
 
 import cupy as cp
-from cupy.cuda import compiler, function
 
-PTX_MIN = (6, 5)          # mma.m8n8k16 needs PTX ISA 6.5; CUDA 10.2's NVRTC writes it
 _TENSOR = ("RTX 20", "TITAN RTX", "QUADRO RTX", "TESLA T4", " T4 ", "CMP 40HX")
 
 
@@ -53,15 +59,7 @@ def source(src):
 
 
 def load_module(src):
-    """compile for compute_75 and load the PTX as written; only an NVRTC older than PTX ISA 6.5 has its .version
-    raised"""
-    prog = compiler._NVRTCProgram(src, "tc_turing.cu")
-    ptx, _ = prog.compile(("-arch=compute_75",))
-    if isinstance(ptx, bytes):
-        ptx = ptx.decode()
-    m = re.search(r"\.version (\d+)\.(\d+)", ptx)
-    if m and (int(m.group(1)), int(m.group(2))) < PTX_MIN:
-        ptx = re.sub(r"\.version \d+\.\d+", ".version %d.%d" % PTX_MIN, ptx, count=1)
-    mod = function.Module()
-    mod.load(ptx.encode())
-    return mod
+    """compile for compute_75 with tc.py's loader: the PTX header says ISA 7.1 (m8n8k16 needs 6.5; a newer NVRTC
+    writes a version the card's driver may not know) and .target sm_75; the driver builds it for the card"""
+    from . import tc
+    return tc._patched_module(src, "sm_75")

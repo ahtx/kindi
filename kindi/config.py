@@ -41,6 +41,7 @@ DEFAULTS = {
     "lookup": "5",                      # Nanbeige: prompt-lookup drafting, up to this many tokens per check (0: off)
     "mtp_head": "",                     # Nanbeige: an MTP head file, a second draft source (empty: none)
     "kv_cache": "auto",                 # Nanbeige: the K/V cache, auto, f16 or q8_0 (auto: f16 when it fits, else q8_0)
+    "turbo": "0",                       # 1: the faster settings with slightly different output (kindi turbo lists them)
     "reasoning_effort": "",             # 27B template: xhigh | medium | low (empty: the template default, xhigh)
     # generation defaults (a request's own values win)
     "max_tokens": "1024",
@@ -78,6 +79,36 @@ def _candidates(explicit):
         out.append(os.environ["KINDI_CONFIG"])
     out += ["kindi.conf", os.path.expanduser("~/.kindi/kindi.conf")]
     return out
+
+
+BONSAI25_HEAD = "bonsai25-mtp.npz"
+
+
+def _sm_major():
+    """the compute capability major of the first visible CUDA card (0 when there is none), without a context"""
+    try:
+        import ctypes
+        from kindi.gpudrv import libcuda
+        cu, dev, major = libcuda(), ctypes.c_int(0), ctypes.c_int(0)
+        if cu.cuInit(0) or cu.cuDeviceGet(ctypes.byref(dev), 0) or cu.cuDeviceGetAttribute(ctypes.byref(major), 75, dev):
+            return 0
+        return major.value
+    except (OSError, AttributeError):
+        return 0
+
+
+def _bonsai25_mtp(cfg):
+    """Bonsai 2.5 27B with its MTP head in the pack (python -m kindi.bonsai25_mtp) on an sm_80+ card: two-draft MTP on
+    the tensor-core plan engine by default (0.8, RTX 3090: write 85-87 -> 135-167 tok/s, the same greedy tokens).
+    Any KINDI_SPEC setting (KINDI_SPEC=0: off) wins."""
+    head = os.path.join(cfg.get("pack") or "", BONSAI25_HEAD)
+    if cfg.get("model_name") != "bonsai25-27b" or "KINDI_SPEC" in os.environ or not os.path.isfile(head):
+        return
+    if os.environ.get("KINDI_DEVICE", "gpu") == "cpu" or _sm_major() < 8:
+        return
+    for k, v in (("KINDI_TC", "1"), ("KINDI_FD", "1"), ("KINDI_SPEC", "mtp"), ("KINDI_SPEC_K", "2"),
+                 ("KINDI_MTP_HEAD", head)):
+        os.environ.setdefault(k, v)
 
 
 def load(explicit=None, overrides=None):
@@ -119,7 +150,11 @@ def load(explicit=None, overrides=None):
     if cfg["model_name"] == "auto":
         manifest = os.path.join(cfg["pack"], "kindi_pack.json")
         m = json.load(open(manifest)) if os.path.isfile(manifest) else {}
-        if m.get("backend") in ("kindi_gemma4", "kindi_lightning", "kindi_qwen4exp", "kindi_inkling2"):
+        if m.get("model_id"):
+            cfg["model_name"] = m["model_id"]
+        elif m.get("model") == "Ternary-Bonsai-2.5-27B":
+            cfg["model_name"] = "bonsai25-27b"
+        elif m.get("backend") in ("kindi_gemma4", "kindi_lightning", "kindi_qwen4exp", "kindi_inkling2"):
             cfg["model_name"] = m.get("model_id", "gemma4")
         else:
             # the GGUF's general.name, then its file name: some files name the model only "Hf"
@@ -129,6 +164,7 @@ def load(explicit=None, overrides=None):
                 if size:
                     break
             cfg["model_name"] = "bonsai2-%sb" % (size.group(1) if size else "2")
+    _bonsai25_mtp(cfg)
     if cfg["head"] not in ("exact", "fast"):
         raise SystemExit("kindi: head must be exact or fast, not %r" % cfg["head"])
     cfg["source"] = source or "(built-in defaults)"

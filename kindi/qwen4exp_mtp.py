@@ -145,21 +145,22 @@ class GraphDrafter(Drafter):
     probe_len = int(os.environ.get("KINDI_MTP_PROBE_LEN", "4"))
     hyst = float(os.environ.get("KINDI_MTP_HYST", "0.10"))
 
-    def _passes(self, ids, n, log=None, chunk=None, stats=None, sampler=None):
-        """the drafted decode as a generator: yields the first token as [tok], then each pass's new tokens.
-        sampler: None for greedy (the main model's argmax); else an object with first(logits, ids) -> the first token
-        and accept(window logits, drafts, ids, out) -> the pass's new tokens by speculative sampling
-        (kindi.sampling.spec_accept: the kept drafts, then one drawn token), so the output is distributed as plain
-        sampling. The drafts are the head's argmax either way."""
-        g, k = self.g, self.k
-        chunk = chunk or getattr(g, "prompt_chunk", 256)
-        ids = list(ids)
-        st = g.new_state()
-        hst = g.new_state()
-        hst["pos"] = self.offset
-        t0 = time.time()
-        carry = None                                      # the streams of the last position read so far
-        cur = {"carry": None, "off": 0}
+    def _prompt(self, ids, chunk, cache, retry=False):
+        """Extend both prompt states at a complete chunk boundary."""
+        g = self.g
+        saved = cache.pop("prompt", None) if cache is not None else None
+        carry, start = None, 0
+        if saved is not None:
+            prefix, st, hst, carry = saved
+            if len(prefix) < len(ids) and ids[:len(prefix)] == prefix:
+                start = len(prefix)
+        else:
+            st = hst = None
+        if not start:
+            saved, carry = None, None
+            st, hst = g.new_state(), g.new_state()
+            hst["pos"] = self.offset
+        cur = {"carry": carry, "off": start}
 
         def head_rows(c, hs):
             """the head's cache rows of chunk c (tokens) from its streams hs after the last layer"""
@@ -172,22 +173,62 @@ class GraphDrafter(Drafter):
         # a long prompt goes through the layer-major path when the model has it and the chunks are the model's own:
         # its logits and streams have the chunked path's bits, chunk by chunk, and the head's rows are made from each
         # chunk's streams as the chunked loop below would (rc5b: the drafted reads were chunked, layer-major unused)
-        pc = getattr(g, "prompt_chunk", 0)
-        if (getattr(g, "layer_major", False) is True and len(ids) > chunk and chunk == pc and len(g.devices) == 1
-                and os.environ.get("KINDI_MTP_LM_PROMPT", "1") == "1"):
-            def tap(l, h):
-                if l == g.L:
-                    n_ = h.shape[0]
-                    head_rows(ids[cur["off"]:cur["off"] + n_], h)
-                    cur["off"] += n_
-            lg = g.logits(ids, state=st, tap=tap, last_n=1)
-        else:
-            for i in range(0, len(ids), chunk):
-                c = ids[i:i + chunk]
-                lg, hs = self._main(c, st, last_n=1)      # the prompt: only its last row's logits
+        def read(end):
+            pos = cur["off"]
+            pc = getattr(g, "prompt_chunk", 0)
+            if (getattr(g, "layer_major", False) is True and end - pos > chunk and chunk == pc and len(g.devices) == 1
+                    and os.environ.get("KINDI_MTP_LM_PROMPT", "1") == "1"):
+                def tap(l, h):
+                    if l == g.L:
+                        n_ = h.shape[0]
+                        head_rows(ids[cur["off"]:cur["off"] + n_], h)
+                        cur["off"] += n_
+                if retry:
+                    return g.logits(ids[pos:end], state=st, tap=tap, last_n=1, draft_prefill_retry=True)
+                return g.logits(ids[pos:end], state=st, tap=tap, last_n=1)
+            for i in range(pos, end, chunk):
+                c = ids[i:min(i + chunk, end)]
+                lg, hs = self._main(c, st, last_n=1)
                 head_rows(c, hs)
-                del hs
-        carry = cur["carry"]
+                cur["off"] += len(c)
+            return lg
+
+        boundary = len(ids) // chunk * chunk if cache is not None else 0
+        checkpoint = None
+        if 0 < boundary < len(ids):
+            if boundary > start:
+                read(boundary)
+            # Recompute the short final chunk on the next turn. Its shape can
+            # change when the reply and next user message extend this prompt.
+            checkpoint = (ids[:boundary], _clone(st), _clone(hst), cur["carry"])
+        lg = read(len(ids))
+        if boundary == len(ids):
+            checkpoint = (ids, st, hst, cur["carry"])
+        return lg, st, hst, cur["carry"], start, checkpoint
+
+    def _passes(self, ids, n, log=None, chunk=None, stats=None, sampler=None, prompt_cache=None):
+        """the drafted decode as a generator: yields the first token as [tok], then each pass's new tokens.
+        sampler: None for greedy (the main model's argmax); else an object with first(logits, ids) -> the first token
+        and accept(window logits, drafts, ids, out) -> the pass's new tokens by speculative sampling
+        (kindi.sampling.spec_accept: the kept drafts, then one drawn token), so the output is distributed as plain
+        sampling. The drafts are the head's argmax either way."""
+        g, k = self.g, self.k
+        chunk = chunk or getattr(g, "prompt_chunk", 256)
+        ids = list(ids)
+        t0 = time.time()
+        retried = False
+        try:
+            prompt = self._prompt(ids, chunk, prompt_cache)
+        except torch.OutOfMemoryError:
+            from kindi.qwen4exp_gpu import env
+            if env("KINDI_MTP_STAGE_PROMPT") != "1":
+                raise
+            retried = True
+        if retried:
+            # The failed read may have extended both states. Rebuild them from the prompt using smaller batches.
+            torch.cuda.empty_cache()
+            prompt = self._prompt(ids, chunk, prompt_cache, retry=True)
+        lg, st, hst, carry, reused, checkpoint = prompt
         nxt = int(lg[-1].argmax()) if sampler is None else int(sampler.first(lg[-1], ids))
         torch.cuda.synchronize()
         dec = g.decoder()
@@ -200,12 +241,15 @@ class GraphDrafter(Drafter):
         for T in range(k + 1, lo, -1):                # every window size captured now, not in the middle of a reply
             if T not in (getattr(dec, "_wins", None) or {}):
                 dec._capture_window(T)
-        del st, hst
+        if checkpoint is not None:
+            # The graph decoder copied both states into its own buffers. Decode cannot modify this prefix.
+            prompt_cache["prompt"] = checkpoint
+        del st, hst, prompt
         h_last, out = carry, [nxt]
-        yield [nxt]
         stats = {} if stats is None else stats
         stats.update({"passes": 0, "drafted": 0, "accepted": 0, "prompt_s": time.time() - t0, "head_s": 0.0,
-                 "window_s": 0.0, "judge_s": 0.0})
+                 "window_s": 0.0, "judge_s": 0.0, "reused": reused, "prefill_retried": retried})
+        yield [nxt]
         dec.t_prep = dec.t_run = 0.0
         dec.t_cache = 0.0                             # the per-pass split (drafter log): head, window, cache, judge
         chain = g.draft_map is not None and os.environ.get("KINDI_MTP_CHAIN", "1") != "0"
@@ -330,13 +374,13 @@ class GraphDrafter(Drafter):
             out += new
         return out[:n], stats
 
-    def stream(self, ids, n, cancel=None, stop=(), chunk=None, stats=None, sampler=None):
+    def stream(self, ids, n, cancel=None, stop=(), chunk=None, stats=None, sampler=None, prompt_cache=None):
         """token by token (greedy, the same tokens as generate; or sampled, see _passes): yields each accepted token;
         ends after n tokens, after a token in stop (yielded), or when cancel() is true (checked between passes; a
         pass in flight finishes first). stats: a dict filled as generate's."""
         k = 0
         stop = set(stop)
-        gen = self._passes(ids, n, chunk=chunk, stats=stats, sampler=sampler)
+        gen = self._passes(ids, n, chunk=chunk, stats=stats, sampler=sampler, prompt_cache=prompt_cache)
         try:
             for new in gen:
                 for t in new:

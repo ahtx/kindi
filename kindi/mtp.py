@@ -169,6 +169,8 @@ class MTPDraft(object):
         self.s = s
         z = np.load(path)
         m = self.meta = json.loads(bytes(z["meta"]).decode())
+        if m.get("base_sha256") and m["base_sha256"] != eng.man.get("source_sha256"):
+            raise ValueError("the MTP head was made for a different base checkpoint")
         D, NH, NHKV, HD, NFF, W = m["D"], m["NH"], m["NHKV"], m["HD"], m["NFF"], m["W"]
         assert D == s.D and HD == 256 and W <= 64, (D, s.D, HD, W)
         self.D, self.NH, self.NHKV, self.HD, self.NFF, self.W = D, NH, NHKV, HD, NFF, W

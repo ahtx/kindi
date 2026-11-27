@@ -31,8 +31,8 @@ MODELS = {
     # Qwen3.8-Flash-Next (docs/FLASHNEXT.md): the dense layers (3.6 GB), the head (0.5 GB), the MTP head and its
     # experts (0.7 GB compact) and a 1.2 GB reserve on the card, the hot experts in the rest; the other experts run on
     # the CPU from the 83 GB file in host RAM. Layers split over 1..N cards (each card then holds its layers' hot
-    # experts); dp4a cards (sm_61 and later)
-    "flashnext": dict(id="qwen38-flash-next", one=8000, two=0, split=(8000, 1500), size=125, kinds="tc dense",
+    # experts). CUDA compute capability 5.0 and later.
+    "flashnext": dict(id="qwen38-flash-next", one=8000, two=0, split=(8000, 1500), size=125, kinds="tc dense maxwell",
                       ram_gb=64),
     # DeepSeek: the main card holds the dense layers, the drafter and the context (about 11.4 GB at 64K on an RTX
     # 3060); every other card in the server is an expert card (sm_50+, 4 GB+). Needs 560 GB of RAM or an NVMe drive.
@@ -101,13 +101,13 @@ def fits(model, cards, inv_ram_gb=None):
     wrong = [c for c in cards if _kind(c) not in kinds and not (_kind(c) == "p100" and "dense" in kinds)]
     if wrong:
         return False, "%s does not run on card %d (%s)" % (model, wrong[0]["index"], wrong[0].get("why"))
+    if len(cards) == 1:
+        ok = _free(cards[0]) >= m["one"]
+        return ok, "" if ok else "card %d has %d MiB free, %s needs %d" % (cards[0]["index"], _free(cards[0]), model, m["one"])
     if "split" in m:
         need = m["split"][0] + m["split"][1] * len(cards)
         have = sum(_free(c) for c in cards)
         return (have >= need, "" if have >= need else "%d MiB free on the cards, %s needs %d" % (have, model, need))
-    if len(cards) == 1:
-        ok = _free(cards[0]) >= m["one"]
-        return ok, "" if ok else "card %d has %d MiB free, %s needs %d" % (cards[0]["index"], _free(cards[0]), model, m["one"])
     if len(cards) == 2 and m["two"]:
         # F4: the two cards share the weights by free memory; each needs its half of the heads and some room
         a, b = _free(cards[0]), _free(cards[1])

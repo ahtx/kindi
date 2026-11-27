@@ -77,7 +77,20 @@ def cmd_bench(cfg, a):
     return run(cfg, log=log)
 
 
+def cmd_turbo(cfg, a):
+    from .turbo import table
+    print(table())
+    return 0
+
+
 def cmd_serve(cfg, a):
+    from . import turbo
+    if getattr(a, "explain", False):
+        print(turbo.table())
+        return 0
+    if turbo.active(cfg):
+        os.environ["KINDI_TURBO"] = "1"          # the DeepSeek server and engines read it from the environment
+        turbo.apply("serve", log=log, cfg=cfg)
     _setup_gpu_env(cfg)
     if getattr(a, "slots", None):
         cfg["slots"] = a.slots
@@ -245,6 +258,10 @@ def main(argv=None):
     s.add_argument("--api-key", dest="api_key")
     s.add_argument("--head", choices=("exact", "fast"))
     s.add_argument("--slots", type=int, help="requests written at the same time (decode slots; one card, KINDI_TC=1)")
+    s.add_argument("--turbo", action="store_true",
+                   help="faster settings with slightly different output (kindi turbo lists them)")
+    s.add_argument("--explain", action="store_true", help="with --turbo: print what turbo changes and exit")
+    sub.add_parser("turbo", help="list the turbo settings: speed and output change for each")
     s = sub.add_parser("chat", help="chat in the terminal")
     s.add_argument("--system", default="")
     s.add_argument("--temperature", type=float, default=0.7)
@@ -272,11 +289,14 @@ def main(argv=None):
         if a.max_tokens < 1 or (a.ctx is not None and a.ctx < 512):
             p.error("inkling requires --max-tokens >= 1 and --ctx >= 512")
         return run(a)
+    if a.cmd == "serve" and getattr(a, "turbo", False):
+        os.environ["KINDI_TURBO"] = "1"
     ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head", "lora")}
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
-            "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route}[a.cmd](cfg, a)
+            "models": cmd_models, "use": cmd_use, "cards": cmd_cards, "plan": cmd_plan, "route": cmd_route,
+            "turbo": cmd_turbo}[a.cmd](cfg, a)
 
 
 if __name__ == "__main__":

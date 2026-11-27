@@ -2396,3 +2396,148 @@ extern "C" __global__ void __launch_bounds__(512) k_lora2(
     for(int u = 0; u < 4; ++u) if(yp[u]) *yp[u] += acc[u];
   }
 }
+
+/* ---- gated-delta-net layer prologue: k_gdn_gates + k_gdn_conv + k_l2w in one launch --------------------------------
+   grid NK + NV, block 256. Block b < NK: the conv (and conv state) of q head b and k head b (256 channels), then the
+   L2 norm of each (warp 0: q, warp 1: k) into qk. Block NK + h: the gates of value head h (beta, g) and the conv of its
+   128 v channels. Each channel and its state belongs to one block. Every value is computed with k_gdn_conv's,
+   k_l2w's and k_gdn_gates's expressions, in the same order. */
+extern "C" __global__ void k_gdn_pro(const float* __restrict__ qkv, float* __restrict__ conv, const float* __restrict__ cw,
+                                     float* __restrict__ cs, int C, float* __restrict__ qk, int NK,
+                                     const float* __restrict__ xn, const float* __restrict__ bw, const float* __restrict__ aw,
+                                     const float* __restrict__ dtb, const float* __restrict__ ssma, float* __restrict__ beta,
+                                     float* __restrict__ g, int n){
+  const int b = blockIdx.x, t = threadIdx.x;
+  if(b < NK){
+    const int c = (t < 128) ? (b * 128 + t) : (NK * 128 + b * 128 + (t - 128));
+    const float c0 = conv[c], c1 = conv[C + c], c2 = conv[2 * C + c], nw = qkv[c];
+    const float o = c0 * cw[4 * c] + c1 * cw[4 * c + 1] + c2 * cw[4 * c + 2] + nw * cw[4 * c + 3];
+    conv[c] = c1; conv[C + c] = c2; conv[2 * C + c] = nw;
+    cs[c] = o / (1.0f + expf(-o));
+    __syncthreads();
+    const int w = t >> 5, lane = t & 31;
+    if(w < 2){
+      const int r = (w == 0) ? b : (NK + b);       /* k_l2w row: q heads, then k heads */
+      const float* xr = cs + (long long)r * 128;
+      double acc = 0.0;
+      for(int e = lane; e < 128; e += 32){ const double v = (double)xr[e]; acc += v * v; }
+      acc = wsum_d(acc);
+      const float sc = 1.0f / fmaxf(sqrtf((float)acc), 1e-6f);
+      for(int e = lane; e < 128; e += 32) qk[(long long)r * 128 + e] = xr[e] * sc;
+    }
+    return;
+  }
+  const int h = b - NK;
+  if(t < 128){
+    const int c = 2 * NK * 128 + h * 128 + t;
+    const float c0 = conv[c], c1 = conv[C + c], c2 = conv[2 * C + c], nw = qkv[c];
+    const float o = c0 * cw[4 * c] + c1 * cw[4 * c + 1] + c2 * cw[4 * c + 2] + nw * cw[4 * c + 3];
+    conv[c] = c1; conv[C + c] = c2; conv[2 * C + c] = nw;
+    cs[c] = o / (1.0f + expf(-o));
+  }
+  __shared__ float sb[256];
+  __shared__ float sa[256];
+  float ab = 0.f, aa = 0.f;
+  for(int i = t; i < n; i += 256){
+    const float x = xn[i];
+    ab += bw[(long long)h * n + i] * x;
+    aa += aw[(long long)h * n + i] * x;
+  }
+  sb[t] = ab; sa[t] = aa;
+  __syncthreads();
+  for(int st = 128; st > 0; st >>= 1){
+    if(t < st){ sb[t] += sb[t + st]; sa[t] += sa[t + st]; }
+    __syncthreads();
+  }
+  if(t == 0){
+    beta[h] = 1.0f / (1.0f + expf(-sb[0]));
+    const float a = sa[0] + dtb[h];
+    const float sp = (a > 20.0f) ? a : log1pf(expf(fminf(a, 20.0f)));
+    g[h] = sp * ssma[h];
+  }
+}
+
+/* ---- gated-delta-net layer epilogue: k_rmsw (per value head) + k_smfold (gate, 512-point fold) in one launch -------
+   grid NV*128/512, block 512 (head size 128, fold chunk 512 or -512). Block c needs the 4 rows its chunk reads (with
+   the head permutation of k_smfold); warps 0..3 each compute one row's scale as k_rmsw does, then the gate and the
+   fold are k_smfold's. */
+extern "C" __global__ void k_gdn_epi(const float* __restrict__ xg, const float* __restrict__ wn, const float* __restrict__ a,
+                                        const float* __restrict__ sg, float* __restrict__ xo, int perm_nk, int perm_rep, int HB){
+  __shared__ float xs[512];
+  __shared__ float rsc[4];
+  const int c = blockIdx.x, j = threadIdx.x, w = j >> 5, lane = j & 31;
+  if(w < 4){
+    const int e = (c << 9) + (w << 7);              /* first element of this chunk's row w */
+    int src = e;
+    if(perm_rep > 1){
+      const int grouped = e >> 7, rep = grouped % perm_rep, nk = grouped / perm_rep;
+      src = 128 * (nk + perm_nk * rep);
+    }
+    const float* xr = xg + src;
+    double acc = 0.0;
+    for(int q = lane; q < 128; q += 32){ const double v = (double)xr[q]; acc += v * v; }
+    acc = wsum_d(acc);
+    if(lane == 0) rsc[w] = 1.0f / sqrtf((float)(acc / 128) + 1e-6f);
+  }
+  __syncthreads();
+  const int e = (c << 9) + j;
+  int src = e;
+  if(perm_rep > 1){
+    const int hd = e & 127, grouped = e >> 7;
+    const int rep = grouped % perm_rep, nk = grouped / perm_rep;
+    src = hd + 128 * (nk + perm_nk * rep);
+  }
+  const float outn = (xg[src] * rsc[j >> 7]) * wn[src & 127];
+  const float xa = a[src];
+  const float m = (xa / (1.0f + expf(-xa))) * outn;
+  xs[j] = sg[e] * m;
+  __syncthreads();
+  fwht_chunks(xs, 1, j);
+  xo[e] = (HB == 512) ? xs[j] * 0.044194173824159220878f : xs[j];
+}
+
+/* ---- attention layer prologue: k_cpq + k_rmsw (q and k head norms) + k_rope (q, k) + k_store_h (K, V) in one launch
+   grid NH + NHKV, block 256 (head size 256, RoPE on the first 64 dimensions). Block r < NH: q head r (the q half of
+   its [q | gate] row) -> norm -> RoPE -> qr. Block NH + r: k head r -> norm -> RoPE -> kro and the K cache row;
+   v head r -> the V cache row. Each value uses the expression of the kernel it replaces; warp 0 computes the row's
+   norm scale as k_rmsw does. */
+extern "C" __global__ void k_att_pro(const float* __restrict__ qn, float* __restrict__ kro, const float* __restrict__ vb,
+                                     const float* __restrict__ wq, const float* __restrict__ wk,
+                                     const float* __restrict__ cc, const float* __restrict__ ss,
+                                     float* __restrict__ qr, unsigned short* __restrict__ kd, unsigned short* __restrict__ vd,
+                                     int NH){
+  __shared__ float xr[256];
+  __shared__ float scs;
+  const int b = blockIdx.x, j = threadIdx.x, lane = j & 31;
+  const bool isq = b < NH;
+  const int r = isq ? b : b - NH;
+  const float x = isq ? qn[r * 512 + j] : kro[r * 256 + j];
+  xr[j] = x;
+  __syncthreads();
+  if(j < 32){
+    double acc = 0.0;
+    for(int e = lane; e < 256; e += 32){ const double v = (double)xr[e]; acc += v * v; }
+    acc = wsum_d(acc);
+    if(lane == 0) scs = 1.0f / sqrtf((float)(acc / 256) + 1e-6f);
+  }
+  __syncthreads();
+  const float nv = (xr[j] * scs) * (isq ? wq : wk)[j];
+  __syncthreads();
+  xr[j] = nv;
+  __syncthreads();
+  float o;
+  if(j < 32){ const float a = xr[j], bb = xr[j + 32]; o = a * cc[j] - bb * ss[j]; }
+  else if(j < 64){ const float a = xr[j - 32], bb = xr[j]; o = a * ss[j - 32] + bb * cc[j - 32]; }
+  else o = xr[j];
+  if(isq){ qr[r * 256 + j] = o; return; }
+  kro[r * 256 + j] = o;
+  unsigned short hk, hv;
+#if KHIP
+  { __half t1 = __float2half(o); hk = *(unsigned short*)&t1; __half t2 = __float2half(vb[r * 256 + j]); hv = *(unsigned short*)&t2; }
+#else
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hk) : "f"(o));
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(vb[r * 256 + j]));
+#endif
+  kd[r * 256 + j] = hk;
+  vd[r * 256 + j] = hv;
+}

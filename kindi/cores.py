@@ -8,9 +8,11 @@ logical CPU per physical core (the lowest-numbered sibling), within the process'
 
 Linux: /sys/devices/system/cpu/cpuN/topology (package and core id), else /proc/cpuinfo ("physical id", "core id").
 Windows: psutil.cpu_count(logical=False) when psutil is there, else WMI (Win32_Processor.NumberOfCores).
+macOS: the performance cores (sysctl hw.perflevel0.physicalcpu).
 Otherwise: half the logical CPUs when SMT is known to be on, else all of them."""
 import os
 import subprocess
+import sys
 
 _SYS = "/sys/devices/system/cpu"
 
@@ -151,11 +153,29 @@ def physical_cpus(node=None, topo=None, allowed=None, nodes=None):
     return sorted(first.values())
 
 
+def _darwin_perf_cores():
+    """macOS on Apple silicon: the performance cores (hw.perflevel0.physicalcpu); None elsewhere. The thread pool
+    waits for its slowest thread on every op, so efficiency cores slow decode down instead of adding to it."""
+    if sys.platform != "darwin":
+        return None
+    for key in ("hw.perflevel0.physicalcpu", "hw.physicalcpu"):
+        try:
+            out = subprocess.run(["sysctl", "-n", key], capture_output=True, text=True, timeout=5).stdout.strip()
+            if out.isdigit() and int(out) > 0:
+                return int(out)
+        except Exception:  # noqa: BLE001 - sysctl is optional
+            pass
+    return None
+
+
 def physical_cores():
     """the number of physical cores this process can use (at least 1)"""
     cs = physical_cpus()
     if cs:
         return len(cs)
+    n = _darwin_perf_cores()
+    if n:
+        return n
     logical = len(_allowed())
     if os.name == "nt":
         n = _windows_cores()

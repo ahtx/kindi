@@ -89,6 +89,9 @@ def parse_calls(text, tools):
     return calls
 
 
+HEAD_FILE = "nanbeige-mtp.npz"      # an MTP head copied into the pack is loaded by default
+
+
 class Sorter(object):
     """splits streamed text into ("reasoning", ...) and ("text", ...) pieces; from <tool_call> on, the text is kept as
     the call tail. A partial tag at the end is held back."""
@@ -142,9 +145,19 @@ class NanbeigeBackend(object):
         self.cached = []            # the token at each position whose K/V is on the cards
         # prompt-lookup drafting (config key lookup): up to this many drafted tokens per check pass, 0: off
         self.lookup = max(0, min(7, int(cfg.get("lookup") or 0)))
+        self.lookup_context = os.environ.get("KINDI_NB_LOOKUP_CONTEXT", "0") == "1"
+        self.lookup_reuse = os.environ.get("KINDI_NB_LOOKUP_REUSE", "0") == "1"
+        self.lookup_state = None
         self.lk_stats = [0] * 6     # this request: check passes, drafted tokens, kept tokens (lookup; MTP head)
         self.mtp = False            # config key mtp_head: an MTP head file, a draft source
         hp = os.path.expanduser(cfg.get("mtp_head") or "")
+        if not hp and os.path.isfile(os.path.join(cfg.get("pack") or "", HEAD_FILE)):
+            # 0.8: a head in the pack is used by default (greedy and seeded sampled output unchanged, code +16-32% on
+            # the RTX 3090); mtp_head = none turns it off
+            hp = os.path.join(cfg["pack"], HEAD_FILE)
+            log("Nanbeige: MTP head %s (from the pack; mtp_head = none: off)" % hp)
+        if hp == "none":
+            hp = ""
         if hp and os.path.exists(hp):
             self.eng.load_mtp(hp)
             self.mtp = True
@@ -197,6 +210,16 @@ class NanbeigeBackend(object):
             keep = np.argpartition(sc, -256)[-256:]
             cand, sc = cand[keep], sc[keep]
         return Sampler._pick(cand, sc, temperature, top_p, top_k, rng)
+
+    def _lookup_for(self, ids):
+        if not self.lookup:
+            return None
+        if self.lookup_state is not None and self.lookup_state.extend_prompt(ids):
+            return self.lookup_state
+        look = Lookup(ids, match_context=self.lookup_context)
+        if self.lookup_reuse:
+            self.lookup_state = look
+        return look
 
     def generate(self, K, req, cancel=None):
         from .nanbeige_chat import render, prompt_ids
@@ -253,7 +276,7 @@ class NanbeigeBackend(object):
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             pos = len(ids)
             pending = False                   # a queued step whose result (the greedy token, the logits) is not read yet
-            look = Lookup(ids) if self.lookup else None
+            look = self._lookup_for(ids)
             queue = []                        # tokens a check pass chose: (token, fed, row); fed: its K/V is on the
             hrow = None                       # cards; row: the pass's row that gave it (the MTP head reads its state)
             mt = [1.0, 2.0]                   # MTP head: kept / checked drafts, decayed (prior 50%)

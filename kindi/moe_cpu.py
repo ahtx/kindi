@@ -83,6 +83,8 @@ class Layer:
         self._keep = (gate, up, down)
         if copy:
             self.h = L.moe_layer_new(K, F, E, clamp)
+            if not self.h:
+                raise MemoryError("could not allocate packed MoE weights")
             gs, ds = F * (K // 32) * 17, K * (F // 32) * 17
             for e in range(E):
                 L.moe_layer_set_expert(self.h, e, gate.ctypes.data + e * gs, up.ctypes.data + e * gs,

@@ -56,8 +56,13 @@
 #define SPIN_IDLE 4000            /* default pause loops between calls before a worker sleeps on the futex */
 
 /* ---------------------------------------------------------------- memory on one node */
+static size_t node_alloc_size(size_t bytes) {
+    return (bytes + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+}
+
 static void* node_alloc(size_t bytes, int node) {
-    size_t sz = (bytes + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+    size_t sz = node_alloc_size(bytes);
+    if (!sz) return NULL;
     void* p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return NULL;
     madvise(p, sz, MADV_HUGEPAGE);
@@ -126,7 +131,7 @@ static void qsum12(const int8_t* q, int nb, int32_t* out) {
 /* Gate/up group g (rows 4g..4g+3 of gate and of up), per block b: 8 scale bytes (g0..g3,u0..u3), then 8 x 16
    code bytes in the same order: 136 bytes per block, nbk blocks per group. Down group (rows 4g..4g+3), per block:
    4 scale bytes + 4 x 16 code bytes = 68 bytes. Groups [0, split) are on node 0, the rest on node 1. */
-typedef struct {
+typedef struct moe_layer_opaque {
     int K, F, E;                 /* hidden size, expert width, number of experts */
     int nbk, nbf;                /* blocks along K (gate/up input), along F (down input) */
     int ngu, ndn;                /* groups per expert: F / 4, K / 4 */
@@ -137,6 +142,8 @@ typedef struct {
     float clamp;                 /* swiglu limit (0 = none) */
     int direct;                  /* 1: the experts are read in place from the GGUF tensors (no copy, no node split) */
     const uint8_t *dgate, *dup, *ddown;  /* direct: [E][rows][blocks] of 17 bytes */
+    struct moe_layer_opaque* packed;     /* a compact, node-local copy of selected in-place experts */
+    int* pack_slot;                     /* original expert id -> packed slot, or -1 */
     /* streamed experts (xstore.c): before a call, fetch(sid, n, experts, ptr) brings the call's experts into RAM and
        gives each one's gate/up/down rows (the file's own bytes); xp[e * 3 + m] then points there instead of into
        the mapped file, and release(sid, ...) ends the call. The kernels read the same bytes either way. */
@@ -271,6 +278,7 @@ static inline float silu(float g) { return g / (1.f + expf(-g)); }
 typedef struct { const uint8_t* r[8]; int bs; int so[8]; int co[8]; } grp;
 
 static inline grp gu_grp(const moe_layer* L, int e, int g) {
+    if (L->packed && L->pack_slot[e] >= 0) { e = L->pack_slot[e]; L = L->packed; }
     grp G;
     if (L->direct) {
         size_t rb = (size_t)L->nbk * 17;
@@ -289,6 +297,7 @@ static inline grp gu_grp(const moe_layer* L, int e, int g) {
 }
 
 static inline grp dn_grp(const moe_layer* L, int e, int g) {
+    if (L->packed && L->pack_slot[e] >= 0) { e = L->pack_slot[e]; L = L->packed; }
     grp G;
     if (L->direct) {
         size_t rb = (size_t)L->nbf * 17;
@@ -926,6 +935,7 @@ void moe_pool_stop(void) {
 
 moe_layer* moe_layer_new(int K, int F, int E, float clamp) {
     moe_layer* L = calloc(1, sizeof(*L));
+    if (!L) return NULL;
     L->K = K; L->F = F; L->E = E; L->clamp = clamp;
     L->nbk = K / QK; L->nbf = F / QK; L->ngu = F / GU_ROWS; L->ndn = K / DN_ROWS;
     int n1 = P.nthr_node[1] > 0;
@@ -933,11 +943,19 @@ moe_layer* moe_layer_new(int K, int F, int E, float clamp) {
     L->dn_split = n1 ? (int)lroundf(L->ndn * P.share0) : L->ndn;
     L->gu_gbytes = (size_t)L->nbk * (8 + 8 * 16);
     L->dn_gbytes = (size_t)L->nbf * (4 + 4 * 16);
-    L->gu[0] = node_alloc((size_t)E * L->gu_split * L->gu_gbytes, 0);
-    L->dn[0] = node_alloc((size_t)E * L->dn_split * L->dn_gbytes, 0);
-    if (n1) {
-        L->gu[1] = node_alloc((size_t)E * (L->ngu - L->gu_split) * L->gu_gbytes, 1);
-        L->dn[1] = node_alloc((size_t)E * (L->ndn - L->dn_split) * L->dn_gbytes, 1);
+    size_t gu_bytes[2] = {(size_t)E * L->gu_split * L->gu_gbytes, (size_t)E * (L->ngu - L->gu_split) * L->gu_gbytes};
+    size_t dn_bytes[2] = {(size_t)E * L->dn_split * L->dn_gbytes, (size_t)E * (L->ndn - L->dn_split) * L->dn_gbytes};
+    for (int n = 0; n < 2; n++) {
+        L->gu[n] = node_alloc(gu_bytes[n], n);
+        L->dn[n] = node_alloc(dn_bytes[n], n);
+        if ((gu_bytes[n] && !L->gu[n]) || (dn_bytes[n] && !L->dn[n])) {
+            for (int i = 0; i <= n; i++) {
+                if (L->gu[i]) munmap(L->gu[i], node_alloc_size(gu_bytes[i]));
+                if (L->dn[i]) munmap(L->dn[i], node_alloc_size(dn_bytes[i]));
+            }
+            free(L);
+            return NULL;
+        }
     }
     return L;
 }
@@ -1006,6 +1024,30 @@ void moe_layer_set_expert(moe_layer* L, int e, const uint8_t* gate, const uint8_
             }
         }
     }
+}
+
+/* Allocate selected slots before the load workers start. The direct rows remain the fallback. */
+int moe_layer_prepare_pack(moe_layer* L, const int* ids, int count) {
+    if (!L->direct || L->xp || L->packed || count < 1 || count > L->E) return -1;
+    int* slots = malloc((size_t)L->E * sizeof(*slots));
+    if (!slots) return -1;
+    for (int e = 0; e < L->E; e++) slots[e] = -1;
+    for (int i = 0; i < count; i++) {
+        const int e = ids[i];
+        if (e < 0 || e >= L->E || slots[e] >= 0) { free(slots); return -1; }
+        slots[e] = i;
+    }
+    moe_layer* packed = moe_layer_new(L->K, L->F, count, L->clamp);
+    if (!packed) { free(slots); return -1; }
+    L->packed = packed;
+    L->pack_slot = slots;
+    return 0;
+}
+
+void moe_layer_pack_expert(moe_layer* L, int e) {
+    if (!L->packed || L->pack_slot[e] < 0) return;
+    const size_t gb = (size_t)L->F * L->nbk * 17, db = (size_t)L->K * L->nbf * 17;
+    moe_layer_set_expert(L->packed, L->pack_slot[e], L->dgate + e * gb, L->dup + e * gb, L->ddown + e * db);
 }
 
 /* Routed experts for T tokens (any number): x [T][K]; ids, wts [T][nsel]; out [T][K] (overwritten, without the

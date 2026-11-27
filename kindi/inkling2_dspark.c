@@ -14,8 +14,11 @@
 #include <omp.h>
 #endif
 
-#if defined(__AVX2__) && defined(__FMA__)
+#if defined(__SSSE3__)
 #include <immintrin.h>
+#endif
+
+#if defined(__AVX2__) && defined(__FMA__)
 #define DS_AVX2 1
 #else
 #define DS_AVX2 0
@@ -243,8 +246,23 @@ static inline float dot_q8_q8(const uint8_t* w_row, int nb, const int8_t* xq, co
         float sc = fp16_to_f32(dh) * xd[b];
         const int8_t* wq = (const int8_t*)(blk + 2);
         const int8_t* xqb = xq + b * 32;
+#if defined(__SSSE3__)
+        /* xq is bounded to [-127,127], so paired products fit in int16. Keep
+           the scalar path's one float addition per block and its sum order. */
+        __m128i w0 = _mm_loadu_si128((const __m128i*)wq);
+        __m128i w1 = _mm_loadu_si128((const __m128i*)(wq + 16));
+        __m128i x0 = _mm_loadu_si128((const __m128i*)xqb);
+        __m128i x1 = _mm_loadu_si128((const __m128i*)(xqb + 16));
+        __m128i p0 = _mm_maddubs_epi16(_mm_abs_epi8(w0), _mm_sign_epi8(x0, w0));
+        __m128i p1 = _mm_maddubs_epi16(_mm_abs_epi8(w1), _mm_sign_epi8(x1, w1));
+        __m128i ones = _mm_set1_epi16(1);
+        __m128i p = _mm_add_epi32(_mm_madd_epi16(p0, ones), _mm_madd_epi16(p1, ones));
+        p = _mm_hadd_epi32(p, p);
+        int isum = _mm_cvtsi128_si32(_mm_hadd_epi32(p, p));
+#else
         int isum = 0;
         for (int i = 0; i < 32; i++) isum += (int)wq[i] * (int)xqb[i];
+#endif
         sum += sc * (float)isum;
     }
     return sum;
@@ -433,10 +451,18 @@ void ds_forward_block(void* handle, int anchor_tok, int pos0, const float* ancho
     static const int is_swa[DS_NL] = {1, 0, 1};
 
     for (int l = 0; l < DS_NL; l++) {
-        rmsnorm_rows(C->h_buf, C->L[l].attn_norm, DS_D, DS_B, C->x_buf);
-        q8_mm_rows(C, C->L[l].attn_q, DS_QDIM, DS_D, C->x_buf, DS_B, C->q_buf);
-        q8_mm_rows(C, C->L[l].attn_k, DS_GQA,  DS_D, C->x_buf, DS_B, C->k_buf);
-        q8_mm_rows(C, C->L[l].attn_v, DS_GQA,  DS_D, C->x_buf, DS_B, C->v_buf);
+        /* The first layer has one anchor and seven identical mask embeddings.
+           Project a single mask, then expand before the position-dependent RoPE. */
+        int rows = l == 0 ? 2 : DS_B;
+        rmsnorm_rows(C->h_buf, C->L[l].attn_norm, DS_D, rows, C->x_buf);
+        q8_mm_rows(C, C->L[l].attn_q, DS_QDIM, DS_D, C->x_buf, rows, C->q_buf);
+        q8_mm_rows(C, C->L[l].attn_k, DS_GQA,  DS_D, C->x_buf, rows, C->k_buf);
+        q8_mm_rows(C, C->L[l].attn_v, DS_GQA,  DS_D, C->x_buf, rows, C->v_buf);
+        for (int i = rows; i < DS_B; i++) {
+            memcpy(C->q_buf + i * DS_QDIM, C->q_buf + DS_QDIM, DS_QDIM * sizeof(float));
+            memcpy(C->k_buf + i * DS_GQA, C->k_buf + DS_GQA, DS_GQA * sizeof(float));
+            memcpy(C->v_buf + i * DS_GQA, C->v_buf + DS_GQA, DS_GQA * sizeof(float));
+        }
 
         rmsnorm_rows(C->q_buf, C->L[l].attn_q_norm, DS_HD, DS_B * DS_NH, C->q_buf);
         rmsnorm_rows(C->k_buf, C->L[l].attn_k_norm, DS_HD, DS_B * DS_NKV, C->k_buf);

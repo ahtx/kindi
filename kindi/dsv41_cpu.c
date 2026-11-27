@@ -41,12 +41,13 @@ int moe_pool_init(const int* cpus, int n0, int n1, float share0);
 moe_layer* moe_layer_new(int K, int F, int E, float clamp);
 moe_layer* moe_layer_direct(int K, int F, int E, float clamp, const uint8_t* gate, const uint8_t* up, const uint8_t* down);
 void moe_layer_set_expert(moe_layer* L, int e, const uint8_t* gate, const uint8_t* up, const uint8_t* down);
+int moe_layer_prepare_pack(moe_layer* L, const int* ids, int count);
+void moe_layer_pack_expert(moe_layer* L, int e);
 int moe_forward(const moe_layer* L, int T, const float* x, int nsel, const int* ids, const float* wts, float* out,
                 int weight_in_h);
 void moe_pool_set_spin(long pauses);
 int moe_forward_parts(const moe_layer* L, int T, const float* x, int nsel, const int* ids, const uint8_t* skip,
                       float* parts);
-int moe_combine(int T, int nsel, const float* w, const float* parts, int K, float* out);
 int moe_combine_alt(int T, int nsel, const float* w, const float* parts, const int* row, const float* alt, int K,
                     float* out);
 int moe_layer_set_stream(moe_layer* L, int (*fetch)(int, int, const int*, const uint8_t**),
@@ -121,7 +122,7 @@ enum { F_FP8_KV = 1, F_FP8_O = 2, F_FP4_IDX = 4, F_FP4_CKV = 8, F_BF16_ENG = 16,
        F_LLAMA_FA = 128 };
 
 /* ---------------------------------------------------------------- matrices */
-enum { TY_F32 = 0, TY_Q8 = 8 };
+enum { TY_F32 = 0, TY_Q8 = 8, TY_MXFP4 = 39 };
 typedef struct {
     int type, rows, cols;         /* rows = outputs, cols = inputs */
     int seg_rows, seg_cols;       /* block-diagonal: row r reads input [(r / seg_rows) * seg_cols, + cols) */
@@ -878,6 +879,7 @@ long dsv_union_count(void) { return dsv_union_total; }
 /* routed experts into moe_cpu.c's node-split layout; each thread takes whole experts */
 static const void* EX[NL][3];
 static _Atomic int ex_next;
+static unsigned char ex_oncard[NL][NE], ex_picked[NL][NE];
 static void expert_job(int t, void* a) {
     (void)t; (void)a;
     const size_t gb = (size_t)FF * (D / 32) * 17, db = (size_t)D * (FF / 32) * 17;
@@ -886,6 +888,58 @@ static void expert_job(int t, void* a) {
         moe_layer_set_expert(M.L[l].moe, e, (const uint8_t*)EX[l][0] + e * gb, (const uint8_t*)EX[l][1] + e * gb,
                              (const uint8_t*)EX[l][2] + e * db);
     }
+}
+
+static void expert_pack_job(int t, void* a) {
+    (void)t; (void)a;
+    for (int i; (i = atomic_fetch_add(&ex_next, 1)) < NL * NE;)
+        if (ex_picked[i / NE][i % NE]) moe_layer_pack_expert(M.L[i / NE].moe, i % NE);
+}
+
+static int pack_hot_experts(void) {
+    const char* budget = getenv("KINDI_MOE_PACK_GB");
+    if (!budget || !budget[0]) return 0;
+    char* end;
+    double gb = strtod(budget, &end);
+    if (*end || !isfinite(gb) || gb < 0) {
+        fprintf(stderr, "dsv41: KINDI_MOE_PACK_GB must be a nonnegative number\n");
+        return -1;
+    }
+    if (gb == 0) return 0;
+    const char* list = getenv("KINDI_MOE_PACK_LIST");
+    if (!list || !list[0]) list = getenv("KINDI_HOT_LIST");
+    FILE* f = list && list[0] ? fopen(list, "r") : NULL;
+    if (!f) {
+        fprintf(stderr, "dsv41: expert packing requires KINDI_MOE_PACK_LIST or KINDI_HOT_LIST\n");
+        return -1;
+    }
+    const double expert_bytes = (double)D * FF * 3 * 17 / 32;
+    /* Each layer has up to four allocations rounded to huge-page boundaries. */
+    const double available = gb * 1e9 - (double)NL * 4 * (2u << 20);
+    const int limit = (int)fmin(NL * NE, fmax(0, available / expert_bytes));
+    int counts[NL] = {0}, ids[NL][NE], n = 0;
+    char line[256];
+    while (n < limit && fgets(line, sizeof line, f)) {
+        int l, e;
+        if (sscanf(line, "%d %d", &l, &e) != 2 || l < 0 || l >= NL || e < 0 || e >= NE
+            || ex_picked[l][e] || ex_oncard[l][e]) continue;
+        ids[l][counts[l]++] = e;
+        ex_picked[l][e] = 1;
+        n++;
+    }
+    fclose(f);
+    if (!n) {
+        fprintf(stderr, "dsv41: no CPU experts selected for the %.2f GB packing budget\n", gb);
+        return -1;
+    }
+    for (int l = 0; l < NL; l++)
+        if (counts[l] && moe_layer_prepare_pack(M.L[l].moe, ids[l], counts[l])) return -1;
+    const double t0 = now();
+    atomic_store(&ex_next, 0);
+    kp_run(expert_pack_job, NULL);
+    fprintf(stderr, "dsv41: %d CPU experts NUMA-packed (%.2f GB of weights) in %.1f s\n",
+            n, n * expert_bytes / 1e9, now() - t0);
+    return 0;
 }
 
 /* thread ids of this process */
@@ -1279,8 +1333,14 @@ int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, c
         const Tensor *g = find("blk.%d.ffn_gate_exps.weight", l), *u = find("blk.%d.ffn_up_exps.weight", l),
                      *d = find("blk.%d.ffn_down_exps.weight", l);
         if (!g || !u || !d) { fprintf(stderr, "dsv41: missing experts of layer %d\n", l); return -3; }
+        if (g->type != TY_MXFP4 || u->type != TY_MXFP4 || d->type != TY_MXFP4) {
+            fprintf(stderr, "dsv41: layer %d requires MXFP4 experts; got GGUF types %d/%d/%d\n",
+                    l, g->type, u->type, d->type);
+            return -3;
+        }
         if (expert_copy) {
             L->moe = moe_layer_new(D, FF, NE, 10.f);
+            if (!L->moe) return -3;
             EX[l][0] = g->p; EX[l][1] = u->p; EX[l][2] = d->p;
         } else {
             L->moe = moe_layer_direct(D, FF, NE, 10.f, g->p, u->p, d->p);
@@ -1374,6 +1434,7 @@ int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, c
                                  *dn = find("blk.%d.ffn_down_exps.weight", l);
                     if (GPU.hot_add(l, e, (const uint8_t*)g->p + e * gb, (const uint8_t*)u->p + e * gb,
                                     (const uint8_t*)dn->p + e * db, reserve)) break;
+                    ex_oncard[l][e] = 1;
                     if (stream) xs_mark_oncard(l, e);
                     if (lean && stream) {
                         release_range((const uint8_t*)g->p + e * gb, gb); release_range((const uint8_t*)u->p + e * gb, gb);
@@ -1393,6 +1454,7 @@ int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, c
                                      *dn = find("blk.%d.ffn_down_exps.weight", l);
                         if (XC[c].add(l, e, (const uint8_t*)g->p + e * gb, (const uint8_t*)u->p + e * gb,
                                       (const uint8_t*)dn->p + e * db, reserve2)) break;
+                        ex_oncard[l][e] = 1;
                         if (stream) xs_mark_oncard(l, e);
                         if (lean && stream) {
                             release_range((const uint8_t*)g->p + e * gb, gb); release_range((const uint8_t*)u->p + e * gb, gb);
@@ -1420,6 +1482,7 @@ int dsv_init(int cap, int tmax, const int* cpus, int n0, int n1, float share0, c
         kp_run(expert_job, NULL);
         fprintf(stderr, "dsv41: experts copied in %.1f s\n", now() - t1);
     }
+    if (!expert_copy && !stream && pack_hot_experts()) return -10;
     if (stream && xs_stream_start()) return -9;
     /* scratch */
     size_t T = tmax;
@@ -2534,16 +2597,44 @@ static int gpu_moe_parts(int l, int T, const float* x, const int* sel, const uin
     return 0;
 }
 
+/* A short verify has few tokens. Merge its six expert rows in slot order on the
+   caller, avoiding a second pool dispatch and its completion wait per layer. */
+int dsv_merge_parts(int T, const float* w, const float* parts, const int* row, const float* alt, float* out) {
+    static int local = -1;
+    if (local < 0) {
+        const char* env = getenv("KINDI_DSV_LOCAL_MERGE");
+        local = env && atoi(env) != 0;
+    }
+    if (!local || T > 8) return moe_combine_alt(T, NS, w, parts, row, alt, D, out);
+    _Static_assert(D % 8 == 0, "merge requires complete AVX vectors");
+    for (int t = 0; t < T; t++) {
+        const float* src[NS];
+        __m256 weight[NS];
+        for (int s = 0; s < NS; s++) {
+            int i = t * NS + s;
+            src[s] = row && row[i] >= 0 ? alt + (size_t)row[i] * D : parts + (size_t)i * D;
+            weight[s] = _mm256_set1_ps(w[i]);
+        }
+        for (int d = 0; d < D; d += 8) {
+            __m256 acc = _mm256_setzero_ps();
+            for (int s = 0; s < NS; s++)
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(weight[s], _mm256_loadu_ps(src[s] + d)));
+            _mm256_storeu_ps(out + (size_t)t * D + d, acc);
+        }
+    }
+    return 0;
+}
+
 static int gpu_combine(int T, const float* wsel, const float* parts, float* out) {
     double t0 = now();
-    moe_combine(T, NS, wsel, parts, D, out);
+    dsv_merge_parts(T, wsel, parts, NULL, NULL, out);
     M.t_moe += now() - t0;
     return 0;
 }
 /* the same, with the card's (token, slot) values read in place from its result rows (no scatter copy) */
 static int gpu_combine_alt(int T, const float* wsel, const float* parts, const int* row, const float* alt, float* out) {
     double t0 = now();
-    moe_combine_alt(T, NS, wsel, parts, row, alt, D, out);
+    dsv_merge_parts(T, wsel, parts, row, alt, out);
     M.t_moe += now() - t0;
     return 0;
 }
@@ -2562,7 +2653,7 @@ static int gpu_moe(int l, int T, const float* x, const int* sel, const float* ws
         early_parts(l, T, x, sel, any ? skip2 : NULL, parts);
         if (xs_pf_after()) xs_predict(l, T, x);
         if (any) xc_finish(any, parts);
-        moe_combine(T, NS, wsel, parts, D, mo);
+        dsv_merge_parts(T, wsel, parts, NULL, NULL, mo);
         M.t_moe += now() - t0;
         return 0;
     }

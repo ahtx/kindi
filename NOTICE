@@ -1,4 +1,4 @@
-Kindi 0.7.2 - third-party notices
+Kindi 0.8.0 - third-party notices
 
 Kindi is licensed under the GNU Affero General Public License v3.0 (see LICENSE). Commercial licenses are
 available (see COMMERCIAL-LICENSE.md).
@@ -12,6 +12,14 @@ Ternary-Bonsai-2-2B (model weights, GGUF)          Apache License 2.0
   https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf
   `kindi convert` re-lays out the weights of a file you download; it does not alter them. If you redistribute a
   converted pack, the Apache License 2.0 terms of the model apply to it.
+
+Ternary Bonsai 2.5 27B (PTQ1_0 GGUF and MTP head)   Apache License 2.0
+  Prism ML and the Qwen team. Kindi reads the base GGUF and extracts the optional MTP head at the user's request.
+  https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF
+
+Nemotron 3.5 Bolt E4B (model weights, GGUF)        OpenMDW License 1.1 (https://openmdw.ai/license/1-1/)
+  NVIDIA. GGUF conversion by Unsloth. Kindi reads the weights as they are.
+  https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF
 
 Nemotron 3.5 Lightning 30B-A3B, ternary            OpenMDW License 1.1 (https://openmdw.ai/license/1-1/)
 (model weights, GGUF)

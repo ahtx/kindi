@@ -1,28 +1,65 @@
-<p align="center"><img src="assets/kindi-banner.svg?v=0.7.2" alt="Kindi 0.7.2: language models on low-cost GPUs, from a 1 GB Quadro K420 to the RTX 50 series, the CMP 170HX and Radeon graphics. Ternary Bonsai 2B to 27B, AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B and DeepSeek-V4.1-Flash." width="100%"></p>
+<p align="center"><img src="assets/kindi-banner.svg?v=0.8.0" alt="Kindi 0.8.0: language models on low-cost GPUs, from a 1 GB Quadro K420 to the RTX 50 series, the CMP 170HX and Radeon graphics. Ternary Bonsai 2B to 27B, AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B and DeepSeek-V4.1-Flash." width="100%"></p>
 
-# Kindi 0.7.2
+# Kindi 0.8.0
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Commercial licenses available](https://img.shields.io/badge/commercial%20licenses-available-green.svg)](COMMERCIAL-LICENSE.md)
-[![Release v0.7.2](https://img.shields.io/badge/release-v0.7.2-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.7.2)
+[![Release v0.8.0](https://img.shields.io/badge/release-v0.8.0-lightgrey.svg)](https://github.com/ahtx/kindi/releases/tag/v0.8.0)
 
 Kindi is a custom inference engine for language models on low-cost GPUs. It runs Prism ML's ternary
-Bonsai models (2B, 4B, 9B and 27B), AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B, DeepSeek-V4.1-Flash and Qwen3.8-Flash-Next.
+Bonsai models (2B, 4B, 9B and 27B), Ternary Bonsai 2.5 27B, AH-Nanbeige4.3-33B,
+Nemotron 3.5 Lightning 30B-A3B, DeepSeek-V4.1-Flash and Qwen3.8-Flash-Next.
 Kindi supports NVIDIA cards from the 1 GB Quadro K420 (Kepler) to the RTX 50 series and the CMP 170HX. It also
 supports AMD Radeon 780M, 840M and 8060S graphics, and x86-64 CPUs. The OpenAI-compatible server has a prompt
 cache, tool calls, a thinking mode and speculative decoding. With the exact head, the greedy output is the same as
 the output of llama.cpp for the same model file, token for token. Version 0.7.0 adds Qwen3.8-Flash-Next, a 125B mixture-of-experts
-model for one 8 GB card, AMD RDNA2 support, native Windows with a tray monitor, several requests at once and card placement. Version 0.7.1 adds drafting for sampled requests in Flash-Next, one CPU thread for each physical core, and
-experimental support for Inkling 2 Mini. Version 0.7.2 adds LoRA adapters for the ternary Bonsai models (`kindi --lora FOLDER serve`).
+model for one 8 GB card, AMD RDNA2 support, native Windows with a tray monitor, several requests at once and card placement. Kindi 0.8 adds Bonsai 2.5 27B and a CPU path for Flash-Next. It speeds up prompt reads for Flash-Next, DeepSeek and
+Nemotron 3.5 Lightning on tested configurations. [Kindi 0.8 benchmarks](docs/SPEED.md) lists the settings and results.
 
 ### Measured speed
 
-Kindi and llama.cpp on the same card, with the same model file and the same context. Tokens per second, one stream,
-greedy. The method and the other cards: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Every comparison uses the same hardware, the same model file and the same context for both engines. Tokens per
+second, one request at a time. Kindi numbers use the 0.8 defaults. The method and every run:
+[docs/SPEED.md](docs/SPEED.md) (0.8) and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) (all cards).
+
+**Qwen3.8-Flash-Next on the CPU alone.** Dual Xeon E5-2673 v4, 40 threads, 8,192 context, the same GSQ-RCO IQ3_S
+GGUF file and the same HTTP harness for both engines:
+
+| | Kindi 0.8 | ik_llama.cpp |
+|---|---:|---:|
+| Read, 5,870-token prompt | **82-86** | 78-81 |
+| Write, greedy | **14.5-15.1** | 9.5-10.1 |
+| Write, T=0.7 | **14.4-14.8** | 9.8-10.2 |
+
+Kindi drafts with the MTP head by default; its greedy tokens match plain decoding, and `kindi verify` passes with
+173 of 174 reference tokens.
+
+**Faster in 0.8, with the defaults.** Same card, model file and context; before is the same build with the new
+setting off.
+
+| Model and hardware | Measure | Before | 0.8 |
+|---|---|---:|---:|
+| Qwen3.8-Flash-Next, RTX 3060 12 GB | Read, 14,064-token prompt | 361 | **870** |
+| DeepSeek V4.1 Flash, RTX 3060 12 GB + Quadro M4000 8 GB | Sampled write, 13,779-token prompt | 12.84 | **16.49** |
+| Ternary Bonsai 2.5 27B, RTX 3090 24 GB | Greedy write, two-token MTP (head imported into the pack) | 85-87 | **135-167** |
+| Ternary Bonsai 2B, GTX 1080 8 GB | Write, 2,048-token prompt | 56.09 | **71.91** |
+| Nemotron 3.5 Lightning, GTX 1080 8 GB | Read, 2,048-token prompt | 647.21 | **758.19** |
+
+Turbo (`kindi serve --turbo`, slightly different output): DeepSeek reads 13,779-token prompts at 97.2 tokens/s
+instead of 92.7 on the same cards ([docs/TURBO.md](docs/TURBO.md)).
+
+**All same-card comparisons together.** Across 262 same-card measurements against llama.cpp, ik_llama.cpp and
+Strata, on 29 hardware setups and 8 models, Kindi's speed is 1.55 times the other engine's (geometric mean of the
+per-row ratios). Kindi is faster in 218 of them. Every measured row is included, and older rows keep the Kindi
+version that was measured. In four more configurations only Kindi finished (llama.cpp crashed, ran out of memory or
+did not finish in one hour).
+
+**Other cards.** Kindi and llama.cpp, same card, model file and context:
 
 | Card | Model | Context | Kindi read / write | llama.cpp read / write |
 |---|---|---:|---:|---:|
 | Quadro K420, 1 GB | Bonsai 2B | 512 | **33.3 / 20.8** | 1.2 / 1.65 |
+| Quadro M4000, 8 GB, with two Xeon E5-2673 v4 | Qwen3.8-Flash-Next | 4K / short chats | **54.7 / 13.1** | 34.2 / 5.4 |
 | GeForce GTX 1080, 8 GB | Nemotron 3.5 Lightning 30B-A3B | 8,192 | **687 / 89.5** | 615 / 4.7 |
 | GeForce RTX 2070 SUPER, 8 GB | Nemotron 3.5 Lightning 30B-A3B | 8,192 | **2,129 / 120.3** | 1,137 / 111.8 |
 | Tesla P100, 16 GB | Nemotron 3.5 Lightning 30B-A3B | 8,192 | **702 / 144.8** | 506 / 118.4 |
@@ -43,6 +80,19 @@ Two more results:
   ([docs/DEEPSEEK.md](docs/DEEPSEEK.md)).
 
 ### Supported cards and models
+
+Run `kindi use bonsai25-27b` to download and select Prism ML's Bonsai 2.5 27B PTQ1_0 text
+checkpoint. `kindi verify` checks the selected model against its own Prism runtime reference.
+The default OpenAI-compatible model ID is `bonsai25-27b`.
+
+On NVIDIA Ampere or newer, Kindi drafts two tokens at a time for greedy requests with the publisher's
+MTP head once the head is in the pack. Download `Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf` and extract
+its head into the selected pack; `KINDI_SPEC=0` turns drafting off. [Prism ML model files](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF/tree/main)
+
+```sh
+python -m kindi.bonsai25_mtp Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf
+kindi serve
+```
 
 | Hardware | Models |
 |---|---|
@@ -169,22 +219,22 @@ exactly that.
 
 ```sh
 git clone https://github.com/ahtx/kindi.git && cd kindi
-docker build -t kindi:0.7.2 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
+docker build -t kindi:0.8.0 -f docker/Dockerfile .   # downloads the CUDA 10.2 toolkit (~2.5 GB), ~15 minutes
 ```
 
-For AMD RDNA3 graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.7.2`, about 6 GB to download). For
-RDNA 3.5 graphics, build `docker/Dockerfile.rocm7` (`kindi-rocm7:0.7.2`, about 9 GB to download). See
+For AMD RDNA3 graphics, build `docker/Dockerfile.rocm` instead (`kindi-rocm:0.8.0`, about 6 GB to download). For
+RDNA 3.5 graphics, build `docker/Dockerfile.rocm7` (`kindi-rocm7:0.8.0`, about 9 GB to download). See
 [docs/AMD.md](docs/AMD.md).
 
-You can also use the release archive. Download `kindi-0.4.0.tar.gz` from the
-[v0.4.0 release](https://github.com/ahtx/kindi/releases/tag/v0.4.0), then run
-`tar xzf kindi-0.4.0.tar.gz && cd kindi-0.4.0` and build the image with the same `docker build` command.
+You can also use the release archive. Download `kindi-0.8.0.tar.gz` from the
+[v0.8.0 release](https://github.com/ahtx/kindi/releases/tag/v0.8.0), then run
+`tar xzf kindi-0.8.0.tar.gz && cd kindi-0.8.0` and build the image with the same `docker build` command.
 
 Check that Docker sees the GPU (create `~/.kindi` first, so it belongs to you and not to root):
 
 ```sh
 mkdir -p ~/.kindi
-docker run --rm --gpus all -u $(id -u):$(id -g) -v ~/.kindi:/data kindi:0.4.0 info
+docker run --rm --gpus all -u $(id -u):$(id -g) -v ~/.kindi:/data kindi:0.8.0 info
 ```
 
 More in [docs/DOCKER.md](docs/DOCKER.md).
@@ -484,10 +534,12 @@ Kindi exists because of the models it runs. Thank you to the teams that release 
   [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) under the MIT License.
   Kindi's DSpark drafter uses the model's own MTP stages. Thank you also to
   [unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) for the GGUF conversion.
-- [Prism ML](https://huggingface.co/prism-ml) for the Ternary Bonsai models, 2B to 27B, and the
+- [Prism ML](https://huggingface.co/prism-ml) for the Ternary Bonsai models, including Bonsai 2.5 27B, and the
   Qwen team at Alibaba Cloud for the Qwen base models of Ternary Bonsai.
 - NVIDIA for Nemotron 3.5 Lightning 30B-A3B, Nota AI for its ternary version, and
   [boro64](https://huggingface.co/boro64/Ternary-Nemotron-3.5-Lightning-30B-A3B-GGUF) for the GGUF conversion.
+- NVIDIA for Nemotron 3.5 Bolt E4B and
+  [Unsloth](https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF) for its GGUF conversion.
 - [Tencent](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) for the DSpine drafter of the 27B, under
   Apache 2.0.
 - The Nanbeige team for Nanbeige4.3-33B, the base model of AH-Nanbeige4.3-33B.
@@ -498,7 +550,8 @@ Kindi exists because of the models it runs. Thank you to the teams that release 
 
 Thank you to slavalevski-tech, who first ran Nemotron 3.5 Lightning on Kindi, on a Quadro K6000. Thank you to
 atimelessrage for the contributions in 0.7.0: the container RAM limit (#48), the tokenizer pack check (#49), one MTP
-draft by default (#72) and exact tensor-core activations for Hadamard-4096 packs (#76). Thank you to everyone whose
+draft by default (#72) and exact tensor-core activations for Hadamard-4096 packs (#76). Thank you also for the
+0.7.2 fixes for JSON file handles (#50) and OpenAI API errors (#58). Thank you to everyone whose
 reports and tests shaped 0.7.0: epscheel, JugglerMaster, vntgeai, rojecas, kidkal, scuderiapk, ggeorgovassilis,
 Immac, exolvo, Rares14324, maximhausleiter and PlagaMedicum. Thank you also to
 the [llama.cpp](https://github.com/ggml-org/llama.cpp) authors. Their implementation is the reference that we check

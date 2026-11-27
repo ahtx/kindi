@@ -20,7 +20,7 @@ import numpy as np
 from .gguf import GGUF
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SOURCES = ("moe_cpu.c", "xstore.c", "qx_cpu.c", "moeaccel.c")
+SOURCES = ("moe_cpu.c", "xstore.c", "qx_cpu.c", "moeaccel.c", "fncpu.c")
 _lib = None
 _pool = None
 
@@ -91,6 +91,16 @@ def lib():
             ctypes.c_int.in_dll(L, "qx_one").value = int(os.environ["KINDI_QX_ONE"])
         if os.environ.get("KINDI_QX_VDEC"):
             ctypes.c_int.in_dll(L, "qx_vdec").value = int(os.environ["KINDI_QX_VDEC"])
+        L.fc_repack.argtypes = [I, V, I, I, I]
+        L.fc_repack.restype = V
+        L.fc_bytes.argtypes = [V]
+        L.fc_bytes.restype = ctypes.c_size_t
+        L.fc_set_layer.argtypes = [I, V, V, V]
+        L.fc_forward_parts.argtypes = [I, I, V, I, V, V, V]
+        L.fc_forward_parts.restype = I
+        L.fc_fits.argtypes = [I, I]
+        L.fc_fits.restype = I
+        L.fc_stats.argtypes = [V]
         L.qx_ma_ctx_set_fetch.argtypes = [V, V, I]
         L.qx_ma_ctx_set_tail.argtypes = [V, I, I]
         L.qx_ma_ctx_dropped.argtypes = [V]
@@ -272,6 +282,25 @@ class Experts(object):
                                     int(os.environ.get("KINDI_XS_CHUNK", str(1 << 20)))) < 1:
             raise RuntimeError("xstore: start failed")
         self.xs = xs_gb > 0
+        # KINDI_FN_FCPU=1 (0.8 C1): the experts repacked into fncpu.c's forms and computed by its kernels (the
+        # mailbox step and forward_parts use them); the file mapping stays for the card's cache
+        self.fc = {}
+        if os.environ.get("KINDI_FN_FCPU", "0") == "1" and not self.xs:
+            import time as _t
+            t0, fb = _t.time(), 0
+            for l in range(len(self.layer)):
+                hs = []
+                for part in ("gate", "up", "down"):
+                    ptr, ne, ty = t["blk.%d.ffn_%s_exps.weight" % (l, part)]
+                    h = L.fc_repack(ty, ptr, ne[1], ne[0], ne[2])
+                    if not h:
+                        raise RuntimeError("fncpu: layer %d %s (type %d) cannot be repacked" % (l, part, ty))
+                    fb += L.fc_bytes(h)
+                    hs.append(h)
+                L.fc_set_layer(l, *hs)
+                self.fc[l] = hs
+            print("qx_cpu: KINDI_FN_FCPU=1: %d layers of experts repacked for fncpu, %.1f GB (%.0f s)" % (
+                len(self.fc), fb / 1e9, _t.time() - t0), file=sys.stderr, flush=True)
         gb = lambda n: ctypes.c_longlong.in_dll(L, n).value / 1e9          # noqa: E731
         ahp = 0
         try:
@@ -306,6 +335,11 @@ class Experts(object):
         skip = np.ascontiguousarray(skip, np.uint8)
         T, n = ids.shape
         assert parts.flags.c_contiguous and parts.dtype == np.float32 and parts.shape == (T, n, self.K)
+        if l in self.fc and lib().fc_fits(T, n):
+            r = lib().fc_forward_parts(l, T, x.ctypes.data, n, ids.ctypes.data, skip.ctypes.data, parts.ctypes.data)
+            if r < 0:
+                raise ValueError("fncpu: layer %d call failed (%d)" % (l, r))
+            return r
         r = lib().qx_forward_parts(self.layer[l], T, x.ctypes.data, n, ids.ctypes.data, skip.ctypes.data,
                                    parts.ctypes.data)
         if r < 0:

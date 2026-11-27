@@ -40,24 +40,42 @@ def qsa_mask(qi, kraw, pos, knorm, eps, rope, budget=QSA_TOKENS, ratio=QSA_RATIO
     sum over heads of relu(q . block key) / sqrt(d), where a block key is the mean of its raw keys, normed and RoPE'd
     at the block's first position; the best budget / ratio blocks are kept, plus the tokens after the last complete
     block (the tail). With at most budget visible tokens this is the causal mask."""
-    T, P, d = qi.shape[0], kraw.shape[0], kraw.shape[1]
+    T, P = qi.shape[0], kraw.shape[0]
     dev = kraw.device
     causal = torch.arange(P, device=dev)[None, :] <= pos[:, None]
     if P <= budget:
         return causal
     nb = P // ratio
-    bk = kraw[:nb * ratio].view(nb, ratio, d).float().mean(1)
-    bk = rope(rms(bk, knorm, eps)[:, None, :], torch.arange(nb, device=dev) * ratio)[:, 0, :]
-    sc = torch.relu(torch.einsum("thd,bd->thb", qi.float(), bk)).sum(1) / math.sqrt(d)     # [T, nb]
-    nvis = (pos + 1) // ratio                                                                  # complete blocks
-    sc = sc.masked_fill(torch.arange(nb, device=dev)[None, :] >= nvis[:, None], float("-inf"))
-    top = sc.topk(min(budget // ratio, nb), dim=-1)
+    top, nvis = _qsa_top(qi, kraw, pos, knorm, eps, rope, budget, ratio)
     sel = torch.zeros(T, nb, dtype=torch.bool, device=dev)
     sel.scatter_(1, top.indices, top.values > float("-inf"))
     tok = torch.zeros(T, P, dtype=torch.bool, device=dev)
     tok[:, :nb * ratio] = sel.repeat_interleave(ratio, dim=1)
     tail = torch.arange(P, device=dev)[None, :] >= (nvis * ratio)[:, None]
     return (tok | tail) & causal
+
+
+def _qsa_top(qi, kraw, pos, knorm, eps, rope, budget, ratio):
+    nb, d = kraw.shape[0] // ratio, kraw.shape[1]
+    dev = kraw.device
+    bk = kraw[:nb * ratio].view(nb, ratio, d).float().mean(1)
+    bk = rope(rms(bk, knorm, eps)[:, None, :], torch.arange(nb, device=dev) * ratio)[:, 0, :]
+    sc = torch.relu(torch.einsum("thd,bd->thb", qi.float(), bk)).sum(1) / math.sqrt(d)     # [T, nb]
+    nvis = (pos + 1) // ratio                                                                  # complete blocks
+    sc = sc.masked_fill(torch.arange(nb, device=dev)[None, :] >= nvis[:, None], float("-inf"))
+    return sc.topk(min(budget // ratio, nb), dim=-1), nvis
+
+
+def qsa_positions(qi, kraw, pos, knorm, eps, rope, budget=QSA_TOKENS, ratio=QSA_RATIO):
+    """Selected key positions and validity for contexts longer than the QSA budget."""
+    top, nvis = _qsa_top(qi, kraw, pos, knorm, eps, rope, budget, ratio)
+    offsets = torch.arange(ratio, device=pos.device)
+    positions = (top.indices[:, :, None] * ratio + offsets).flatten(1)
+    valid = (top.values > float("-inf")).repeat_interleave(ratio, dim=1)
+    tail = nvis[:, None] * ratio + offsets[:-1]
+    valid_tail = tail <= pos[:, None]
+    positions = torch.cat((positions, tail.clamp_max(kraw.shape[0] - 1)), dim=1)
+    return positions.to(torch.int32), torch.cat((valid, valid_tail), dim=1)
 
 
 def shards(path):

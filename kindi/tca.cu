@@ -17,7 +17,15 @@
 
 __device__ __forceinline__ unsigned int atc_h2(float lo, float hi){
   unsigned int r;
+#ifdef KINDI_TURING
+  /* (cvt.rn.f16x2.f32 is sm_80+: two cvt.rn.f16.f32, the same rounding of each half) */
+  unsigned short l, h;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(l) : "f"(lo));
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(hi));
+  r = (unsigned int)l | ((unsigned int)h << 16);
+#else
   asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+#endif
   return r;
 }
 

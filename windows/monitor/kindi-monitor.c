@@ -37,7 +37,7 @@
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "dwmapi.lib")
 
-#define APP_VERSION L"0.7.0"
+#define APP_VERSION L"0.8.0"
 
 /* ------------------------------------------------------------------ GDI+ flat API (C has no gdiplus.h) */
 typedef struct { UINT32 version; ULONG_PTR callback; BOOL suppress_bg, suppress_codecs; } GdiStartup;

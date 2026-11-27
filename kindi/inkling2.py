@@ -13,7 +13,9 @@ Uses zero top-level CuPy dependency so CPU-only and prefill/host-init run withou
 import ctypes
 import hashlib
 import os
+import platform
 import subprocess
+import sys
 import time
 
 import numpy as np
@@ -103,18 +105,63 @@ class _IkGpuHooks(ctypes.Structure):
     ]
 
 
+def _cc():
+    """the C compiler: $CC when set, clang on macOS (Xcode command line tools), else gcc"""
+    return os.environ.get("CC") or ("clang" if sys.platform == "darwin" else "gcc")
+
+
+def _arch_flag():
+    """-march=native on x86; -mcpu=native on arm64 (Apple silicon, AArch64 Linux), which turns on NEON dotprod/fp16"""
+    m = platform.machine().lower()
+    return "-mcpu=native" if m in ("arm64", "aarch64") else "-march=native"
+
+
+def _cpu_has_i8mm():
+    """the CPU has the AArch64 int8 matrix multiply (SMMLA): macOS sysctl, else /proc/cpuinfo"""
+    if sys.platform == "darwin":
+        try:
+            return subprocess.run(["sysctl", "-n", "hw.optional.arm.FEAT_I8MM"], capture_output=True, text=True,
+                                  timeout=5).stdout.strip() == "1"
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        with open("/proc/cpuinfo") as f:
+            return any(line.startswith("Features") and " i8mm" in line for line in f)
+    except OSError:
+        return False
+
+
+def _extra_flags(cc, arch):
+    """arm64 with i8mm whose compiler does not turn it on for -mcpu=native (Apple clang 16 on M2-M4 does not):
+    add the target feature, so the SMMLA prompt kernels are built. [] elsewhere."""
+    if arch != "-mcpu=native" or os.environ.get("KINDI_NO_I8MM") == "1" or not _cpu_has_i8mm():
+        return []
+    try:
+        macros = subprocess.run([cc, arch, "-dM", "-E", "-x", "c", os.devnull], capture_output=True, text=True,
+                                timeout=30).stdout
+    except Exception:  # noqa: BLE001
+        return []
+    if "__ARM_FEATURE_MATMUL_INT8" in macros:
+        return []
+    if "clang" in cc or "__clang__" in macros:
+        return ["-Xclang", "-target-feature", "-Xclang", "+i8mm"]
+    return []
+
+
 def _compile_cpu():
     src_path = os.path.join(HERE, "inkling2_cpu.c")
     tbl_path = os.path.join(HERE, "inkling2_iq2_tables.h")
     src = open(src_path, "rb").read()
     tbl = open(tbl_path, "rb").read() if os.path.exists(tbl_path) else b""
-    h = hashlib.sha256(src + tbl).hexdigest()[:16]
+    cc, arch = _cc(), _arch_flag()
+    extra = _extra_flags(cc, arch)
+    h = hashlib.sha256(src + tbl + " ".join(extra).encode()).hexdigest()[:16]
     cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "kindi")
     os.makedirs(cache_dir, exist_ok=True)
     so_path = os.path.join(cache_dir, "inkling2_cpu_%s.so" % h)
     if not os.path.exists(so_path):
         tmp = so_path + ".tmp.%d" % os.getpid()
-        cmd = ["gcc", "-O3", "-std=gnu11", "-march=native", "-Wall", "-Wextra",
+        cmd = [cc, "-O3", "-std=gnu11", arch] + extra + ["-Wall", "-Wextra",
                "-I" + HERE, "-shared", "-fPIC", src_path, "-o", tmp, "-pthread", "-lm", "-ldl"]
         subprocess.check_call(cmd)
         os.replace(tmp, so_path)
@@ -140,6 +187,8 @@ def _compile_cpu():
     lib.ik_get_profile.restype = None
     lib.ik_reset_timers.argtypes = []
     lib.ik_reset_timers.restype = None
+    lib.ik_max_batch.argtypes = []
+    lib.ik_max_batch.restype = ctypes.c_int
     lib.ik_n_threads.argtypes = []
     lib.ik_n_threads.restype = ctypes.c_int
     lib.ik_conv_hist_ptr.argtypes = []
@@ -394,6 +443,9 @@ class Engine(object):
             self.gpu_ctx = gpu_mod.attach(self, usage, log=log)
 
         self.pos = 0
+        # tokens per forward call: the C build's IK_MAXB (512 on AArch64) on the CPU path; 128, what the GPU paths
+        # are sized for, whenever a GPU takes part
+        self.maxb = int(self.lib.ik_max_batch()) if self.gpu_ctx is None else IK_MAXB
         self._state_sz = int(self.lib.ik_state_bytes())
         self.dspark = None
         self.dspark_path = None
@@ -455,7 +507,7 @@ class Engine(object):
         out_gap = ctypes.c_float()
         c0 = 0
         while c0 < n:
-            part = ids[c0:c0 + IK_MAXB]
+            part = ids[c0:c0 + self.maxb]
             T = len(part)
             arr = (ctypes.c_int * T)(*[int(x) for x in part])
             last = (c0 + T == n)
@@ -492,7 +544,7 @@ class Engine(object):
         out = np.empty((T, IK_V_UNPAD), dtype=np.float32)
         c0 = 0
         while c0 < T:
-            part = ids[c0:c0 + IK_MAXB]
+            part = ids[c0:c0 + self.maxb]
             tlen = len(part)
             arr = (ctypes.c_int * tlen)(*[int(x) for x in part])
             lptr = out[c0:c0 + tlen].ctypes.data_as(ctypes.POINTER(ctypes.c_float))

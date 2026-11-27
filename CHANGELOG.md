@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.0 (2026-11-27)
+
+The speed settings below are on by default. Each one keeps an environment variable to turn it off.
+
+- Bonsai 2B, 4B and 9B fuse the Gated DeltaNet and attention setup kernels on one card. In 2,048-token tests, write speed rose from 56.09 to 71.91 tokens/s on the GTX 1080, from 79.52 to 82.55 on the Quadro K1200 and from 220.77 to 241.29 on an RTX 3080. The tokens and final logits matched. `KINDI_DENSE_FUSE=0` turns fusion off.
+- Qwen3.8-Flash-Next reads long prompts faster on one Ampere or newer card when its experts are page-locked. On an RTX 3060 server, a 14,064-token prompt read at 870 tokens/s, up from 361 with the 0.8 settings before this change. A 4,601-token prompt read at 454 tokens/s greedy and 504 at T=0.7, up from 345. Write speed changed by -5% to +3%. The profile stages experts early, coalesces uploads and sizes the expert batch to the free card memory. In the default fast mode it also uses fp16 prompt GEMMs, the fused prompt kernels and causal key limits. `KINDI_QXG_PROFILE=0` turns the profile off. `KINDI_FAST=0` keeps the exact prompt arithmetic.
+- DeepSeek V4.1 Flash uses a partial sort for top-p sampling. On the RTX 3060 and M4000, sampled write speed rose from 12.37 to 15.61 tokens/s at 4,284 prompt tokens and from 12.84 to 16.49 at 13,779. Read speed and the seeded answers were unchanged. `KINDI_DSV_TOPP_PARTIAL=0` uses the full sort.
+- Nemotron 3.5 Lightning batches up to 1,024 prompt tokens on cards that otherwise use 512-token chunks. The GTX 1080 read a 2,048-token prompt at 758.19 tokens/s, up from 647.21. Write speed moved from 86.77 to 85.99. The tokens matched. `KINDI_LT_ADAPT_PREFILL=0` keeps 512-token chunks.
+- Run Ternary Bonsai 2.5 27B with its PTQ1_0 GGUF. After `python -m kindi.bonsai25_mtp Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf` writes the head into the pack, Ampere and newer cards draft two tokens with it by default. On the RTX 3090, greedy write speed rose from 85-87 to 135-167 tokens/s across two documents at 512 and 4,096 prompt tokens. The tokens matched. `KINDI_SPEC=0` turns drafting off.
+- Nanbeige uses an MTP head saved in the pack as `nanbeige-mtp.npz` by default. The output is unchanged. No head is published yet. Set `mtp_head = none` to turn it off.
+- Serve and verify Qwen3.8-Flash-Next on the CPU. Prompt chunks of 16 tokens or more use fp32 matrix products and tiled attention, the per-layer embedding table warms in the background, and the thread pool synchronizes per NUMA node. MTP drafting is on for the CPU too and gives the same greedy tokens as plain decoding. On dual Xeon E5-2673 v4 CPUs (20 cores per socket, 40 threads, 8,192 context), 5,870-token prompts read at 82 to 86 tokens/s over HTTP, against 78 to 81 for ik_llama.cpp with the same GGUF file and harness. Write speed is 14.5 to 15.1 tokens/s greedy and 14.4 to 14.8 at T=0.7, against 9.5 to 10.1 and 9.8 to 10.2. `kindi verify` passes with 173 of 174 reference tokens.
+- Inkling 2 Mini avoids a host copy when all experts fit on the card. The GTX 1080 test gained 3.9 to 4.7% in greedy write speed against 0.7.2, with the same output.
+- The Flash-Next planner accepts Maxwell cards with 8 GB free. The release archive includes the Flash-Next installer and its MTP helpers. The general installer accepts a successful model verification without a speed line.
+
+- Kindi serve answers the Anthropic Messages API at `POST /v1/messages` and `/v1/messages/count_tokens`, on the same
+  chat path as `/v1/chat/completions` (text, tools, thinking, streaming, `x-api-key`). Images and documents get HTTP 400.
+- Admission limits: `queue_max` (64) waiting requests, then HTTP 429 `server_busy`; `max_body_mb` (32), then HTTP 413;
+  an optional per-client `rate_limit_per_min`. `/health` shows them.
+- `kindi bench --sample-vram` logs each card's VRAM peak during the run.
+- Turing (RTX 20, T4) tensor cores on the `KINDI_TC=1` path with `KINDI_TC_TURING=1`. Off by default.
+- The DeepSeek card calibration loads the CUDA driver through the same code as the rest of Kindi.
+- Thanks to atimelessrage for #47, #51, #63, #64 and #75. We wrote these changes again in Kindi's code from their
+  pull requests. Their #50 and #58 shipped in 0.7.2.
+
+See the [0.8 benchmarks](docs/SPEED.md) for model files, settings and baselines.
+
 ## 0.7.2 (2026-11-24)
 
 Everything in 0.7.1 and 0.7.0 stays. This includes Qwen3.8-Flash-Next, AMD RDNA2 support, native Windows, several

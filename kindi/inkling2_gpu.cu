@@ -2670,6 +2670,7 @@ typedef struct {
     const uint8_t** d_ptrs_dn_sc;
     const uint8_t** d_ptrs_dn_qs;
     uint8_t on_dev[IK_NE];
+    int n_resident_experts;
 } GpuPhysLayer;
 
 typedef struct {
@@ -3355,11 +3356,16 @@ static int gpu_run_layer(GpuState* G, int il, int ip, int T, int pos0,
                                &G->d_uniq_n[d], &G->d_has_cold[d] };
             kl_launch(G->fn[d][FN_BUCKET_MOE], 1, 1, 1, IK_NE, 1, 1, st, args);
         }
-        cudaMemcpyAsync(G->h_pin_uniq_n, G->d_uniq_n[d], sizeof(int), cudaMemcpyDeviceToHost, st);
-        cudaMemcpyAsync(G->h_pin_cold_flag, G->d_has_cold[d], 1, cudaMemcpyDeviceToHost, st);
-        cudaStreamSynchronize(st);
-        int uniq_n = *G->h_pin_uniq_n;
-        int has_cold = (*G->h_pin_cold_flag) != 0;
+        /* One token routes to IK_NU distinct experts. If all are resident, both
+           counts are known and the kernels can consume the bucket on this stream. */
+        int uniq_n = IK_NU, has_cold = 0;
+        if (T != 1 || gl->n_resident_experts != IK_NE) {
+            cudaMemcpyAsync(G->h_pin_uniq_n, G->d_uniq_n[d], sizeof(int), cudaMemcpyDeviceToHost, st);
+            cudaMemcpyAsync(G->h_pin_cold_flag, G->d_has_cold[d], 1, cudaMemcpyDeviceToHost, st);
+            cudaStreamSynchronize(st);
+            uniq_n = *G->h_pin_uniq_n;
+            has_cold = (*G->h_pin_cold_flag) != 0;
+        }
 
         if (has_cold) {
             cudaMemcpyAsync(G->h_pin_sel, G->d_sel[d], (size_t)T * IK_NU * sizeof(int), cudaMemcpyDeviceToHost, G->xfer_stream[d]);
@@ -4314,6 +4320,7 @@ void* ik_gpu_init(const char* gguf_path, size_t data_start,
             uint8_t plan_v = exp_plan[ip * IK_NE + e];
             if (plan_v == 2) {
                 gl->on_dev[e] = 1;
+                gl->n_resident_experts++;
                 if (gu_sc_sz > 0) {
                     if (G->d_static_slab[d]) {
                         uint8_t* sp = G->d_static_slab[d] + stat_off[d];

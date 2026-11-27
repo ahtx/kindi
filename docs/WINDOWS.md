@@ -5,8 +5,10 @@ Windows. One PowerShell command installs everything: it turns on WSL2, makes a L
 Docker, checks the GPU, and runs the normal Kindi installer inside. Then Windows programs use Kindi at
 `http://localhost:8093/v1`, the same as on Linux.
 
-Kindi also runs natively on Windows with an NVIDIA card, without WSL, from the source: see
-[INSTALL.md](INSTALL.md#native-windows-without-wsl). WSL2 is the supported way.
+On Windows with an NVIDIA card, you can also use the
+[native Kindi package](https://github.com/ahtx/kindi/releases/tag/v0.8.0) without WSL.
+Extract `kindi-0.8.0-windows-x64.zip` and run `Install Kindi.cmd` inside the extracted folder.
+See [the native Windows requirements](INSTALL.md#native-windows-without-wsl) for model support.
 
 ## Install
 

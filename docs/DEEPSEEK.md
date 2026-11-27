@@ -83,6 +83,10 @@ with the probability that the model gives it. When it refuses a draft, it takes 
 distribution. So the output has the same distribution as plain sampling (`tools/test_dsv41_sampling.py` checks
 this).
 
+The top-p sampler uses a partial stable sort by default (`KINDI_DSV_TOPP_PARTIAL=0` restores the full sort). The sampler uses the same
+normalization, tie order and probability cutoff. It sorts the full vocabulary if the candidate set does not
+cover the requested probability mass. It applies to sampled requests that use a `top_p` below `1`.
+
 ## Hot experts
 
 `tools/dsv41_hotplan.py` makes the hot-expert list from measured counts of the expert picks. It uses Kindi's shared
@@ -174,6 +178,13 @@ of 65,536 and Kindi 0.6.0, with DSpark on (the default).
 
 Prompt reading on real text is about 95 to 100 tokens/s at 2K and at 8K tokens. The CPU expert work sets this speed.
 
-The prompt chunk (`tmax`) is 512 by default. A chunk of 1024 reads an 8K prompt about 7% faster, but it uses 1 GB
-more VRAM. With DSpark, a 12 GB card has no space for a chunk of 1024. The installer uses 1024 on cards with 16 GB
-or more.
+The prompt chunk (`tmax`) is 512 by default. On a card with enough VRAM, start the server with
+`--tmax 1024 --adaptive-prefill` to use 512-token chunks for short uncached prompts and pipelined
+1,024-token chunks for uncached spans of at least 8,192 tokens. The 1,024 setting reserves more VRAM
+when the server loads, including for short requests. The installer uses 512.
+With DSpark, 81,920 context and `KINDI_DSV_CKV4=1`, adaptive prefill on the RTX 3060 and M4000 read at
+102.5 tokens/s on a 13K agent prompt versus 91.4–92.5 at fixed 512. The 4K read and combined write rates
+stayed within the fixed-512 range. The 3060 used 756 MiB more after the replay.
+`KINDI_DSV_CKV4=1` is experimental: `kindi.dsv41 verify` gives 1,260 of 1,280 (98.4%) with it, below the
+1,266 of 1,280 (98.9%) gate of the default KV cache. Without CKV4, the RTX 3060 runs out of memory at
+81,920 context with `--tmax 1024`.

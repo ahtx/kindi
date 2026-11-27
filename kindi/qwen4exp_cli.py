@@ -98,10 +98,14 @@ def verify(cfg, man, log=print):
     rows = [json.loads(l) for l in open(rp) if l.strip()]
     # verify checks the exact path against the reference: fast mode (the default) is off here unless set explicitly
     os.environ.setdefault("KINDI_FAST", "0")
-    from .qwen4exp_gen import Engine
+    from .qwen4exp_gen import CPUDecode, Engine
     t0 = time.time()
-    eng = Engine(man["model_path"], ctx=0, log=log)
-    s = gate(eng.gm, rows, log=log)
+    if os.environ.get("KINDI_DEVICE", "gpu").lower() == "cpu":
+        needed = max(len(row["ids"]) + len(row["gen"]) for row in rows)
+        model = CPUDecode(man["model_path"], ctx=max(int(cfg["ctx"]), needed), log=log).model
+    else:
+        model = Engine(man["model_path"], ctx=0, log=log).gm
+    s = gate(model, rows, log=log)
     log("%s: %d of %d tokens the reference's top-1, %d misses at near-ties (%.0f s)" % (
         "PASS" if s["pass"] else "FAIL", s["agree"], s["total"], s["near_tie_misses"], time.time() - t0))
     return 0 if s["pass"] else 1

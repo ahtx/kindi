@@ -64,16 +64,12 @@ def _cat(ch):
     return c
 
 
-def _is_l(ch):
-    return _cat(ch) == "L"
-
-
 def _is_lm(ch):
     return _cat(ch) in ("L", "M")
 
 
-def _is_n(ch):
-    return _cat(ch) == "N"
+def _is_other(ch):
+    return not ch.isspace() and _cat(ch) not in ("L", "M", "N")
 
 
 def pretoken(text):
@@ -98,10 +94,11 @@ def pretoken(text):
                 i += 2
                 continue
         # 2 optional prefix + letter/mark run
+        category = _cat(c)
         j = None
-        if not (c in "\r\n" or _is_l(c) or _is_n(c)) and i + 1 < n and _is_lm(text[i + 1]):
+        if category not in ("L", "N") and c not in "\r\n" and i + 1 < n and _is_lm(text[i + 1]):
             j = i + 1
-        elif _is_lm(c):
+        elif category in ("L", "M"):
             j = i
         if j is not None:
             k = j
@@ -111,18 +108,16 @@ def pretoken(text):
             i = k
             continue
         # 3 one number
-        if _is_n(c):
+        if category == "N":
             out.append(c)
             i += 1
             continue
         # 4 optional space + run of "other" + trailing CR/LF
 
-        def other(ch):
-            return not (ch.isspace() or _is_lm(ch) or _is_n(ch))
-        j = i + 1 if (c == " " and i + 1 < n and other(text[i + 1])) else i
-        if j < n and other(text[j]):
+        j = i + 1 if (c == " " and i + 1 < n and _is_other(text[i + 1])) else i
+        if _is_other(text[j]):
             k = j
-            while k < n and other(text[k]):
+            while k < n and _is_other(text[k]):
                 k += 1
             while k < n and text[k] in "\r\n":
                 k += 1

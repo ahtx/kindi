@@ -10,7 +10,8 @@ Prompt reuse: the engine's state after a prompt (GDN states, attention caches, t
 whose prompt continues the last prompt reads only the new tokens. The decode runs on a copy of that state (the CUDA
 graph decoder), so the reply's tokens are not in the kept state: the next turn renders the reply again in its prompt
 anyway. A second copy is kept at the last assistant header of each prompt (a new turn of the same chat starts
-there), as the Lightning backend does."""
+there), as the Lightning backend does. The CPU engine reuses its live state for an exact extension of the tokens
+it has processed and rereads edited prompts."""
 import os
 import time
 
@@ -41,18 +42,26 @@ def _clone(st):
 
 
 def band(z, temperature):
-    """(token ids, logits as float64) of the tokens of logit row z (a card tensor) within 16 temperatures of the best
+    """(token ids, logits as float64) of the tokens of logit row z within 16 temperatures of the best
     (each other token has relative probability under e^-16 against the best), at most 256 of the best; None when
     more than 4096 qualify even at a narrow band (the caller then takes the best token). The candidates of plain
     sampling and of drafted sampling, so both sample the same distribution."""
     z = z.float().reshape(-1)
+    host = z.detach().numpy() if z.device.type == "cpu" else None
+    peak = host.max() if host is not None else z.max()
     w = 16.0 * max(temperature, 0.1)
     got = None
     while True:
-        idx = (z >= z.max() - w).nonzero().reshape(-1)
-        if idx.numel() <= 4096:
-            got = idx.cpu().numpy().astype(np.int64), z[idx].double().cpu().numpy()
-            break
+        if host is not None:
+            idx = np.flatnonzero(host >= peak - np.float32(w))
+            if idx.size <= 4096:
+                got = idx.astype(np.int64), host[idx].astype(np.float64)
+                break
+        else:
+            idx = (z >= peak - w).nonzero().reshape(-1)
+            if idx.numel() <= 4096:
+                got = idx.cpu().numpy().astype(np.int64), z[idx].double().cpu().numpy()
+                break
         if w <= 0.5:
             break
         w /= 2
@@ -185,6 +194,7 @@ class Engine(object):
         if mode == "auto":
             log("Flash-Next: KINDI_FN_DRAFT=auto: drafting %s" % ("on" if self.draft_on else "off (the engine's rule)"))
         self._gen, self.dstats = None, {}
+        self.draft_prompt_cache = {} if os.environ.get("KINDI_FN_DRAFT_CACHE", "0") == "1" else None
         self.log = log
         self.st, self.pos, self.dec, self.live = None, 0, None, False
         self.row = None                 # the logits of the last position (prompt or step), on the card
@@ -196,6 +206,8 @@ class Engine(object):
     # ---- the state
     def reset(self):
         self.st, self.pos, self.live = self.gm.new_state(), 0, False
+        if self.draft_prompt_cache is not None:
+            self.draft_prompt_cache.clear()
 
     def snapshot(self):
         self._snap = _clone(self.st)
@@ -221,12 +233,13 @@ class Engine(object):
     def start_drafted(self, ids, n, cancel=None, stop=(), sampler=None):
         """reply of ids with MTP drafts (kindi.qwen4exp_mtp.GraphDrafter.stream; greedy, or sampled with a
         DraftSampler): returns the first token; each step() then gives the next accepted token. The drafter reads the
-        prompt itself (its head needs the prompt's cache), so the kept state is not this prompt's afterwards."""
+        prompt itself and holds its own optional paired target and head states."""
         from .qwen4exp_mtp import GraphDrafter
         self.dstats = {}
         self._gen = GraphDrafter(self.gm, k=int(os.environ.get("KINDI_FN_DRAFT_K", "2"))).stream(
-            list(ids), n, cancel=cancel, stop=tuple(stop), stats=self.dstats, sampler=sampler)
-        self.st, self.live, self.pos = None, False, len(ids)
+            list(ids), n, cancel=cancel, stop=tuple(stop), stats=self.dstats, sampler=sampler,
+            prompt_cache=self.draft_prompt_cache)
+        self.st, self._snap, self.live, self.pos = None, None, False, len(ids)
         first = int(next(self._gen))
         self._dhist = list(ids) + [first]             # the prompt and the tokens handed out
         return first
@@ -321,6 +334,82 @@ class Engine(object):
         return out
 
 
+class CPUDecode:
+    """The CPU model keeps one live sequence, including every token fed during decode. With the MTP head beside the
+    model (kindi.fn_cpu.Model.has_mtp) replies are drafted (KINDI_FN_DRAFT=0: plain): k drafts a pass
+    (KINDI_FN_DRAFT_K, default 2) checked in one window of the main model, greedy or by speculative sampling."""
+
+    draft_prompt_cache = None
+
+    def __init__(self, path, ctx, log):
+        import torch
+        from .cores import parse_list
+        from .fn_cpu import Model
+        selected = os.environ.get("KINDI_FN_CPUS")
+        self.model = Model(path, ctx=ctx or 8192, cpus=parse_list(selected) if selected else None, log=log)
+        self.ctx = self.model.ctx
+        self.history = []
+        self.row = None
+        self.torch = torch
+        self.draft_on = self.model.has_mtp and os.environ.get("KINDI_FN_DRAFT", "auto") != "0"
+        self._gen, self.dstats = None, {}
+        log("Flash-Next CPU: drafting %s" % ("on" if self.draft_on else "off"))
+
+    @property
+    def pos(self):
+        return self.model.pos
+
+    def reset(self):
+        self.model.reset()
+        self.history.clear()
+        self.row = None
+
+    def prefill(self, ids):
+        self.row = self.torch.from_numpy(self.model.forward(ids)[-1])
+        self.history.extend(ids)
+        return int(self.row.argmax())
+
+    def start_drafted(self, ids, n, cancel=None, stop=(), sampler=None):
+        """reply of ids with MTP drafts: returns the first token; each step() then gives the next accepted token"""
+        self.dstats = {}
+        self.history.clear()                          # (the drafted reply leaves a state the next request rereads)
+        self._gen = self.model.drafted(list(ids), n, k=int(os.environ.get("KINDI_FN_DRAFT_K", "2")), sampler=sampler,
+                                       stop=tuple(stop), cancel=cancel, stats=self.dstats)
+        first = int(next(self._gen))
+        self._dhist = list(ids) + [first]
+        return first
+
+    def end_drafted(self):
+        if self._gen is not None:
+            self._gen.close()
+        self._gen = None
+
+    def step(self, token):
+        if self._gen is not None and int(token) != self._dhist[-1]:
+            h = self._dhist[:-1] + [int(token)]       # the caller writes another token: read the reply plainly
+            self.end_drafted()
+            self.reset()
+            return self.prefill(h)
+        if self._gen is not None:
+            try:
+                t = int(next(self._gen))
+            except StopIteration:
+                return int(token)
+            self._dhist.append(t)
+            return t
+        return self.prefill([token])
+
+    def generate(self, ids, n):
+        self.reset()
+        output = [self.prefill(ids)]
+        while len(output) < n:
+            output.append(self.step(output[-1]))
+        return output
+
+    def drafting_now(self):
+        return self._gen is not None
+
+
 class FlashNextBackend(LightningBackend):
     """The Lightning backend's chat handling with the Flash-Next engine, tokenizer and sampling defaults"""
 
@@ -337,7 +426,9 @@ class FlashNextBackend(LightningBackend):
         self.tok.tokens = self.tok.vocab
         self.stop_ids = {self.tok.eos} | {i for i, t in enumerate(self.tok.types) if t == 3}
         self.im_start = self.tok.sid[_lg.IM_START]
-        self.eng = Engine(self.path, ctx=int(cfg["ctx"]), log=log)
+        self.cpu = os.environ.get("KINDI_DEVICE", "gpu").lower() == "cpu"
+        engine = CPUDecode if self.cpu else Engine
+        self.eng = engine(self.path, ctx=int(cfg["ctx"]), log=log)
         self.cached, self.snap = [], []
         if os.environ.get("KINDI_FN_SELFCHECK", "1") != "0":
             self.selfcheck()
@@ -354,7 +445,7 @@ class FlashNextBackend(LightningBackend):
         # fast mode (the default) drops CPU expert picks at a high router rank, and which experts are on the CPU
         # changes as the card cache fills after the first run: two runs can then differ at a near-tie. The exact
         # path (KINDI_FAST=0) must repeat token for token; fast mode must give two sound runs with the same start.
-        exact = os.environ.get("KINDI_FAST", "1") != "1"
+        exact = self.cpu or os.environ.get("KINDI_FAST", "1") != "1"
         if not (ok(a) and ok(b) and (a == b if exact else a[0] == b[0])):
             raise RuntimeError("Flash-Next self-check failed: %s / %s" % (a, b))
         if a != b:
@@ -379,6 +470,15 @@ class FlashNextBackend(LightningBackend):
         """the kept state holds the last prompt (not its reply): reuse it when ids continues that prompt, or the copy
         at its last assistant header; else read from the start"""
         eng = self.eng
+        if self.cpu:
+            start = len(eng.history)
+            if eng.pos != start or start >= len(ids) or ids[:start] != eng.history:
+                eng.reset()
+                start = 0
+            greedy = eng.prefill(ids[start:])
+            self._prompt = list(ids)
+            self.cached = list(ids)
+            return greedy, start
         prev = getattr(self, "_prompt", [])
         if prev and _lg._lcp(prev, ids) == len(prev) and len(prev) < len(ids) and eng.st is not None \
                 and eng.st["pos"] == len(prev):
@@ -402,16 +502,15 @@ class FlashNextBackend(LightningBackend):
         return greedy, reused
 
     def _read_drafted(self, ids):
-        """a request with drafting on: the drafter reads the whole prompt (no reuse) and gives the reply (greedy; or,
-        for a sampled request, by speculative sampling with the request's sampling and random generator)"""
+        """Read and draft with the MTP head and the request's sampling settings."""
         d = self._draft
         sampler = None
         if d["sampled"]:
             s = self._samp
             sampler = DraftSampler(s["temperature"], s["top_p"], s["top_k"], s["min_p"], s["rp"], s["rlast"], self._rng)
         greedy = self.eng.start_drafted(ids, d["n"], cancel=d["cancel"], stop=sorted(self.stop_ids), sampler=sampler)
-        self._prompt, self.cached, self.snap = [], [], []
-        return greedy, 0
+        self._prompt, self.cached, self.snap = (list(ids) if self.eng.draft_prompt_cache is not None else []), [], []
+        return greedy, self.eng.dstats.get("reused", 0)
 
     def generate(self, K, req, cancel=None):
         # Qwen's sampling defaults for the request's thinking mode (MODEL_SAMPLING of the Lightning backend)
@@ -453,12 +552,20 @@ class FlashNextBackend(LightningBackend):
     def drafting(self):
         """the MTP head is loaded by default; greedy requests draft with it when KINDI_FN_DRAFT=1 and the card can
         (sm_50+, one card, KINDI_QXG_PASS=1)"""
+        if self.cpu:
+            on = bool(self.eng.draft_on)
+            return {"enabled": on, "method": "mtp" if on else None, "drafter": "MTP head" if on else None}
         on = bool(self.eng.draft_on)
         return {"enabled": on, "method": "mtp" if self.eng.gm.mtp else None,
                 "drafter": "MTP head" if self.eng.gm.mtp else None}
 
     def health_extra(self):
         """the card fields (the engine is PyTorch, not CuPy) and the expert numbers"""
+        if self.cpu:
+            out = {"device": "cpu", "experts": {"cards": 0, "hot_experts": 0, "mtp_head": bool(self.eng.model.has_mtp)}}
+            if self.eng.dstats:
+                out["drafting_last"] = dict(self.eng.dstats)
+            return out
         torch = self.eng.torch
         out = {"experts": self.eng.stats(), "device": "gpu"}
         try:

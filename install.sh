@@ -19,7 +19,7 @@
 # password or a key. Copyright (c) 2026 Amir Husain. SPDX-License-Identifier: AGPL-3.0-only.
 set -euo pipefail
 
-KINDI_VERSION="0.7.2"
+KINDI_VERSION="0.8.0"
 # the image tag (kindi:TAG); KINDI_IMAGE_TAG sets another one, so a test install never replaces an image that other
 # containers on the machine use
 IMAGE_TAG="${KINDI_IMAGE_TAG:-$KINDI_VERSION}"
@@ -1261,16 +1261,20 @@ for i in $(seq 0 $((NS - 1))); do
     VX=(); [ -n "$CPUS" ] && VX=(--cpus "$CPUS")
     if $DOCKER run --rm ${VX[@]+"${VX[@]}"} ${BASE[@]+"${BASE[@]}"} ${GARGS[@]+"${GARGS[@]}"} ${ENV[@]+"${ENV[@]}"} -e "KINDI_PACK=/data/pack-$M" -e KINDI_HEAD=exact "$IMAGE" verify > "$VERIFY_OUT" 2>&1; then
       grep -E "PASS|FAIL" "$VERIFY_OUT" | sed 's/^\[[^]]*\] /    /' | sed -n 1,6p
-      sp=$(grep -o '[0-9.]* tokens/s over the run' "$VERIFY_OUT" | awk '{print $1}')
-      if [ "$M" = nanbeige ] || [ "$M" = lightning ]; then ok "server $((i + 1)): agrees with llama.cpp on each prompt, up to a llama.cpp tie (${sp} tokens/s over the check)"
-      elif [ "$M" = nemotron ]; then ok "server $((i + 1)): agrees with llama.cpp on the first 12 tokens or more of each prompt (${sp} tokens/s over the check)"
-      else ok "server $((i + 1)): token-exact with llama.cpp (${sp} tokens/s over the check, prompt tokens included)"; fi
+      # Lightning and some verifier paths report agreement without an aggregate token rate.
+      sp=$(awk 'match($0, /[0-9.]+ tokens\/s over the run/) {print substr($0, RSTART, RLENGTH); exit}' "$VERIFY_OUT")
+      sp=${sp%% *}
+      speed_note=""
+      [ -z "$sp" ] || speed_note=" ($sp tokens/s over the check)"
+      if [ "$M" = nanbeige ] || [ "$M" = lightning ]; then ok "server $((i + 1)): agrees with llama.cpp on each prompt, up to a llama.cpp tie$speed_note"
+      elif [ "$M" = nemotron ]; then ok "server $((i + 1)): agrees with llama.cpp on the first 12 tokens or more of each prompt$speed_note"
+      else ok "server $((i + 1)): token-exact with llama.cpp$speed_note"; fi
     else
       tail -15 "$VERIFY_OUT" | sed 's/^/    /'
       die "kindi verify did not pass for server $((i + 1)) (log: ${VERIFY_OUT}). No server is started."
     fi
   fi
-  SPEED+=("$sp"); SPK[$key]=$sp
+  sp=${sp:-?}; SPEED+=("$sp"); SPK[$key]=$sp
 done
 
 # ------------------------------------------------------------------------------------------------ 7. service

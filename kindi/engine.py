@@ -62,7 +62,7 @@ KERNELS = ("k_g4", "k_g4l", "k_fold_fwht", "k_rmsfold", "k_smfold", "k_l2w", "k_
            "k_attn_sq8t", "k_attn_vq8u", "k_attn_vq8g", "k_xrmsN", "k_attn_vq8w", "k_g5r4", "k_g5r8", "k_attn_sq8d", "k_g5r1", "k_g5r2", "k_g5n4",
            "k_g5r1s", "k_g5r2s", "k_g5r4s", "k_g5r8s",
            "k_g5a1", "k_g5a2", "k_g5a4", "k_g5a8",
-           "k_g5a1s", "k_g5a2s", "k_g5a4s", "k_g5a8s", "k_lora", "k_lora2")
+           "k_g5a1s", "k_g5a2s", "k_g5a4s", "k_g5a8s", "k_lora", "k_lora2", "k_gdn_pro", "k_gdn_epi", "k_att_pro")
 
 
 
@@ -130,6 +130,12 @@ class Engine(object):
         self.NH, self.NHKV, self.HD = self.dims["heads"], self.dims["kv_heads"], self.dims["head_dim"]
         self.NK, self.HK = self.dims["groups"], self.dims["state_size"]
         self.NV = self.dims["gdn_inner"] // self.HK
+        # the fused GDN and attention setup kernels (0.8): on by default (the same tokens and final logits as the separate
+        # kernels; write +4-30% on the GTX 1080, K1200 and RTX 3080, +1-2% on the 780M); KINDI_DENSE_FUSE=0 runs the
+        # separate kernels. The 27B runs on the plan engine (kindi.tp), which has no fused path.
+        fuse = os.environ.get("KINDI_DENSE_FUSE", "1") != "0"
+        self.fuse_gdn = fuse and self.HK == 128 and self.NV % 4 == 0 and self.HB >= 512
+        self.fuse_attn = fuse and self.HD == 256 and self.dims["rope_dim"] == 64
         self.CONV_CH = 2 * self.NK * self.HK + self.NV * self.HK
         self.NATT = self.NL // self.dims["full_attention_interval"]
         if self.NV % self.NK or self.NH != self.NHKV * 4:
@@ -423,17 +429,29 @@ class Engine(object):
         p = "blk.%d." % il
         xn = self.rmsfold(h, p + "attn_norm.weight")
         self.gemv([p + "attn_qkv.weight", p + "attn_gate.weight"], self.xp, [self.qkv, self.zv])
-        self.k.k_gdn_gates((self.NV,), (256,), (xn, self.f32(p + "ssm_beta.weight"), self.f32(p + "ssm_alpha.weight"),
-                                           self.f32(p + "ssm_dt.bias"), self.f32(p + "ssm_a"), self.gb, self.gg,
-                                           np.int32(self.D)))
-        self.k.k_gdn_conv(((self.CONV_CH + 255) // 256,), (256,),
-                          (self.qkv, self.conv[il], self.f32(p + "ssm_conv1d.weight"), self.cs, np.int32(self.CONV_CH)))
-        self.k.k_l2w((4,), (256,), (self.cs, self.qkbuf, np.int32(self.HK), np.int32(2 * self.NK)))
+        if self.fuse_gdn:
+            self.k.k_gdn_pro((self.NK + self.NV,), (256,),
+                             (self.qkv, self.conv[il], self.f32(p + "ssm_conv1d.weight"), self.cs, np.int32(self.CONV_CH),
+                              self.qkbuf, np.int32(self.NK), xn, self.f32(p + "ssm_beta.weight"),
+                              self.f32(p + "ssm_alpha.weight"), self.f32(p + "ssm_dt.bias"), self.f32(p + "ssm_a"),
+                              self.gb, self.gg, np.int32(self.D)))
+        else:
+            self.k.k_gdn_gates((self.NV,), (256,), (xn, self.f32(p + "ssm_beta.weight"), self.f32(p + "ssm_alpha.weight"),
+                                                 self.f32(p + "ssm_dt.bias"), self.f32(p + "ssm_a"), self.gb, self.gg,
+                                                 np.int32(self.D)))
+            self.k.k_gdn_conv(((self.CONV_CH + 255) // 256,), (256,),
+                              (self.qkv, self.conv[il], self.f32(p + "ssm_conv1d.weight"), self.cs, np.int32(self.CONV_CH)))
+            self.k.k_l2w((4,), (256,), (self.cs, self.qkbuf, np.int32(self.HK), np.int32(2 * self.NK)))
         self.k.k_gdn_delta((self.NV,), (self.HK,), (self.M[il], self.qkbuf[:self.NK * self.HK], self.qkbuf[self.NK * self.HK:], self.cs[2 * self.NK * self.HK:],
                                           self.gg, self.gb, self.gout, np.float32(1.0 / np.sqrt(self.HK)), np.int32(self.NK)))
-        outn = self.rms_rows(self.gout, p + "ssm_norm.weight", self.NV, self.HK, self.outgdn)
         grid, hb = self.fold_args(self.NV * self.HK)
-        self.k.k_smfold(grid, (512,), (self.zv, outn, self.sV, self.xp, np.int32(self.HK), np.int32(self.NK), np.int32(self.NV // self.NK), hb))
+        if self.fuse_gdn:
+            self.k.k_gdn_epi(((self.NV * self.HK) // 512,), (512,),
+                             (self.gout, self.f32(p + "ssm_norm.weight"), self.zv, self.sV, self.xp,
+                              np.int32(self.NK), np.int32(self.NV // self.NK), hb))
+        else:
+            outn = self.rms_rows(self.gout, p + "ssm_norm.weight", self.NV, self.HK, self.outgdn)
+            self.k.k_smfold(grid, (512,), (self.zv, outn, self.sV, self.xp, np.int32(self.HK), np.int32(self.NK), np.int32(self.NV // self.NK), hb))
         self.fold_hi(self.xp, self.NV * self.HK)
         npart = self.gemv([p + "ssm_out.weight"], self.xp, [self.y], parts_ok=True)
         self.pending = npart
@@ -444,14 +462,20 @@ class Engine(object):
         self.rmsfold(h, p + "attn_norm.weight")
         self.gemv([p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"], self.xp,
                   [self.qn, self.kro, self.qkvbuf])
-        Kn = self.rms_rows(self.kro, p + "attn_k_norm.weight", self.NHKV, self.HD, self.kn)
-        qc = self.qn.reshape(self.NH, 2 * self.HD)[:, :self.HD].copy()
-        q = self.rms_rows(qc, p + "attn_q_norm.weight", self.NH, self.HD, self.fo)
         cs, sn = self.cos_t[pos], self.sin_t[pos]
-        self.k.k_rope((self.NH,), (256,), (q, cs, sn, self.qr, np.int32(self.HD)))
-        self.k.k_rope((self.NHKV,), (256,), (Kn, cs, sn, self.kro, np.int32(self.HD)))
-        self.Kc[kvi][pos] = self.kro.reshape(self.NHKV, self.HD)
-        self.Vc[kvi][pos] = self.qkvbuf.reshape(self.NHKV, self.HD)
+        if self.fuse_attn:
+            self.k.k_att_pro((self.NH + self.NHKV,), (256,),
+                             (self.qn, self.kro, self.qkvbuf, self.f32(p + "attn_q_norm.weight"),
+                              self.f32(p + "attn_k_norm.weight"), cs, sn, self.qr, self.Kc[kvi][pos],
+                              self.Vc[kvi][pos], np.int32(self.NH)))
+        else:
+            Kn = self.rms_rows(self.kro, p + "attn_k_norm.weight", self.NHKV, self.HD, self.kn)
+            qc = self.qn.reshape(self.NH, 2 * self.HD)[:, :self.HD].copy()
+            q = self.rms_rows(qc, p + "attn_q_norm.weight", self.NH, self.HD, self.fo)
+            self.k.k_rope((self.NH,), (256,), (q, cs, sn, self.qr, np.int32(self.HD)))
+            self.k.k_rope((self.NHKV,), (256,), (Kn, cs, sn, self.kro, np.int32(self.HD)))
+            self.Kc[kvi][pos] = self.kro.reshape(self.NHKV, self.HD)
+            self.Vc[kvi][pos] = self.qkvbuf.reshape(self.NHKV, self.HD)
         n = pos + 1
         nch = (n + 255) // 256
         Kall, Vall = self.Kc[kvi][:n], self.Vc[kvi][:n]

@@ -1524,7 +1524,7 @@ static struct {
     float *gup, *vp, *hpart_big, *vp_h; int8_t* hqp; float* hdp;
     dg_combine_fn combine;
     dg_combine_alt_fn combine_alt;
-    double sp_cpu, sp_gpu, sp_wait; long sp_n, sp_gpairs, sp_pairs;
+    double sp_cpu, sp_gpu, sp_wait; long sp_n, sp_gpairs, sp_pairs, sp_prefetched, sp_streamed, sp_reused;
 } G;
 
 static float* dvec(const float* h, size_t n) {
@@ -2062,7 +2062,7 @@ static double wall(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &t
 #include <pthread.h>
 /* one expert's three matrices (GGUF bytes, back to back) from the page cache into pinned staging k; the copier
    thread does this while the main thread computes experts with the CPU pool */
-typedef struct { int l, n, e[64], j0, pairs; const int* off; cudaEvent_t hot_ev; } CopyJob2;
+typedef struct { int l, n, e[64], slot[64], already_loaded[64], j0, pairs; const int* off; cudaEvent_t hot_ev; } CopyJob2;
 static CopyJob2 CJ2;
 /* the streamed experts, all on st2 from this thread: wait until the staging buffer's previous DMA is done, copy the
    expert from the page cache into it, DMA, re-layout into a VRAM slot, compute its pairs */
@@ -2080,18 +2080,20 @@ static void* copier(void* a) {
     const size_t gb = (size_t)FF * (D / QK) * 17, db = (size_t)D * (FF / QK) * 17;
     const size_t gq = (size_t)FF * (D / QK) * 16, gs = (size_t)FF * (D / QK);
     for (int i = 0; i < CJ2.n; i++) {
-        const int k = i & 1, e = CJ2.e[i], l = CJ2.l, q = i % SPLIT_SLOTS, j = CJ2.j0 + i;
+        const int k = i & 1, e = CJ2.e[i], l = CJ2.l, q = CJ2.slot[i], j = CJ2.j0 + i;
         const int o = CJ2.off[j], n = CJ2.off[j + 1] - o;
-        cudaEventSynchronize(G.raw_ev[k]);           /* recorded by this thread after the DMA of expert i - 2 */
-        memcpy(G.raw_h[k], G.src_g[l] + e * gb, gb);
-        memcpy(G.raw_h[k] + gb, G.src_u[l] + e * gb, gb);
-        memcpy(G.raw_h[k] + 2 * gb, G.src_d[l] + e * db, db);
-        cudaMemcpyAsync(G.raw_d[k], G.raw_h[k], 2 * gb + db, cudaMemcpyHostToDevice, G.st2);
-        cudaEventRecord(G.raw_ev[k], G.st2);
         uint8_t *q0 = G.slot_q[q], *s0 = G.slot_s[q];
-        k_relayout_mx<<<1440, 256, 0, G.st2>>>(G.raw_d[k], FF, D, q0, s0);
-        k_relayout_mx<<<1440, 256, 0, G.st2>>>(G.raw_d[k] + gb, FF, D, q0 + gq, s0 + gs);
-        k_relayout_mx<<<1440, 256, 0, G.st2>>>(G.raw_d[k] + 2 * gb, D, FF, q0 + 2 * gq, s0 + 2 * gs);
+        if (!CJ2.already_loaded[i]) {
+            cudaEventSynchronize(G.raw_ev[k]);       /* the same host buffer is reusable after its last DMA */
+            memcpy(G.raw_h[k], G.src_g[l] + e * gb, gb);
+            memcpy(G.raw_h[k] + gb, G.src_u[l] + e * gb, gb);
+            memcpy(G.raw_h[k] + 2 * gb, G.src_d[l] + e * db, db);
+            cudaMemcpyAsync(G.raw_d[k], G.raw_h[k], 2 * gb + db, cudaMemcpyHostToDevice, G.st2);
+            cudaEventRecord(G.raw_ev[k], G.st2);
+            k_relayout_mx<<<1440, 256, 0, G.st2>>>(G.raw_d[k], FF, D, q0, s0);
+            k_relayout_mx<<<1440, 256, 0, G.st2>>>(G.raw_d[k] + gb, FF, D, q0 + gq, s0 + gs);
+            k_relayout_mx<<<1440, 256, 0, G.st2>>>(G.raw_d[k] + 2 * gb, D, FF, q0 + 2 * gq, s0 + 2 * gs);
+        }
         const dim3 gg((FF / 16 + 3) / 4, (n + MMA_TOK - 1) / MMA_TOK), gd((D / 16 + 3) / 4, (n + MMA_TOK - 1) / MMA_TOK);
         k_mx_mma<<<gg, 128, 0, G.st2>>>(q0, s0, FF, D, G.xq, G.xd, D, G.xrow_d + o, n, G.gup + (size_t)o * 2 * FF, 2 * FF, 0);
         k_mx_mma<<<gg, 128, 0, G.st2>>>(q0 + gq, s0 + gs, FF, D, G.xq, G.xd, D, G.xrow_d + o, n, G.gup + (size_t)o * 2 * FF, 2 * FF, FF);
@@ -2217,7 +2219,7 @@ static int pf_init(void) {
 /* the experts of a prompt chunk, split: the card takes the hot experts, the prefetched experts its tokens use, and
    the nstream most used other experts of this layer (streamed now), the host the rest (moe_forward_parts); the host
    adds all row values in slot order (combine) */
-static int host_experts_split(int l, int T) {
+static int host_experts_split(int l, int T, bool paired_second) {
     pf_init();
     const double t0 = wall();
     const int np_all = T * NS;
@@ -2333,7 +2335,31 @@ static int host_experts_split(int l, int T) {
     /* streamed experts on st2: copier thread fills pinned staging, DMA, re-layout, compute */
     pthread_t cth;
     CJ2.l = l; CJ2.n = nst; CJ2.j0 = nhot_used + npf; CJ2.off = off; CJ2.pairs = 0;
-    for (int i = 0; i < nst; i++) CJ2.e[i] = stream_e[i];
+    // Keep the first chunk's most-used streamed experts until the second chunk. The last slot serves all misses.
+    static const bool reuse_uploads = [] {
+        const char* setting = getenv("KINDI_DSV_PREFILL_REUSE_UPLOADS");
+        return setting && !strcmp(setting, "1");
+    }();
+    const bool keep_uploads = reuse_uploads && (G.pf_hold || paired_second);
+    constexpr int kept = SPLIT_SLOTS - 1;
+    static int retained[kept];
+    if (keep_uploads && G.pf_hold) for (int& e : retained) e = -1;
+    int reused = 0;
+    for (int i = 0; i < nst; i++) {
+        const int e = stream_e[i];
+        int slot = i % SPLIT_SLOTS, loaded = 0;
+        if (keep_uploads) {
+            slot = kept;
+            if (G.pf_hold && i < kept) {
+                retained[i] = e;
+                slot = i;
+            } else if (paired_second) {
+                for (int j = 0; j < kept; j++) if (retained[j] == e) { slot = j; loaded = 1; break; }
+            }
+        }
+        CJ2.e[i] = e; CJ2.slot[i] = slot; CJ2.already_loaded[i] = loaded;
+        reused += loaded;
+    }
     if (pairs && G.d2h_early) {                      /* the D2H goes on st2 after the card's last expert */
         if (nst) {
             if (!CJ2.hot_ev) CK(cudaEventCreateWithFlags(&CJ2.hot_ev, cudaEventDisableTiming));
@@ -2375,15 +2401,17 @@ static int host_experts_split(int l, int T) {
     if (!r) r = G.combine_alt ? G.combine_alt(T, G.hwsel, G.hpart_big, crow, G.vp_h, G.hmo)
                               : G.combine(T, G.hwsel, G.hpart_big, G.hmo);
     G.sp_cpu += t2 - t1; G.sp_wait += t3 - t2; G.sp_gpu += t1 - t0; G.sp_n++; G.sp_gpairs += pairs; G.sp_pairs += np_all;
+    G.sp_prefetched += npf; G.sp_streamed += nst - reused; G.sp_reused += reused;
     if (getenv("KINDI_SPLIT_LOG") && G.sp_n % 40 == 0)
-        fprintf(stderr, "dsv41_gpu split: %ld layer chunks, card pairs %.1f%%, host experts %.1f ms, wait for card %.1f ms, setup %.1f ms per layer chunk (last: %d hot + %d streamed)\n",
-                G.sp_n, 100.0 * G.sp_gpairs / G.sp_pairs, G.sp_cpu * 1e3 / G.sp_n, G.sp_wait * 1e3 / G.sp_n, G.sp_gpu * 1e3 / G.sp_n, nhot_used, nst + npf);
+        fprintf(stderr, "dsv41_gpu split: %ld layer chunks, card pairs %.1f%%, host experts %.1f ms, wait for card %.1f ms, setup %.1f ms per layer chunk (last: %d hot + %d prefetched + %d streamed, totals %ld prefetched + %ld streamed + %ld reused)\n",
+                G.sp_n, 100.0 * G.sp_gpairs / G.sp_pairs, G.sp_cpu * 1e3 / G.sp_n, G.sp_wait * 1e3 / G.sp_n,
+                G.sp_gpu * 1e3 / G.sp_n, nhot_used, npf, nst - reused, G.sp_prefetched, G.sp_streamed, G.sp_reused);
     return r;
 }
 
 /* the host's part of layer l's routed experts: all of them, or the uncached slots when the hot path is on */
-static int host_experts(int l, int T, dg_moe_fn moe) {
-    if (G.split && T > HOTT && G.combine) return host_experts_split(l, T);
+static int host_experts(int l, int T, dg_moe_fn moe, bool paired_second = false) {
+    if (G.split && T > HOTT && G.combine) return host_experts_split(l, T, paired_second);
     if (G.nhot && T <= HOTT) {
         int any = 0;
         for (int i = 0; i < T * NS; i++) { G.hskip[i] = G.hotmap_h[l][G.hsel[i]] >= 0; any |= !G.hskip[i]; G.hhit += G.hskip[i]; }
@@ -2648,13 +2676,14 @@ int dg_forward2(int pos, int T, int flags, const DgIn* inA, const DgIn* inB, dg_
         pc_use(1);
         wait_flag(l);
         G.pf_hold = 1;
-        if (host_experts(l, T, moe)) return -2;
+        const int r = host_experts(l, T, moe);
         G.pf_hold = 0;
+        if (r) return -2;
         if (layer_b(l, T, NULL)) return -3;
         if (l + 1 < NL && layer_a(l + 1, T, pos, flags, oa[0], oa[1], oa[2], oa[3], inA->nlat[l + 1])) return -3;
         pc_use(0);
         wait_flag(l);
-        if (host_experts(l, T, moe)) return -2;
+        if (host_experts(l, T, moe, true)) return -2;
         if (layer_b(l, T, NULL)) return -3;
         if (l + 1 < NL && layer_a(l + 1, T, pos + T, flags, ob[0], ob[1], ob[2], ob[3], inB->nlat[l + 1])) return -3;
     }

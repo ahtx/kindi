@@ -49,6 +49,65 @@ QCHUNK = int(os.environ.get("KINDI_QXG_QCHUNK", "64"))    # queries per attentio
 # gives 256's bits and speed with a quarter of the scores' memory)
 
 
+# Limit each prompt attention GEMM to keys visible to its last query. Different GEMM shapes
+# may change rounding. Keep this opt-in until the matched prompt and token checks pass.
+CAUSAL_PREFILL = os.environ.get("KINDI_QXG_CAUSAL_PREFILL", "0") == "1"
+
+# The 0.8 prompt-read profile of the streamed prefill (one sm_80+ card with the experts page-locked: the RTX 3060
+# replays in docs/dev/bench-0.8.0/MATRIX.md). Model._g_defaults turns it on for those cards (KINDI_QXG_PROFILE=0: off);
+# every variable set in the environment still wins. Scheduling and upload items (the same bits):
+PROFILE_BASE = {"KINDI_QXG_COMPACT_STREAM": "1", "KINDI_QXG_STREAM_UPLOAD": "packed-pipeline", "KINDI_QXG_RING": "64",
+                "KINDI_QXG_PREFETCH_PHASES": "1", "KINDI_MTP_STAGE_PROMPT": "1"}
+# by prompt length and read (plain / drafted with the MTP head); the expert batch is then limited by the free memory
+PROFILE_PLAIN = ({"KINDI_QXG_LM_TOK": "4096", "KINDI_QXG_PREFETCH_PREFIX": "400", "KINDI_QXG_PREFETCH_ORDER": "usage",
+                  "KINDI_QXG_PREFETCH_SLICE": "0"},
+                 {"KINDI_QXG_LM_TOK": "16384", "KINDI_QXG_PREFETCH_PREFIX": "512", "KINDI_QXG_PREFETCH_ORDER": "index",
+                  "KINDI_QXG_PREFETCH_SLICE": "8192", "KINDI_QXG_PREFETCH_COMPUTE_GROUP": "128",
+                  "KINDI_QXG_TENSOR_QSA": "fp16", "KINDI_QXG_DEQ_REUSE": "1"})
+PROFILE_DRAFT = ({"KINDI_QXG_LM_TOK_DRAFT": "4096", "KINDI_QXG_PREFETCH_PREFIX": "320",
+                  "KINDI_QXG_PREFETCH_ORDER": "usage", "KINDI_QXG_PREFETCH_SLICE": "0",
+                  "KINDI_QXG_PREFETCH_COMPUTE_GROUP": "128", "KINDI_QXG_TENSOR_QSA": "fp16"},
+                 {"KINDI_QXG_LM_TOK_DRAFT": "8192", "KINDI_QXG_PREFETCH_PREFIX": "400",
+                  "KINDI_QXG_PREFETCH_ORDER": "index", "KINDI_QXG_PREFETCH_SLICE": "4096",
+                  "KINDI_QXG_PREFETCH_COMPUTE_GROUP": "128", "KINDI_QXG_TENSOR_QSA": "fp16"})
+PROFILE_LONG = 8192          # prompts above this many tokens use the long-prompt profile
+_PROFILE = {}                # the items in force now (empty: the profile is off)
+
+
+def env(key, default=None):
+    """a setting: the environment's value, else the prompt-read profile's, else default"""
+    v = os.environ.get(key)
+    if v is not None:
+        return v
+    return _PROFILE.get(key, default)
+
+
+class _CopyAttributes(ctypes.Structure):
+    # CUDA CUmemcpyAttributes_v1 with two CUmemLocation fields.
+    _fields_ = [("source_order", ctypes.c_int), ("source_location", ctypes.c_int * 2),
+                ("destination_location", ctypes.c_int * 2), ("flags", ctypes.c_uint)]
+
+
+def _submit_weight_copies(cu, stream, origins, destinations, sizes):
+    batch = getattr(cu, "cuMemcpyBatchAsync_v2", None)
+    if batch is not None:
+        p = ctypes.c_void_p
+        batch.argtypes = [p, p, p, ctypes.c_size_t, ctypes.POINTER(_CopyAttributes), p, ctypes.c_size_t, p]
+        batch.restype = ctypes.c_int
+        # CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
+        attr = _CopyAttributes(source_order=1)
+        attr_offset = ctypes.c_size_t(0)
+        rc = batch(destinations.ctypes.data, origins.ctypes.data, sizes.ctypes.data, origins.size,
+                   ctypes.byref(attr), ctypes.byref(attr_offset), 1, stream)
+        if rc != 0:
+            raise RuntimeError(f"cuMemcpyBatchAsync_v2 failed ({rc})")
+        return
+    for d, s, size in zip(destinations.flat, origins.flat, sizes.flat):
+        rc = cu.cuMemcpyHtoDAsync_v2(ctypes.c_uint64(int(d)), ctypes.c_void_p(int(s)), ctypes.c_size_t(int(size)), stream)
+        if rc != 0:
+            raise RuntimeError(f"cuMemcpyHtoDAsync_v2 failed ({rc})")
+
+
 def _fast_config():
     """the fast mode (lossy, ON by default since 11-22, Amir: defaults give speed unless a high quality risk; kbench
     B27 62/65 fast = 62/65 exact): KINDI_FAST=0 is the exact path. KINDI_FAST=1 (default) turns on the items marked (on); each item's own variable
@@ -343,6 +402,9 @@ class Model(object):
         # the seed profile: the given one, else KINDI_QXG_USAGE (a routing trace's OUT.json), else the shipped one
         use = moe.Usage.load(spec, usage or os.environ.get("KINDI_QXG_USAGE")
                              or os.path.join(HERE, "qwen4exp-experts.json"))
+        self._prefetch_priority = {
+            l: np.argsort(-np.asarray(counts, dtype=np.float64), kind="stable") for l, counts in use.counts.items()
+        }
         # the last session's decode set (written by the adaptive cache, kindi/qwen4exp_cache.py save_hot): those
         # experts first, so a fresh start decodes like a warmed-up one (B23: card hits 0.10 -> 0.38 over the first
         # ~100 tokens of a cold start; the first run's decode 14.6-18.3 against 19.9-20.1). Placement only: no bits.
@@ -584,8 +646,20 @@ class Model(object):
         # expert plan), 1, 0
         lm = os.environ.get("KINDI_QXG_LAYER_MAJOR", "auto")
         self.layer_major = (False if not self.stream else "auto") if lm == "auto" else lm == "1"
-        self.log("phase G: down blocks %d, prompt experts on tensor cores %s, streamed %s, prompt chunk %d" % (
-            dn, "on" if self.tcx else "off", "on" if self.stream else "off", self.prompt_chunk))
+        # the 0.8 prompt-read profile (PROFILE_*): on with the stream (KINDI_QXG_PROFILE=0: off). With the fast mode
+        # on (the default) it also takes the fp16 prompt GEMMs, the fused prompt kernels and the causal key prefix
+        # (KINDI_QXG_PGEMM, KINDI_QXG_PFUSE, KINDI_QXG_CAUSAL_PREFILL; they change the prompt's rounding, as TF32 does)
+        global PGEMM, PFUSE, CAUSAL_PREFILL
+        self.profile = bool(self.stream) and os.environ.get("KINDI_QXG_PROFILE", "1") != "0"
+        if self.profile:
+            _PROFILE.update(PROFILE_BASE)
+            if os.environ.get("KINDI_FAST", "1") == "1":
+                PGEMM = os.environ.get("KINDI_QXG_PGEMM", "fp16")
+                PFUSE = os.environ.get("KINDI_QXG_PFUSE", "1") == "1"
+                CAUSAL_PREFILL = os.environ.get("KINDI_QXG_CAUSAL_PREFILL", "1") == "1"
+        self.log("phase G: down blocks %d, prompt experts on tensor cores %s, streamed %s, prompt chunk %d, "
+                 "prompt-read profile %s" % (dn, "on" if self.tcx else "off", "on" if self.stream else "off",
+                                             self.prompt_chunk, "on (%s prompt GEMMs)" % PGEMM if self.profile else "off"))
         self.log(fast_summary())
 
     def _willneed(self):
@@ -677,6 +751,17 @@ class Model(object):
         m = self.ref
         Tl = max(T, int(os.environ.get("KINDI_QXG_LM_TOK", "4096")))
         return (Tl - T) * m.n_used * (Fd * 13 + H * 4) + lmax * (m.hc * H * 4 + 2 * H * 4)
+
+    def _lm_fit(self, lm_tok, pc, floor):
+        """the profile's expert batch, halved until its extra buffers fit the card's free memory now (the elastic
+        tails are released for a prompt read) with 1 GB to spare; never below floor (the batch the plan reserves)"""
+        m, dv = self.ref, self.devices[0]
+        Fd = m.w.t["blk.0.ffn_gate_exps.weight"][2][1]
+        free = torch.cuda.mem_get_info(dv)[0] + torch.cuda.memory_reserved(dv) - torch.cuda.memory_allocated(dv)
+        row = m.n_used * (Fd * 13 + H * 4)
+        while lm_tok > floor and (lm_tok - floor) * row > free - (1 << 30):
+            lm_tok = max(floor, lm_tok // 2 // pc * pc)
+        return lm_tok
 
     def _context_bytes(self, layers, chunk=256):
         """VRAM that grows with the context for these layers: per attention layer the decoder's K/V and indexer
@@ -1015,7 +1100,23 @@ class Model(object):
             if l in st["ik"]:
                 kr = torch.cat([st["ik"][l], kr])
             st["ik"][l] = kr
-        mask = R.qsa_mask(self._index_q(l, x, pos), kr, pos, self.vec[p + "indexer.k_norm.weight"], m.eps, self._rope)
+        if (env("KINDI_QXG_TENSOR_QSA") == "fp16" and kr.shape[0] >= 2 * R.QSA_TOKENS
+                and hd in (128, 256) and nh // nkv <= 16 and torch.cuda.get_device_capability(x.device)[0] >= 8):
+            try:
+                from kindi.qx_prefill_qsa import selected_attention
+            except ModuleNotFoundError as error:
+                if error.name != "triton":
+                    raise
+            else:
+                selected, valid = R.qsa_positions(self._index_q(l, x, pos), kr, pos,
+                                                   self.vec[p + "indexer.k_norm.weight"], m.eps, self._rope)
+                attended = selected_attention(q, k, v, selected, valid)
+                return self.mv(p + "attn_output.weight", attended.reshape(T, -1) * torch.sigmoid(gate))
+        if CAUSAL_PREFILL and kr.shape[0] <= R.QSA_TOKENS:
+            # Every visible key fits. Keep the raw index keys above for future chunks.
+            mask = torch.arange(kr.shape[0], device=x.device)[None, :] <= pos[:, None]
+        else:
+            mask = R.qsa_mask(self._index_q(l, x, pos), kr, pos, self.vec[p + "indexer.k_norm.weight"], m.eps, self._rope)
         # grouped: Q head h reads KV head h // rep, without copying K and V out to every Q head (at 16K positions
         # those copies took about 800 MB)
         rep = nh // nkv
@@ -1025,9 +1126,10 @@ class Model(object):
             return self.mv(p + "attn_output.weight", o * torch.sigmoid(gate))
         outs = []
         for a in range(0, T, QCHUNK):                 # queries in sub-chunks: the scores stay QCHUNK x keys
-            s = torch.einsum("tgrd,sgd->grts", qg[a:a + QCHUNK], k) / math.sqrt(hd)
-            s = s.masked_fill(~mask[None, None, a:a + QCHUNK], float("-inf"))
-            outs.append(torch.einsum("grts,sgd->tgrd", torch.softmax(s, -1), v))
+            end = min(k.shape[0], p0 + a + QCHUNK) if CAUSAL_PREFILL else k.shape[0]
+            s = torch.einsum("tgrd,sgd->grts", qg[a:a + QCHUNK], k[:end]) / math.sqrt(hd)
+            s = s.masked_fill(~mask[None, None, a:a + QCHUNK, :end], float("-inf"))
+            outs.append(torch.einsum("grts,sgd->tgrd", torch.softmax(s, -1), v[:end]))
         o = torch.cat(outs).reshape(T, -1)
         return self.mv(p + "attn_output.weight", o * torch.sigmoid(gate))
 
@@ -1041,18 +1143,20 @@ class Model(object):
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
         try:
             outs = []
+            p0 = k.shape[0] - qg.shape[0]
             for a in range(0, qg.shape[0], QCHUNK):
-                mk = mask[a:a + QCHUNK]
+                end = min(k.shape[0], p0 + a + QCHUNK) if CAUSAL_PREFILL else k.shape[0]
+                mk = mask[a:a + QCHUNK, :end]
                 qq = qg[a:a + QCHUNK] / math.sqrt(hd)
                 if fa == "fp16":
-                    s = torch.einsum("tgrd,sgd->grts", qq.half(), k.half()).float()
+                    s = torch.einsum("tgrd,sgd->grts", qq.half(), k[:end].half()).float()
                 else:
-                    s = torch.einsum("tgrd,sgd->grts", qq, k)
+                    s = torch.einsum("tgrd,sgd->grts", qq, k[:end])
                 pr = torch.softmax(s.masked_fill(~mk[None, None], float("-inf")), -1)
                 if fa == "fp16":
-                    outs.append(torch.einsum("grts,sgd->tgrd", pr.half(), v.half()).float())
+                    outs.append(torch.einsum("grts,sgd->tgrd", pr.half(), v[:end].half()).float())
                 else:
-                    outs.append(torch.einsum("grts,sgd->tgrd", pr, v))
+                    outs.append(torch.einsum("grts,sgd->tgrd", pr, v[:end]))
             return torch.cat(outs)
         finally:
             torch.backends.cuda.matmul.allow_tf32 = prev
@@ -1095,6 +1199,71 @@ class Model(object):
                 return None
         return cc
 
+    def _prefetch_expert_prefix(self, l, tokens, limit):
+        self._prefetched = None
+        cc = self._stream_ok(l, tokens)
+        if cc is None:
+            return
+        missing = self.slot[l] < 0
+        priority = self._prefetch_priority.get(l)
+        if env("KINDI_QXG_PREFETCH_ORDER") == "usage" and priority is not None:
+            cold = np.sort(priority[missing[priority]][:limit])
+        else:
+            cold = np.flatnonzero(missing)[:limit]
+        if not cold.size:
+            return
+        source = cc.src[l]
+        widths = np.array([width for _, _, width in source], np.uintp)
+        total = int(widths.sum()) * cold.size
+        dv = self.devices[0]
+        bank = getattr(self, "_prefetch_bank", None)
+        new_bank = bank is None or bank.numel() < total
+        if new_bank:
+            available = torch.cuda.mem_get_info(dv)[0] + torch.cuda.memory_reserved(dv) - torch.cuda.memory_allocated(dv)
+            if available < total + (384 << 20):
+                return
+            try:
+                bank = torch.empty(total, dtype=torch.uint8, device=dv)
+            except torch.OutOfMemoryError:
+                return
+            self._prefetch_bank = bank
+        side = getattr(self, "_ring_stream", None)
+        if side is None:
+            side = self._ring_stream = torch.cuda.Stream(dv)
+        if new_bank:
+            # The main stream may still use the caching allocator's previous occupant.
+            side.wait_stream(torch.cuda.current_stream(dv))
+        reusable = getattr(self, "_prefetch_reusable", None)
+        if reusable is not None:
+            side.wait_event(reusable)
+        hosts = np.array([np.frombuffer(mm, np.uint8).ctypes.data + base for mm, base, _ in source], np.uintp)
+        planes = cold.size * np.array([0, widths[0], widths[0] + widths[1]], np.uintp)
+        entries = np.uintp(bank.data_ptr()) + np.arange(cold.size, dtype=np.uintp)[:, None] * widths + planes
+        starts = np.concatenate(([0], np.flatnonzero(np.diff(cold) != 1) + 1))
+        lengths = np.diff(np.append(starts, cold.size)).astype(np.uintp)
+        origins = hosts + cold[starts, None].astype(np.uintp) * widths
+        sizes = lengths[:, None] * widths
+        destinations = entries[starts]
+        cu, copy_stream = lib().cu, ctypes.c_void_p(side.cuda_stream)
+        early = None
+        if env("KINDI_QXG_PREFETCH_PHASES") == "1":
+            _submit_weight_copies(cu, copy_stream, np.ascontiguousarray(origins[:, :2]),
+                                  np.ascontiguousarray(destinations[:, :2]), np.ascontiguousarray(sizes[:, :2]))
+            early = torch.cuda.Event()
+            early.record(side)
+            origins, destinations, sizes = (np.ascontiguousarray(a[:, 2:3]) for a in (origins, destinations, sizes))
+        _submit_weight_copies(cu, copy_stream, origins, destinations, sizes)
+        bank.record_stream(side)
+        ready = torch.cuda.Event()
+        ready.record(side)
+        slots = np.full(self.ref.n_exp, -1, np.int32)
+        slots[cold] = np.arange(cold.size)
+        self._prefetched = l, slots, entries, early if early is not None else ready, ready if early is not None else None
+        self._prefetch_reusable = ready      # no consumer is also a valid reuse case
+        self.times["stream_bytes"] = self.times.get("stream_bytes", 0) + total
+        self.times["stream_copies"] = self.times.get("stream_copies", 0) + len(starts) * len(widths)
+        self.times["prefetch_experts"] = self.times.get("prefetch_experts", 0) + cold.size
+
     def _experts_stream(self, l, cc, x, idx_h, parts):
         """every pick of the chunk on the card (see _stream_ok): experts grouped as in experts(); the cached ones in
         one pass; the others in batches of KINDI_QXG_RING / 2 experts, each batch's copies (a side stream, direct
@@ -1106,11 +1275,20 @@ class Model(object):
         dty = m.w.t["blk.%d.ffn_down_exps.weight" % l][3]
         dv = x.device
         flat = idx_h.reshape(-1)
+        coalesce = env("KINDI_QXG_STREAM_UPLOAD") == "packed-pipeline"
         uq, fi = np.unique(flat, return_index=True)
         cached = self.slot[l][uq] >= 0
-        # cached experts first (first-use order), then the streamed ones (first-use order)
-        order = np.concatenate([uq[cached][np.argsort(fi[cached])], uq[~cached][np.argsort(fi[~cached])]])
+        prefetched = getattr(self, "_prefetched", None)
+        ahead = prefetched[1][uq] >= 0 if prefetched is not None and prefetched[0] == l else np.zeros_like(cached)
+        ahead &= ~cached
+        # Keep cached experts in first-use order. Sort cold experts by index for contiguous copies.
+        absent = ~(cached | ahead)
+        misses = uq[absent] if coalesce else uq[absent][np.argsort(fi[absent])]
+        order = np.concatenate([uq[cached][np.argsort(fi[cached])], uq[ahead], misses])
         n_hot = int(cached.sum())
+        n_ready = n_hot + int(ahead.sum())
+        ready_group = max(1, int(env("KINDI_QXG_PREFETCH_COMPUTE_GROUP", str(n_ready - n_hot))))
+        ready_ranges = [(u, min(u + ready_group, n_ready)) for u in range(n_hot, n_ready, ready_group)]
         umap = np.full(m.n_exp, -1, np.int64)
         umap[order] = np.arange(len(order))
         u_of = umap[flat]
@@ -1121,7 +1299,7 @@ class Model(object):
         src = cc.src[l]                                      # (mm, base, bytes per expert) of gate, up, down
         nbs = [nb for _, _, nb in src]
         rowb = sum(nbs)
-        R = max(2, int(os.environ.get("KINDI_QXG_RING", "32")) // 2 * 2)
+        R = max(2, int(env("KINDI_QXG_RING", "32")) // 2 * 2)
         ring = getattr(self, "_ring", None)
         if ring is None or ring.shape[0] < R or ring.device != dv:   # rows of the largest expert of any layer
             wmax = max(sum(nb for _, _, nb in parts_) for parts_ in cc.src.values())
@@ -1131,79 +1309,154 @@ class Model(object):
         for u, e in enumerate(order[:n_hot]):
             a = buf.data_ptr() + int(self.slot[l][e]) * buf.shape[1]
             mats[3 * u], mats[3 * u + 1], mats[3 * u + 2] = a, a + nbs[0], a + nbs[0] + nbs[1]
+        if n_ready > n_hot:
+            mats.reshape(-1, 3)[n_hot:n_ready] = prefetched[2][prefetched[1][uq[ahead]]]
         half = R // 2
-        for i, e in enumerate(order[n_hot:]):                # streamed expert i -> ring row (i % R)
-            a = ring.data_ptr() + (i % R) * ring.shape[1]
-            u = n_hot + i
-            mats[3 * u], mats[3 * u + 1], mats[3 * u + 2] = a, a + nbs[0], a + nbs[0] + nbs[1]
+        compact = env("KINDI_QXG_COMPACT_STREAM") == "1"
+        if coalesce:
+            widths = np.array(nbs, dtype=np.uintp)
+            planes = R * np.array([0, nbs[0], nbs[0] + nbs[1]], dtype=np.uintp)
+            rows = np.arange(len(misses), dtype=np.uintp) % R
+            destinations = np.uintp(ring.data_ptr()) + rows[:, None] * widths + planes
+            mats.reshape(-1, 3)[n_ready:] = destinations
+        else:
+            for i in range(len(misses)):
+                a = ring.data_ptr() + (i % R) * ring.shape[1]
+                u = n_ready + i
+                mats[3 * u], mats[3 * u + 1], mats[3 * u + 2] = a, a + nbs[0], a + nbs[0] + nbs[1]
         xt = None
+        group_start = {}
+        npair = int(pstart[-1])
+        if compact:
+            # One group consumes its scratch before the next group reuses it on the compute stream.
+            groups = [(0, n_hot)] if n_hot else []
+            groups += ready_ranges
+            groups += [(n_ready + b, n_ready + min(b + half, len(misses))) for b in range(0, len(misses), half)]
+            boundaries = []
+            offset = 0
+            for u0, u1 in groups:
+                p0, p1 = int(pstart[u0]), int(pstart[u1])
+                boundaries.append(pstart[u0:u1 + 1] - p0)
+                group_start[u0] = offset
+                offset += u1 - u0 + 1
+            npair = max(int(pstart[u1] - pstart[u0]) for u0, u1 in groups)
+            packed_start = np.concatenate(boundaries)
+        else:
+            packed_start = pstart
         if L.XTILE:                                          # the tiled expert GEMM's tile list
             tl, tstart = xtiles(pstart, L.XT_BN)
-            mats_d, pstart_d, ptok_d, pslot_d, tl_d = _upload(dv, mats, pstart, ptok, pslot, tl)
+            if compact:
+                for u0, u1 in groups:
+                    tiles = tl[tstart[u0]:tstart[u1]]
+                    tiles[:, 0] -= u0
+                    tiles[:, 1:3] -= pstart[u0]
+            mats_d, pstart_d, ptok_d, pslot_d, tl_d = _upload(dv, mats, packed_start, ptok, pslot, tl)
             xt = (tl_d, tstart)
         else:
-            mats_d, pstart_d, ptok_d, pslot_d = _upload(dv, mats, pstart, ptok, pslot)
+            mats_d, pstart_d, ptok_d, pslot_d = _upload(dv, mats, packed_start, ptok, pslot)
         xc = x.contiguous()
-        npair = int(pstart[-1])
         xq = torch.empty((T, K), dtype=torch.int8, device=dv)
         xd = torch.empty((T, K // 256), dtype=torch.float32, device=dv)
         gg = torch.empty((npair, Fd), dtype=torch.float32, device=dv)
         vv = torch.empty((npair, Fd), dtype=torch.float32, device=dv)
-        h = torch.empty((npair, Fd), dtype=torch.float32, device=dv)
+        h = gg if compact else torch.empty((npair, Fd), dtype=torch.float32, device=dv)
         hq = torch.empty((npair, Fd), dtype=torch.int8, device=dv)
         hd = torch.empty((npair, Fd // L.DN), dtype=torch.float32, device=dv)
         main = torch.cuda.current_stream(dv)
         d_, st = _st(xc)
         L.quant256(d_, st, _p(xc), T * K, _p(xq), _p(xd))
 
-        def run(u0, u1):                                     # experts u0 .. u1 - 1 (their pairs are contiguous)
+        def run(u0, u1, down_ready=None):                    # experts u0 .. u1 - 1 (their pairs are contiguous)
             if u1 <= u0:
                 return
             p0, p1 = int(pstart[u0]), int(pstart[u1])
-            md, pd = mats_d[3 * u0:], pstart_d[u0:]
+            count = (p1 - p0) * Fd
+            md, pd = mats_d, pstart_d
+            tk, sk, tiles = ptok_d, pslot_d, xt
+            lo, hi = u0, u1
+            gp, vp, hp, hqp, hdp = gg[p0:], vv[p0:], h[p0:], hq[p0:], hd[p0:]
+            if compact:
+                md, pd = mats_d[3 * u0:], pstart_d[group_start[u0]:]
+                tk, sk = ptok_d[p0:], pslot_d[p0:]
+                if xt is not None:
+                    first_tile = int(xt[1][u0])
+                    tiles = (xt[0][first_tile:], xt[1][u0:u1 + 1] - first_tile)
+                lo, hi = 0, u1 - u0
+                gp, vp, hp, hqp, hdp = gg, vv, h, hq, hd
             for part, o in ((0, gg), (1, vv)):
-                _xmm(L, d_, st, gty, K, Fd, 256, part, mats_d, pstart_d, ptok_d, pslot_d, n, 0, _p(xq), _p(xd), _p(o),
-                     Fd, xt, u0, u1)
-            L.silu_mul(d_, st, _p(gg[p0:]), _p(vv[p0:]), _p(h[p0:]), (p1 - p0) * Fd)
-            L.quant_dn(d_, st, _p(h[p0:]), (p1 - p0) * Fd, _p(hq[p0:]), _p(hd[p0:]))
+                _xmm(L, d_, st, gty, K, Fd, 256, part, md, pd, tk, sk, n, 0, _p(xq), _p(xd), _p(o),
+                     Fd, tiles, lo, hi)
+            L.silu_mul(d_, st, _p(gp), _p(vp), _p(hp), count)
+            L.quant_dn(d_, st, _p(hp), count, _p(hqp), _p(hdp))
+            if down_ready is not None:
+                main.wait_event(down_ready)
             if L.DN == 64:
-                _xmm(L, d_, st, dty, Fd, K, 64, 2, mats_d, pstart_d, ptok_d, pslot_d, n, 1, _p(hq), _p(hd), _p(parts),
-                     K, xt, u0, u1)
+                _xmm(L, d_, st, dty, Fd, K, 64, 2, md, pd, tk, sk, n, 1, _p(hq), _p(hd), _p(parts),
+                     K, tiles, lo, hi)
             else:
-                L.down(d_, st, dty, K, Fd, n, u1 - u0, _p(md), _p(pd), _p(ptok_d), _p(pslot_d), _p(hq), _p(hd),
+                L.down(d_, st, dty, K, Fd, n, hi - lo, _p(md[3 * lo:]), _p(pd[lo:]), _p(tk), _p(sk), _p(hq), _p(hd),
                        _p(parts))
 
-        run(0, n_hot)
         side = getattr(self, "_ring_stream", None)
         if side is None:
             side = self._ring_stream = torch.cuda.Stream(dv)
+        side.wait_stream(main)                               # the ring's last users (the previous layer) come first
+        run(0, n_hot)
+        if n_ready > n_hot:
+            main.wait_event(prefetched[3])
+            for start, end in ready_ranges:
+                run(start, end, prefetched[4])
+            self._prefetch_reusable = torch.cuda.Event()
+            self._prefetch_reusable.record(main)
+            self.times["prefetch_hits"] = self.times.get("prefetch_hits", 0) + n_ready - n_hot
         cu, ss = L.cu, ctypes.c_void_p(side.cuda_stream)
         hosts = [(np.frombuffer(mm, np.uint8).ctypes.data + base, nb) for mm, base, nb in src]
-        side.wait_stream(main)                               # the ring's last users (the previous layer) come first
-        streamed = order[n_hot:]
+        if coalesce:
+            sources = np.array([a for a, _ in hosts], dtype=np.uintp) + misses.astype(np.uintp)[:, None] * widths
+
+            def upload(starts, lengths, columns):
+                origin = np.ascontiguousarray(sources[starts, columns])
+                dest = np.ascontiguousarray(destinations[starts, columns])
+                sizes = np.ascontiguousarray(lengths[:, None] * widths[columns])
+                _submit_weight_copies(cu, ss, origin, dest, sizes)
+
         done = [None, None]                                  # per ring half: the event after its last compute
-        t_copy = 0
-        for b0 in range(0, len(streamed), half):
+        copy_ops = 0
+        for b0 in range(0, len(misses), half):
             hf = (b0 // half) % 2
             if done[hf] is not None:
                 side.wait_event(done[hf])                    # that half's previous batch has been computed
-            for i in range(b0, min(b0 + half, len(streamed))):
-                e = int(streamed[i])
-                dst = ring.data_ptr() + (i % R) * ring.shape[1]
-                for a, nb in hosts:
-                    cu.cuMemcpyHtoDAsync_v2(ctypes.c_uint64(dst), ctypes.c_void_p(a + e * nb), ctypes.c_size_t(nb), ss)
-                    dst += nb
-                    t_copy += nb
+            end = min(b0 + half, len(misses))
+            if coalesce:
+                # Both index order and ring layout are contiguous within each run.
+                starts = np.concatenate(([b0], np.flatnonzero(np.diff(misses[b0:end]) != 1) + b0 + 1))
+                lengths = np.diff(np.append(starts, end)).astype(np.uintp)
+                upload(starts, lengths, slice(0, 2))
+                copy_ops += len(starts) * len(hosts)
+            else:
+                for i in range(b0, end):
+                    e = int(misses[i])
+                    dst = ring.data_ptr() + (i % R) * ring.shape[1]
+                    for a, nb in hosts:
+                        cu.cuMemcpyHtoDAsync_v2(ctypes.c_uint64(dst), ctypes.c_void_p(a + e * nb), ctypes.c_size_t(nb), ss)
+                        dst += nb
+                copy_ops += (end - b0) * len(hosts)
             landed = torch.cuda.Event()
             landed.record(side)
+            down_ready = None
+            if coalesce:
+                upload(starts, lengths, slice(2, 3))
+                down_ready = torch.cuda.Event()
+                down_ready.record(side)
             main.wait_event(landed)
-            run(n_hot + b0, n_hot + min(b0 + half, len(streamed)))
+            run(n_ready + b0, n_ready + end, down_ready)
             done[hf] = torch.cuda.Event()
             done[hf].record(main)
-        self.times["stream_bytes"] = self.times.get("stream_bytes", 0) + t_copy
-        self.times["stream_experts"] = self.times.get("stream_experts", 0) + len(streamed)
+        self.times["stream_bytes"] = self.times.get("stream_bytes", 0) + len(misses) * rowb
+        self.times["stream_experts"] = self.times.get("stream_experts", 0) + len(misses)
+        self.times["stream_copies"] = self.times.get("stream_copies", 0) + copy_ops
 
-    def experts(self, l, x, idx, top):
+    def experts(self, l, x, idx, top, idx_h=None):
         """the routed experts: the card's hot experts here, the others on the CPU, combined in slot order"""
         m = self.ref
         T, n = idx.shape
@@ -1211,7 +1464,7 @@ class Model(object):
         if cc is not None:                                   # phase G: every pick on the card
             K = H
             parts = torch.empty((T, n, K), dtype=torch.float32, device=x.device)
-            self._experts_stream(l, cc, x, idx.int().cpu().numpy(), parts)
+            self._experts_stream(l, cc, x, idx.int().cpu().numpy() if idx_h is None else idx_h, parts)
             out = torch.empty((T, K), dtype=torch.float32, device=x.device)
             w = top.float().contiguous()
             lib().combine(*_st(out), T, n, K, _p(w), _p(parts), _p(out))
@@ -1355,28 +1608,49 @@ class Model(object):
         lib().deq(d_, st, ty, _p(raw), len(ids), ne[0], rb, _p(out))
         return out
 
-    def ext_off(self):
+    def ext_off(self, keep_windows=None):
         """the elastic tails' memory back to the driver (a long prompt read is next), and the drafter's window
         buffers and graphs with it (KINDI_QXG_WIN_FREE, 1): the plan gives the layer-major prompt and the drafter's
         windows the same reserve, so they must not be held at once (B51, 3060: the second drafted long prompt read
-        with the windows still allocated, 4K 360 / 16K 319 against 400 / 351 plain, peak 11.54 GB). The windows are
-        captured again before the next drafted decode (GraphDrafter.generate, or the first window call)."""
+        with the windows still allocated, 4K 360 / 16K 319 against 400 / 351 plain, peak 11.54 GB). Staged short
+        reads can keep warm graphs when there is enough room. Freed windows are captured before the next decode."""
         dec = getattr(self, "_dec", None)
         for cc in set(self.cache_of.values()):
             cc.ext_off(dec)
-        if dec is not None and os.environ.get("KINDI_QXG_WIN_FREE", "1") == "1":
+        if keep_windows is None:
+            keep_windows = os.environ.get("KINDI_QXG_WIN_FREE", "1") != "1"
+        if dec is not None and not keep_windows:
             dec.free_windows()
 
-    def logits(self, ids, last_n=None, state=None, tap=None):
+    def logits(self, ids, last_n=None, state=None, tap=None, draft_prefill_retry=False):
         m = self.ref
         ids = list(ids)
         if len(ids) > int(os.environ.get("KINDI_QXG_EXT_PROMPT", "256")):
-            self.ext_off()
+            keep_windows = False if draft_prefill_retry else None
+            if (not draft_prefill_retry and tap is not None and state is not None and state["pos"] + len(ids) <= 4096
+                    and env("KINDI_MTP_STAGE_PROMPT") == "1" and "KINDI_QXG_WIN_FREE" not in os.environ
+                    and getattr(getattr(self, "_dec", None), "_wins", None)):
+                dv = self.devices[0]
+                free, _ = torch.cuda.mem_get_info(dv)
+                keep_windows = free + torch.cuda.memory_reserved(dv) - torch.cuda.memory_allocated(dv) >= (2 << 30)
+            self.ext_off(keep_windows)
         st = state
         pc = getattr(self, "prompt_chunk", 0)
         if st is not None and pc and len(ids) > pc and last_n and last_n <= pc and getattr(self, "layer_major", False) \
                 and len(self.devices) == 1:
-            return self._logits_lm(ids, last_n, st, pc, tap)
+            if getattr(self, "profile", False):
+                _PROFILE.update((PROFILE_DRAFT if tap is not None else PROFILE_PLAIN)[
+                    int(st["pos"] + len(ids) > PROFILE_LONG)])
+            try:
+                return self._logits_lm(ids, last_n, st, pc, tap, draft_prefill_retry)
+            finally:
+                if getattr(self, "profile", False):
+                    _PROFILE.clear()
+                    _PROFILE.update(PROFILE_BASE)
+                self._dq = None
+                self._prefetched = None
+                self._prefetch_bank = None
+                self._prefetch_reusable = None
         if st is not None and tap is None and pc and len(ids) > pc and last_n and last_n <= pc:
             # a long prompt in the engine's chunks (the memory plan reserves one chunk's buffers), whatever the caller
             # passes; the state carries over, the last chunk's rows are returned
@@ -1400,7 +1674,7 @@ class Model(object):
             st["ids"] = np.asarray((prev + ids)[-ctx:], np.int64)
         return out
 
-    def _logits_lm(self, ids, last_n, st, pc, tap=None):
+    def _logits_lm(self, ids, last_n, st, pc, tap=None, draft_prefill_retry=False):
         """the prompt layer by layer (KINDI_QXG_LAYER_MAJOR, phase G): for each layer every chunk of pc tokens runs its
         mixers, attention or Gated DeltaNet, router and shared expert exactly as logits() would chunk by chunk (the
         same shapes, the state as it would be at that chunk), then the routed experts of up to KINDI_QXG_LM_TOK
@@ -1420,13 +1694,23 @@ class Model(object):
         # so its expert batch is smaller (KINDI_QXG_LM_TOK_DRAFT, 3072): B66 (3060) drafted 16K read peaked at 11.20
         # GB with 4096 against the 11.07 cap (B67: 2048 gave 10.60 GB, reads 433 / 389). A pick's row does not depend
         # on its batch: the same bits. Plain reads keep KINDI_QXG_LM_TOK (4096).
-        lm_tok = int(os.environ.get("KINDI_QXG_LM_TOK_DRAFT" if tap is not None else "KINDI_QXG_LM_TOK",
-                                    "3072" if tap is not None else "4096"))
+        key = "KINDI_QXG_LM_TOK_DRAFT" if tap is not None else "KINDI_QXG_LM_TOK"
+        lm_tok = int(env(key, "3072" if tap is not None else "4096"))
+        if draft_prefill_retry:
+            lm_tok = min(lm_tok, 3072)
         lm_tok = max(pc, lm_tok // pc * pc)
+        if key not in os.environ and key in _PROFILE and not draft_prefill_retry:
+            lm_tok = self._lm_fit(lm_tok, pc, 3072 if tap is not None else 4096)
         per = max(1, lm_tok // pc)                       # chunks per experts call
         with torch.no_grad(), torch.cuda.device(dv):
             hs = [self.emb_rows(c, dv).repeat(1, m.hc) for c, _, _ in chunks]
-            reuse = os.environ.get("KINDI_QXG_DEQ_REUSE", "auto")
+            reuse = env("KINDI_QXG_DEQ_REUSE", "auto")
+            prefetch = 0 if draft_prefill_retry else max(0, int(env("KINDI_QXG_PREFETCH_PREFIX", "0")))
+            min_stage = 4096
+            if tap is not None and env("KINDI_MTP_STAGE_PROMPT") == "1":
+                min_stage = max(1024, min(4096, lm_tok))
+            route_slice = int(env("KINDI_QXG_PREFETCH_SLICE", "0"))
+            slice_chunks = min(per, max(1, route_slice // pc)) if prefetch and route_slice > 0 else per
             for l in range(self.L):
                 p = "blk.%d." % l
                 # KINDI_QXG_DEQ_REUSE (auto: when the card has the room): the layer's dense matrices dequantized once
@@ -1438,6 +1722,10 @@ class Model(object):
                     if reuse == "1" or torch.cuda.mem_get_info(dv)[0] >= need + (1 << 30):
                         self._dq = {}
                 for b0 in range(0, len(chunks), per):
+                    if prefetch:
+                        tokens = sum(len(c) for c, _, _ in chunks[b0:b0 + per])
+                        if tokens >= min_stage:
+                            self._prefetch_expert_prefix(l, tokens, prefetch)
                     part = []
                     for ci in range(b0, min(b0 + per, len(chunks))):
                         c, p0, ctx_ids = chunks[ci]
@@ -1458,14 +1746,25 @@ class Model(object):
                                      self.mv(p + "ffn_up_shexp.weight", x))
                         sg = torch.sigmoid(x @ self.vec[p + "ffn_gate_inp_shexp.weight"])
                         part.append((ci, x, idx, top, sh, sg, hin, wr))
-                    out, _ = self.experts(l, torch.cat([q[1] for q in part]), torch.cat([q[2] for q in part]),
-                                          torch.cat([q[3] for q in part]))
-                    a = 0
-                    for ci, x, idx, top, sh, sg, hin, wr in part:
-                        T = x.shape[0]
-                        hs[ci] = self.write(hin, out[a:a + T] + sg[:, None] * sh, wr)
-                        a += T
-                    del part, out
+                    if b0 + per >= len(chunks):
+                        self._dq = None
+                    step = slice_chunks if getattr(self, "_prefetched", None) is not None else per
+                    routing = torch.cat([q[2] for q in part]).int().cpu().numpy() if step < len(part) else None
+                    for group in range(0, len(part), step):
+                        work = part[group:group + step]
+                        idx = torch.cat([q[2] for q in work])
+                        picks = None if routing is None else routing[group * pc:group * pc + idx.shape[0]]
+                        route_args = {"idx_h": picks} if picks is not None else {}
+                        out, _ = self.experts(l, torch.cat([q[1] for q in work]), idx,
+                                              torch.cat([q[3] for q in work]), **route_args)
+                        a = 0
+                        for ci, x, idx, top, sh, sg, hin, wr in work:
+                            T = x.shape[0]
+                            hs[ci] = self.write(hin, out[a:a + T] + sg[:, None] * sh, wr)
+                            a += T
+                        del out, _, work
+                    del part
+                    self._prefetched = None
             self._dq = None
             if tap is not None:
                 for h in hs:

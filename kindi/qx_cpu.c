@@ -1190,6 +1190,9 @@ void* qx_ma_ctx_new(int nl, int E, int nsel, const int* handle, const unsigned c
     c->skip = malloc(64 * (size_t)nsel);
     return c;
 }
+int fc_has_layer(int l);
+int fc_fits(int T, int nsel);
+int fc_forward_parts(int l, int T, const float* x, int nsel, const int* ids, const uint8_t* skip, float* rows);
 int qx_ma_fn(void* ctx, int l, int T, const int* ids, const void* in, void* rows) {
     qx_ma_ctx* c = ctx;
     if (l < 0 || l >= c->nl || T > 64) return -1;
@@ -1218,6 +1221,8 @@ int qx_ma_fn(void* ctx, int l, int T, const int* ids, const void* in, void* rows
     }
     c->st[0] += T * c->nsel; c->st[1] += hits; c->st[2] += fp; c->st[3] += nt;
     if (!any) return 0;
+    if (fc_has_layer(l) && fc_fits(T, c->nsel))   /* KINDI_FN_FCPU=1: fncpu.c's repacked experts (0.8 C1) */
+        return fc_forward_parts(l, T, (const float*)in, c->nsel, ids, c->skip, (float*)rows) < 0 ? -1 : 0;
     return qx_forward_parts(c->handle[l], T, (const float*)in, c->nsel, ids, c->skip, (float*)rows) < 0 ? -1 : 0;
 }
 void* qx_ma_fn_ptr(void) { return (void*)qx_ma_fn; }

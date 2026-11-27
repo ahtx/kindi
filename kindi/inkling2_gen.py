@@ -225,8 +225,12 @@ class InklingBackend(object):
         eng.prefill(ids[:-1], 0)
         snap = eng.snapshot()
         a = reply(eng.step(ids[-1]))
-        for _ in range(200):                               # more than the 128 spare slots of a window ring
-            eng.step(a[-1])
+        spare = getattr(eng, "maxb", 128)                  # the spare slots of a window ring
+        if spare + 72 <= 200:
+            for _ in range(200):                           # more than the spare slots
+                eng.step(a[-1])
+        else:
+            eng.prefill([a[-1]] * (spare + 72))            # the same, read as one prompt (512 spare on AArch64)
         eng.restore(snap)
         b = reply(eng.step(ids[-1]))
         eng.reset()

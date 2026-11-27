@@ -274,6 +274,25 @@ class Cancelled(Exception):
     """raised by Model.forward between prompt chunks when Model.cancel() returns True"""
 
 
+def _nucleus_prefix(q, top_p, top_k_mask):
+    """Select the same stable nucleus prefix using a small candidate sort when it covers the requested mass."""
+    if q.size > 256:
+        if top_k_mask is None:
+            threshold = np.partition(q, -256)[-256]
+            cand = np.flatnonzero(q >= threshold)
+        else:
+            cand = np.flatnonzero(top_k_mask)
+        # Include ties at the cutoff. Candidate indices start in token order, as in the full stable sort.
+        if 0 < 2 * cand.size <= q.size:
+            order = cand[np.argsort(-q[cand], kind="stable")]
+            c = np.cumsum(q[order])
+            if c[-1] >= top_p:
+                return order[:int(np.searchsorted(c, top_p, side="left")) + 1]
+    order = np.argsort(-q, kind="stable")
+    c = np.cumsum(q[order])
+    return order[:int(np.searchsorted(c, top_p, side="left")) + 1]
+
+
 def distribution(logits, temperature=1.0, top_p=1.0, top_k=0, min_p=0.0):
     """the sampling distribution of the DeepSeek server (plain sampled decode and speculative sampling use this one
     function, so both give the same distribution): temperature, then top-k, then top-p (nucleus), then min-p
@@ -285,18 +304,24 @@ def distribution(logits, temperature=1.0, top_p=1.0, top_k=0, min_p=0.0):
         return p
     z = lg / float(temperature)
     keep = np.ones(lg.shape[0], bool)
-    if top_k and 0 < top_k < lg.shape[0]:
+    has_top_k = top_k and 0 < top_k < lg.shape[0]
+    if has_top_k:
         kth = np.partition(z, -top_k)[-top_k]
         keep &= z >= kth
     z = np.where(keep, z, -np.inf)
     e = np.exp(z - np.max(z))
     q = e / e.sum()
     if top_p < 1.0:
-        order = np.argsort(-q, kind="stable")
-        c = np.cumsum(q[order])
-        n = int(np.searchsorted(c, top_p, side="left")) + 1       # the smallest prefix with mass >= top_p
+        # the partial nucleus sort (0.8, on by default): the same kept set and probabilities bit for bit as the full
+        # sort; KINDI_DSV_TOPP_PARTIAL=0 runs the full sort
+        if os.environ.get("KINDI_DSV_TOPP_PARTIAL", "1") != "0":
+            prefix = _nucleus_prefix(q, top_p, keep if has_top_k else None)
+        else:
+            order = np.argsort(-q, kind="stable")
+            c = np.cumsum(q[order])
+            prefix = order[:int(np.searchsorted(c, top_p, side="left")) + 1]
         cut = np.zeros_like(keep)
-        cut[order[:n]] = True
+        cut[prefix] = True
         q = np.where(cut, q, 0.0)
         q /= q.sum()
     if min_p > 0.0:
@@ -309,10 +334,11 @@ def spec_accept(dists, draft, rng):
     """exact speculative sampling with deterministic drafts (the draft distribution is a point mass): draft token i is
     kept with probability p_i(draft_i); at the first rejection the replacement is drawn from p_i with draft_i removed
     (the residual max(p - q, 0), renormalised). dists: the target distributions after each prefix (len(draft) + 1 of
-    them). Returns (number of kept drafts a, the next token: the replacement at a rejection, else a sample of
+    them), indexed or supplied as a callable of the row index. Returns (number of kept drafts a, the next token: the replacement at a rejection, else a sample of
     dists[a])."""
+    row = dists if callable(dists) else dists.__getitem__
     for i, d in enumerate(draft):
-        pi = dists[i]
+        pi = row(i)
         if rng.random() < pi[d]:
             continue
         r = pi.copy()
@@ -322,7 +348,8 @@ def spec_accept(dists, draft, rng):
             continue
         return i, int(rng.choice(len(r), p=r / s))
     a = len(draft)
-    return a, int(rng.choice(len(dists[a]), p=dists[a]))
+    bonus = row(a)
+    return a, int(rng.choice(len(bonus), p=bonus))
 
 
 class Snapshot(object):
@@ -339,16 +366,52 @@ class Snapshot(object):
         self.nbytes = 0
 
 
+# Native routed-expert kernels consume MXFP4 directly. These dimensions match
+# D, FF, NE and NL in dsv41_cpu.c and determine the byte strides in every cache.
+_EXPERT_SHAPES = {
+    f"blk.{layer}.ffn_{projection}_exps.weight": shape
+    for layer in range(40)
+    for projection, shape in (("gate", (5120, 2304, 384)), ("up", (5120, 2304, 384)),
+                              ("down", (2304, 5120, 384)))
+}
+
+
+def _expert_shards(path):
+    """Read and validate every expert header before native initialization or NUMA placement."""
+    headers = [GGUF(f) for f in shards(path)]
+    seen = set()
+    for header in headers:
+        end = os.path.getsize(header.path) - header.data_start
+        for name, dims, codec, offset in sorted(header.tensors, key=lambda t: t[3], reverse=True):
+            if name.endswith("_exps.weight"):
+                if codec != 39:
+                    raise ValueError(f"{header.path}: {name} uses GGUF type {codec}, "
+                                     "but the DeepSeek expert kernels require MXFP4 (39)")
+                if name in seen or _EXPERT_SHAPES.get(name) != tuple(dims):
+                    raise ValueError(f"{header.path}: duplicate or unexpected expert tensor {name} {dims}")
+                cols, rows, experts = dims
+                if end - offset < (cols // 32 * 17) * rows * experts:
+                    raise ValueError(f"{header.path}: truncated or overlapping MXFP4 expert tensor {name}")
+                seen.add(name)
+            end = min(offset, end)
+    missing = _EXPERT_SHAPES.keys() - seen
+    if missing:
+        raise ValueError(f"DeepSeek GGUF is missing {len(missing)} expert tensors, including {min(missing)}")
+    return headers
+
+
 class Model(object):
+    adaptive_prefill = False
+
     def __init__(self, path, ctx=8192, tmax=64, expert_copy=None, verbose=True):
+        headers = _expert_shards(path)
         L = lib()
-        files = shards(path)
-        self.meta = GGUF(files[0]).kv
+        self.meta = headers[0].kv
         expert_only = []
         mapped = []
         t0 = time.time()
-        for f in files:
-            g = GGUF(f)
+        for g in headers:
+            f = g.path
             size = ctypes.c_long(0)
             p = L.dsv_map_file(f.encode(), ctypes.byref(size))
             if not p:
@@ -557,26 +620,32 @@ class Model(object):
         ids = np.ascontiguousarray(ids, np.int32)
         out = np.zeros((len(ids), VOCAB) if all_logits else VOCAB, np.float32)
         a0 = 0
+        # Cache matching in prefill_cached has already removed the reusable prefix.
+        adaptive = self.adaptive_prefill and self.tmax >= 1024 and push and not all_logits
+        plain_chunk = 512 if adaptive else self.tmax
+        pair_chunk = plain_chunk
+        if adaptive and len(ids) >= 8192:
+            pair_chunk = 1024
         # prompt chunks: two full chunks at a time through the pipelined path (KINDI_PIPE=0: off)
-        while (not all_logits and os.environ.get("KINDI_PIPE", "1") != "0" and len(ids) - a0 >= 2 * self.tmax
-               and self.tmax > 8):
-            last = len(ids) - a0 == 2 * self.tmax
+        while (not all_logits and os.environ.get("KINDI_PIPE", "1") != "0" and len(ids) - a0 >= 2 * pair_chunk
+               and pair_chunk > 8):
+            last = len(ids) - a0 == 2 * pair_chunk
             self._check_cancel()
             p0 = self.pos
-            r = lib().dsv_forward2(ids[a0:].ctypes.data, self.tmax, out.ctypes.data if last else None)
+            r = lib().dsv_forward2(ids[a0:].ctypes.data, pair_chunk, out.ctypes.data if last else None)
             if r == 1:
                 break
             if r:
                 raise RuntimeError("dsv41: forward2 failed")
-            self.hist.extend(int(x) for x in ids[a0:a0 + 2 * self.tmax])
+            self.hist.extend(int(x) for x in ids[a0:a0 + 2 * pair_chunk])
             if push and getattr(self, "dspark", False):
-                n = min(self.tmax, 128)
-                lib().dsv_dspark_push(self.tmax - n, n, p0 + 2 * self.tmax - n)
-            a0 += 2 * self.tmax
+                n = min(pair_chunk, 128)
+                lib().dsv_dspark_push(pair_chunk - n, n, p0 + 2 * pair_chunk - n)
+            a0 += 2 * pair_chunk
             if push:
                 self._ring_save()
-        for a in range(a0, len(ids), self.tmax):
-            b = min(len(ids), a + self.tmax)
+        for a in range(a0, len(ids), plain_chunk):
+            b = min(len(ids), a + plain_chunk)
             dst = out[a:b] if all_logits else out
             if b - a > 16:
                 self._check_cancel()
@@ -596,6 +665,8 @@ class Model(object):
     def _ckpt_key(self, toks):
         k = hashlib.sha1(np.asarray(toks, np.int32).tobytes()).hexdigest()
         # KINDI_DSV_CKV4: the compressed KV is saved in FP4 codes, another layout: its own files
+        if self.adaptive_prefill and self.tmax >= 1024:
+            k += "-adaptive8k"
         return k + "-c4" if os.environ.get("KINDI_DSV_CKV4", "0") not in ("", "0") else k
 
     def checkpoint_save(self, cache_dir):
@@ -706,8 +777,8 @@ class Model(object):
         st = stats if stats is not None else {}
         for key in ("steps", "drafted", "accepted", "draft_s"):
             st.setdefault(key, 0)
-        tok = np.zeros(8, np.int32)
-        conf = np.zeros(8, np.float32)
+        conf = np.zeros(5, np.float32)                     # DS_BLOCK in dsv41_cpu.c
+        tok = np.zeros(1 + len(conf), np.int32)
         union = (1.0, 1.69, 2.28, 2.80, 3.28, 3.73, 4.15, 4.54)   # expert bytes of m consecutive tokens (route_spec.py)
         # KINDI_DS_UNION (default 1; 0 = the fixed table): the expert term uses the measured CPU expert union of recent verify steps instead of the
         # fixed average table. ub[m] = running mean of the distinct experts read on the CPU (main layers, card-resident
@@ -753,11 +824,12 @@ class Model(object):
                     on_tokens([y])
                 break
             pos_last = self.pos - 1
-            td = time.time()
-            if L.dsv_dspark_draft(pos_last, y, tok.ctypes.data, conf.ctypes.data):
-                raise RuntimeError("dsv41: draft failed")
-            st["draft_s"] += time.time() - td
-            kcap = min(kmax, n - len(out), self.tmax - 1)
+            kcap = min(kmax, len(conf), n - len(out), self.tmax - 1)
+            if kcap > 0:
+                td = time.time()
+                if L.dsv_dspark_draft(pos_last, y, tok.ctypes.data, conf.ctypes.data):
+                    raise RuntimeError("dsv41: draft failed")
+                st["draft_s"] += time.time() - td
             # prompt lookup next to the drafter (KINDI_DS_NGRAM="bonus,strong,c0"): where the continuation of the
             # latest earlier occurrence of the context's longest suffix agrees with the drafts, their confidence rises
             # by bonus; when it disagrees from the first draft on, a match of >= strong tokens replaces the drafts if
@@ -793,6 +865,8 @@ class Model(object):
             if use_ng:
                 draft = list(ngc[:kcap])
                 st["ng_steps"] = st.get("ng_steps", 0) + 1
+            if stop_eos and self.eos in draft:
+                draft = draft[:draft.index(self.eos) + 1]
             p0 = self.pos
             u_before = L.dsv_union_count() if uni else 0
             rows = self.forward([y] + draft, all_logits=True, push=False)
@@ -803,7 +877,7 @@ class Model(object):
                 st["union_experts"] = st.get("union_experts", 0) + u_
             a = 0
             if sample:
-                a, nxt = spec_accept([dist(rows[i]) for i in range(len(draft) + 1)], draft, rng)
+                a, nxt = spec_accept(lambda i: dist(rows[i]), draft, rng)
                 if a < len(draft):
                     forced = nxt                         # the residual sample replaces the rejected draft
             else:
@@ -1041,6 +1115,7 @@ def main(argv=None):
     ap.add_argument("--think", action="store_true")
     ap.add_argument("-n", type=int, default=64)
     ap.add_argument("--ctx", default="8192")
+    ap.add_argument("--adaptive-prefill", action="store_true", help="use the server adaptive prefill policy")
     ap.add_argument("--tmax", type=int, default=64)
     ap.add_argument("--gen", type=int, default=32)
     ap.add_argument("--prompts", default=None)
@@ -1070,8 +1145,8 @@ def main(argv=None):
             share0 = float(os.environ.get("KINDI_MOE_SHARE0", "0.667"))
             gu_rows = int(round(2304 // 4 * share0)) * 4      # the split of moe_layer_direct (lroundf of the groups)
             dn_rows = int(round(5120 // 4 * share0)) * 4
-            for f in shards(a.model):
-                g = GGUF(f)
+            for g in _expert_shards(a.model):
+                f = g.path
                 offs, lens, nodes = [], [], []
                 for name, ne, ty, off in g.tensors:
                     if not name.endswith("_exps.weight"):
@@ -1119,6 +1194,7 @@ def main(argv=None):
             print("dsv41 verify: FAIL - %d shard(s) do not match the published sha256" % len(bad))
             return 1
     model = Model(a.model, ctx=max(ctxs) + a.n + 64, tmax=a.tmax)
+    model.adaptive_prefill = a.adaptive_prefill
     if a.flags is not None:
         lib().dsv_set_flags(a.flags)
     elif a.cmd == "verify":

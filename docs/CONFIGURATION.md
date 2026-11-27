@@ -100,12 +100,43 @@ These variables have no config key. Use them to test or to compare.
 
 | variable | default | |
 |---|---|---|
-| `KINDI_DEVICE` | `gpu` | `cpu` = the CPU engine (2B, 4B, 9B). Kindi also uses the CPU engine when CuPy is not installed |
-| `KINDI_CPU_CACHE` | `~/.cache/kindi` | the folder for the built CPU library (`libkcpu.so`) |
+| `KINDI_DEVICE` | `gpu` | `cpu` selects the CPU engine for Bonsai 2B, 4B and 9B and for Flash-Next. The Bonsai backend also uses its CPU engine when CuPy is unavailable. |
+| `KINDI_CPU_CACHE` | `~/.cache/kindi` | build cache for the native CPU libraries |
+| `KINDI_FN_CPUS` | physical cores | CPU list for Flash-Next inference. For example, `0-19,40-59` selects those logical CPU IDs. |
+| `KINDI_FNCPU_CHUNK` | `1024` | Tokens per Flash-Next CPU prefill chunk, from 1 to 4,096. Larger chunks compile with more CPU scratch capacity. |
+| `KINDI_FNCPU_GEMM` | `16` | Flash-Next CPU prefill chunks with at least this many tokens use fp32 matrix products and tiled attention. `0` keeps the int8 kernels. |
+| `KINDI_FNCPU_GEMM_EMIN` | `6` | Experts with fewer tokens in a prefill chunk use the int8 kernels. |
+| `KINDI_FNCPU_ATTN_TILE` | `1` | `0` turns off the tiled prefill attention of the fp32 path. |
+| `KINDI_FNCPU_BARRIER` | two-level | `flat` uses the thread pool's single-counter barrier instead of the per-NUMA-node barrier. |
+| `KINDI_FNCPU_WARM_PLE` | `bg` | Warms the 28.8 GB per-layer embedding table into the page cache when RAM allows: `bg` in the background while serving, `1` before serving, `0` off. |
+| `KINDI_FNCPU_K6` | `0` | `1` stores Q6_K and Q5_K matrices as 6-bit codes. Opt-in: no net write gain was measured. |
+| `KINDI_FNCPU_PRIV` | `0` | `1` makes each worker quantize a decode step's input itself instead of waiting at a barrier. Opt-in: measured slower. |
+| `KINDI_FNCPU_QUERY_PARALLEL` | `0` | `1` parallelizes whole attention queries during Flash-Next CPU prefill when a chunk contains at least one token per worker and the fp32 path is off. |
+| `KINDI_FNCPU_QUERY_PAIR` | `0` | `1` shares key and value loads across two query heads with `KINDI_FNCPU_QUERY_PARALLEL=1`. |
+| `KINDI_FNCPU_PACKED_GDN` | `1` | Packs Gated DeltaNet state into contiguous worker-local panels for Flash-Next CPU prefill when the chunk contains at least one token per worker. `0` turns it off. |
+| `KINDI_QXG_PROFILE` | `1` | The 0.8 Flash-Next prompt-read profile, used on one Ampere or newer card with page-locked experts (`KINDI_QXG_PIN=1`). It sets the upload, ring, staging, expert-batch and selected-key attention settings by prompt length and fits the expert batch to the free card memory. In fast mode it also uses fp16 prompt GEMMs, the fused prompt kernels and causal key limits. `0` turns it off. A variable set in the environment overrides the profile's value. |
+| `KINDI_QXG_STREAM_UPLOAD` | `packed-pipeline` with the prompt profile, else `legacy` | `packed-pipeline` coalesces adjacent cold-expert weights and overlaps down-projection uploads with gate/up compute in Flash-Next GPU prefill. |
+| `KINDI_QXG_RING` | `64` with the prompt profile, else `32` | Expert slots in the double-buffered Flash-Next GPU prefill uploader. The coalesced pipeline was measured at `64`. |
+| `KINDI_QXG_COMPACT_STREAM` | `1` with the prompt profile, else `0` | `1` reuses the same gate/up and activation scratch for each group of expert uploads during Flash-Next prefill. The RTX 3060 long-prompt test used it with `KINDI_QXG_LAYER_MAJOR=1` and `KINDI_QXG_LM_TOK=8192`. |
+| `KINDI_QXG_PREFETCH_PREFIX` | `0` | Maximum cold experts to stage before their layer routes a batch of at least 4,096 Flash-Next prompt tokens. The matched RTX 3060 4K tests used `448`, compact scratch, and `KINDI_FN_EXPERT_GB=0.4`. |
+| `KINDI_QXG_PREFETCH_ORDER` | `index` | `usage` ranks cold experts by the configured routing profile before picking which ones to upload early. |
+| `KINDI_QXG_PREFETCH_PHASES` | `1` with the prompt profile, else `0` | `1` lets gate and up projections run as soon as their weights arrive, while the down weights are still uploading. |
+| `KINDI_QXG_PREFETCH_SLICE` | `0` | Tokens per expert-compute slice within one staged layer batch. Zero uses the entire batch. |
+| `KINDI_QXG_PREFETCH_COMPUTE_GROUP` | all ready experts | Maximum prefetched experts per compute group. The long-prompt RTX 3060 profile used `128`. |
+| `KINDI_QXG_TENSOR_QSA` | `0` | `fp16` runs selected-key attention on tensor cores from 4,096 cached positions on Ampere and newer CUDA cards with Triton installed. The engine uses the standard attention path when Triton is unavailable. |
+| `KINDI_LT_ADAPT_PREFILL` | `1` | `0` keeps Lightning at 512-token chunks. On, Lightning batches up to 1,024 prompt tokens on eligible cards that normally use 512. It reuses GPU scratch and preserves attention tile boundaries and single-token tails. Set a fixed `KINDI_LT_CHUNK` to override the adaptive path. |
+| `KINDI_MTP_STAGE_PROMPT` | `1` with the prompt profile, else `0` | `1` lets Flash-Next stage experts for smaller layer-major MTP prompt batches when `KINDI_QXG_PREFETCH_PREFIX` is set. Warm verification graphs can stay resident through a read of at most 4,096 total tokens when at least 2 GiB are available. If the read exhausts GPU memory, Kindi releases the graphs and retries with staging off and a smaller batch. |
+| `KINDI_QXG_WIN_FREE` | auto | `1` releases Flash-Next verification graphs before prompt prefill. `0` keeps them resident. The automatic policy releases them unless it can retain them for a short staged MTP read. |
+| `KINDI_QXG_LM_TOK_DRAFT` | `3072` | Size of Flash-Next layer-major MTP expert batches. Larger batches can reuse expert weights across more tokens and need more GPU memory. |
+| `KINDI_FN_DRAFT_K` | `2` | Maximum Flash-Next tokens proposed by the MTP head before target verification. |
+| `KINDI_SPLIT_CARD` | `KINDI_SPLIT_STREAM` (12 by default) | Maximum streamed experts dispatched to the main GPU per DeepSeek prompt layer when using the GPU/CPU split. The RTX 3060 + M4000 replay tested 16 with 81,920 context and DSpark. |
+| `KINDI_DSV_PREFILL_REUSE_UPLOADS` | `0` | `1` keeps up to five streamed experts in existing GPU upload slots between adjacent pipelined DeepSeek prompt chunks. The tested wider profile used `KINDI_SPLIT_CARD=16`. |
+| `KINDI_FN_DRAFT_CACHE` | `0` | `1` keeps one pair of Flash-Next target and MTP prompt states in VRAM. An exact append can reuse completed prefill chunks, then rereads the previous partial chunk with the new suffix. |
 | `KINDI_CKPT_STREAM` | `1` with decode slots, else `0` | `1` = the prompt cache copies the recurrent state (checkpoints, parked conversations, saved turns) on a side stream into pinned host memory, so that another slot's pass does not wait for the copy. Without slots it is a speed option for hosts with RAM to spare: the copies are about 10% faster (27B on a PCIe x1 link), but pinned memory then holds up to the whole checkpoint budget (`checkpoint_budget_mb`, default 20% of the RAM) |
 | `KINDI_SLOTS_ROWS` | `1` | decode slots: `0` = the batched pass launches the per-token kernels once per slot (slower; for tests) |
 | `KINDI_SLOTS_WAIT_MS` | `2` | decode slots: how long a writing slot waits for the others to hand in their tokens before a pass runs without them |
 | `KINDI_TP` | (auto) | `1` = the plan engine, `0` = the single-card engine. The 27B always uses the plan engine |
+| `KINDI_DENSE_FUSE` | `1` | `0` turns off the fused recurrent and attention kernel launches in the single-card Bonsai engine. The GTX 1080 replay verified exact generated tokens and final logits on 2B, 4B and 9B. |
 | `KINDI_CARDS` | (all, at most 2) | the number of cards for the plan engine |
 | `KINDI_TP_SPLIT` | `auto` | two cards: when the halves do not leave room for the context on the card with less free memory, `auto` gives the other card a larger part of the FFN and of the output head, so both cards have the same room for the context. That card then does more of the work, so the halves stay whenever they fit. `even` = the halves; a number (0.1 to 0.9) = card 0's part |
 | `KINDI_CHUNK` | `256` | prompt tokens per chunk; `0` = one token at a time. The default is `128` on Kepler (sm_30) |

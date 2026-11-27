@@ -142,7 +142,11 @@ class Engine(object):
         big = 2048 if self.k35 and total >= 11 * 2 ** 30 else 1024 if self.cc >= 75 and total >= 9.5 * 2 ** 30 else CHUNK
         if self.ctx == 0 or self.ctx > 32768 and not self.k35:   # long contexts: the room goes to the K/V cache
             big = CHUNK
-        self.chunk = int(os.environ.get("KINDI_LT_CHUNK") or big)
+        fixed_chunk = os.environ.get("KINDI_LT_CHUNK")
+        self.adaptive_prefill = (not fixed_chunk and big < 1024 and self.ctx > 0 and self.ctx <= 32768
+                                 and self.cc >= 60 and os.environ.get("KINDI_LT_ADAPT_PREFILL", "1") != "0")
+        self.chunk = int(fixed_chunk or (1024 if self.adaptive_prefill else big))
+        self.attention_chunk = big if self.adaptive_prefill else self.chunk
         t0 = time.time()
         # the plan leaves KINDI_LT_RESERVE_MB (350 MB) free for what it does not count (the CUDA context, compiled
         # kernels, the memory pool's rounding). On 8 GB cards with host experts that was not always enough (an RTX 2070
@@ -447,11 +451,21 @@ class Engine(object):
 
     def _buf_bytes(self):
         s, C = self.s, self.chunk
-        f = C * (2 * s.n_embd + s.d_in + s.d_xbc + 2 * s.d_inner + s.n_exp + s.n_ffsh + s.n_embd) * 4
-        f += C * s.n_used * (s.n_ff + s.n_embd) * 4 + C * s.n_used * s.n_ff * 1.5
+        f = C * (3 * s.n_embd + s.n_exp + s.n_ffsh) * 4
+        mixer = s.d_in + s.d_xbc + 2 * s.d_inner
+        values = s.n_used * s.n_embd
+        if self.adaptive_prefill:
+            state, output = self._mixer_widths()
+            mixer = max(0, state + output - values)
+        f += C * (mixer + values + s.n_used * s.n_ff) * 4 + C * s.n_used * s.n_ff * 1.5
         if self.k35 and KBLAS:                             # _kblas: the fp32 weight block and inputs
             f += KDQ_BYTES + C * max(s.n_embd, s.d_inner, s.n_ffsh) * 4
         return int(f + C * max(s.d_in, s.n_ffsh) * 1.5 + s.vocab * 4 + (64 << 20))
+
+    def _mixer_widths(self):
+        s = self.s
+        head = s.n_head * s.hd
+        return max(s.d_in + s.d_xbc, head), max(s.d_inner, head + 2 * s.n_kv * s.hd)
 
     def _buffers(self):
         cp, s, C = self.cp, self.s, self.chunk
@@ -461,10 +475,21 @@ class Engine(object):
         self.xn = z(C, E)
         W = max(E, s.d_inner, s.n_ffsh, s.n_head * s.hd)
         self.xq, self.xd, self.xs = z(C * W // 4, dt=cp.int32), z(C * W // 32), z(C * W // 32, dt=cp.int32)
-        self.zx = z(C, s.d_in)
-        self.xbc = z(C, s.d_xbc)
-        self.y = z(C, max(s.d_inner, s.n_head * s.hd + 2 * s.n_kv * s.hd))
-        self.att = z(C, s.n_head * s.hd)
+        state, output = self._mixer_widths()
+        if self.adaptive_prefill:
+            # Only one layer uses this storage at a time on self.stream. The weight upload stream never uses it.
+            scratch = z(C * max(state + output, U * E))
+            self.zx = scratch[:C * s.d_in].reshape((C, s.d_in))
+            self.xbc = scratch[C * s.d_in:C * (s.d_in + s.d_xbc)].reshape((C, s.d_xbc))
+            self.att = scratch[:C * s.n_head * s.hd].reshape((C, s.n_head * s.hd))
+            self.y = scratch[C * state:C * (state + output)].reshape((C, output))
+            self.yd = scratch[:C * U * E].reshape((C * U, E))
+        else:
+            self.zx = z(C, s.d_in)
+            self.xbc = z(C, s.d_xbc)
+            self.y = z(C, output)
+            self.att = z(C, s.n_head * s.hd)
+            self.yd = z(C * U, E)
         self.lg = z(C, s.n_exp)
         self.ids = z(C, U, dt=cp.int32)
         self.gw = z(C, U)
@@ -473,7 +498,6 @@ class Engine(object):
         self.u = z(C * U, s.n_ff)
         self.uq, self.ud, self.us = z(C * U * s.n_ff // 4, dt=cp.int32), z(C * U * s.n_ff // 32), \
             z(C * U * s.n_ff // 32, dt=cp.int32)
-        self.yd = z(C * U, E)
         self.ush = z(C, s.n_ffsh)
         self.shq, self.shd, self.shs = z(C * s.n_ffsh // 4, dt=cp.int32), z(C * s.n_ffsh // 32), \
             z(C * s.n_ffsh // 32, dt=cp.int32)
@@ -674,16 +698,21 @@ class Engine(object):
                                                                self.pacc))
                     k["lt_attn_merge"](((s.n_head + 7) // 8,), (256,), (self.pm, self.pl, self.pacc,
                                                                         np.int32(s.n_head), np.int32(NSPLIT), self.att))
-                elif self.tc and gq == 16:
-                    k["lt_fa"](((16 * T + 63) // 64, s.n_kv), (128,), (self.y, np.int32(ld), np.int32(T), self.dpos,
-                                                                       np.int32(0), self.kc[il], self.vc[il], scale,
-                                                                       self.att))
-                else:                       # fp32 (cards without tensor cores): 6 or 8 tokens per block
-                    tb = 6 if self.pre6 and gq == 16 else 8
-                    k["lt_attn_pre%d" % tb]((s.n_kv, (T + tb - 1) // tb), (256,), (self.y, np.int32(ld), self.kc[il],
-                                                                               self.vc[il], self.dpos, np.int32(0),
-                                                                               np.int32(T), np.int32(s.n_kv),
-                                                                               np.int32(gq), scale, self.att))
+                else:
+                    # Keep the established attention tile boundaries while batching more MoE rows per weight upload.
+                    for start in range(0, T, self.attention_chunk):
+                        n = min(self.attention_chunk, T - start)
+                        q = self.y if not start else self.y.ravel()[start * ld:]
+                        out = self.att if not start else self.att[start:]
+                        if self.tc and gq == 16:
+                            k["lt_fa"](((16 * n + 63) // 64, s.n_kv), (128,),
+                                        (q, np.int32(ld), np.int32(n), self.dpos, np.int32(start), self.kc[il],
+                                         self.vc[il], scale, out))
+                        else:               # fp32: 6 or 8 tokens per block
+                            tb = 6 if self.pre6 and gq == 16 else 8
+                            k["lt_attn_pre%d" % tb]((s.n_kv, (n + tb - 1) // tb), (256,),
+                                                    (q, np.int32(ld), self.kc[il], self.vc[il], self.dpos,
+                                                     np.int32(start), np.int32(n), np.int32(s.n_kv), np.int32(gq), scale, out))
                 nhd = s.n_head * s.hd
                 self._quant(self.att, T, nhd, nhd, 0, self.xq, self.xd, self.xs)
                 if T == 1:
@@ -847,15 +876,24 @@ class Engine(object):
         cp = self.cp
         pos = self.pos if pos is None else pos
         assert pos + len(ids) <= self.ctx, "the prompt does not fit the context (%d)" % self.ctx
+        chunk = self.chunk
+        if self.adaptive_prefill and len(ids) < chunk:
+            chunk = self.attention_chunk
+        end = len(ids)
+        # The old schedule uses the single-token kernels for a one-token tail.
+        body_end = end - 1 if self.adaptive_prefill and end % self.attention_chunk == 1 else end
         with self.stream:
-            for c0 in range(0, len(ids), self.chunk):
-                part = ids[c0:c0 + self.chunk]
+            c0 = 0
+            while c0 < end:
+                c1 = min(c0 + chunk, body_end) if c0 < body_end else end
+                part = ids[c0:c1]
                 T = len(part)
                 self.k["lt_set"]((1,), (32,), (self.dpos, np.int32(pos + c0)))
                 self.tok[:T].set(np.asarray(part, np.int32), stream=self.stream)
                 self.k["lt_embed"]((T,), (256,), (np.uint64(self.emb_mem.ptr), self.tok, np.int32(self.s.n_embd),
                                                   self.x))
                 self._layers(T)
+                c0 = c1
             self._head(T - 1)
             self.k["lt_set"]((1,), (32,), (self.dpos, np.int32(pos + len(ids))))
             cp.cuda.runtime.memcpyAsync(self.h.ctypes.data + 8, self.tok_out.data.ptr, 4, 2, self.stream.ptr)

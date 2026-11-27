@@ -1,4 +1,4 @@
-"""kindi convert: supported Ternary-Bonsai-2 PTQ1_0 GGUF -> Kindi weight pack. Exact (same information, new layout).
+"""kindi convert: supported Ternary-Bonsai PTQ1_0 GGUF -> Kindi weight pack. Exact (same information, new layout).
 
 Ternary tensors (GGUF type 143 = PTQ1_0: per 128 weights, qs[24] | qh[2] | fp16 scale d; 5 trits per byte) are
 re-coded 4 trits per byte (byte = t0 + 3 t1 + 9 t2 + 27 t3, t in {0,1,2}, weight = (t-1) * d) and laid out
@@ -20,6 +20,8 @@ from . import __version__
 from .gguf import GGUF
 
 PTQ1_0, F32, BF16 = 143, 0, 30
+BONSAI25_27B = "bonsai25-27b"
+BONSAI25_27B_NAME = "Ternary-Bonsai-2.5-27B"
 POW3 = np.array([1, 3, 9, 27, 81, 243], dtype=np.uint32)
 PROFILES = {
     (24, 2048, 6144, 8, 2, 16): "Ternary-Bonsai-2-2B",
@@ -48,8 +50,9 @@ def trits_from_raw(raw):
 
 def phase_bytes(tr):
     """(nb, 128) trits -> (nb, 32) bytes, byte s = t0 + 3 t1 + 9 t2 + 27 t3 of elements 4s .. 4s+3."""
-    g = tr.reshape(-1, 32, 4).astype(np.int32)
-    return (g[:, :, 0] + 3 * g[:, :, 1] + 9 * g[:, :, 2] + 27 * g[:, :, 3]).astype(np.uint8)
+    g = tr.reshape(-1, 32, 4).astype(np.uint8, copy=False)
+    # All terms and their sum (at most 80) fit in uint8.
+    return g[:, :, 0] + 3 * g[:, :, 1] + 9 * g[:, :, 2] + 27 * g[:, :, 3]
 
 
 def selftest():
@@ -107,7 +110,7 @@ def convert(gguf_path, out_dir, log=print):
                g.kv.get("qwen35.feed_forward_length"), g.kv.get("qwen35.attention.head_count"),
                g.kv.get("qwen35.attention.head_count_kv"), g.kv.get("qwen35.ssm.group_count"))
     if profile not in PROFILES:
-        raise SystemExit("kindi convert: unsupported Ternary-Bonsai-2 dimensions %r" % (profile,))
+        raise SystemExit("kindi convert: unsupported Ternary-Bonsai dimensions %r" % (profile,))
     types = {t[2] for t in g.tensors}
     if not types <= {PTQ1_0, F32, BF16}:
         raise SystemExit("kindi convert: needs the PTQ1_0 GGUF (found tensor types %s)" % sorted(types))
@@ -198,6 +201,8 @@ def convert(gguf_path, out_dir, log=print):
                 "head": "output.weight" if any(t[0] == "output.weight" for t in g.tensors) else "token_embd.weight",
                 # the chat template: the 27B's differs from the 2B/4B/9B one (chat.template_variant)
                 "chat_template": g.kv.get("tokenizer.chat_template", "")}
+    if manifest["model"] == BONSAI25_27B_NAME:
+        manifest["model_id"] = BONSAI25_27B
     # B16: each pack file's size, fast hash and sha256, checked before the pack is used (kindi.packcheck)
     from .packcheck import record
     manifest["files"] = record(out_dir, log)

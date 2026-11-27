@@ -3,8 +3,8 @@
 1 ICON "kindi.ico"
 1 24 "kindi-monitor.manifest"
 1 VERSIONINFO
-FILEVERSION 0,7,0,0
-PRODUCTVERSION 0,7,0,0
+FILEVERSION 0,8,0,0
+PRODUCTVERSION 0,8,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -14,10 +14,10 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Kindi"
       VALUE "FileDescription", "Kindi Monitor"
-      VALUE "FileVersion", "0.7.0"
+      VALUE "FileVersion", "0.8.0"
       VALUE "LegalCopyright", "Copyright (c) 2026 Amir Husain. AGPL-3.0-only."
       VALUE "ProductName", "Kindi"
-      VALUE "ProductVersion", "0.7.0"
+      VALUE "ProductVersion", "0.8.0"
     END
   END
   BLOCK "VarFileInfo"

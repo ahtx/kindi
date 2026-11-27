@@ -8,9 +8,12 @@ import time
 
 
 def reference_for(pack):
-    """the reference file of the pack's model (by the size in its source file name), or None"""
+    """The reference file for the pack's model, with a size fallback for older Bonsai packs."""
     here = os.path.dirname(os.path.abspath(__file__))
     man = json.load(open(os.path.join(pack, "kindi_pack.json")))
+    if man.get("model_id") == "bonsai25-27b" or man.get("model") == "Ternary-Bonsai-2.5-27B":
+        p = os.path.join(here, "reference-bonsai25-27b.json")
+        return p if os.path.exists(p) else None
     m = re.search(r"-(\d+)B[-_.]", man.get("source_file", "") + ".") or re.search(r"(\d+)B", man.get("model", ""))
     size = (m.group(1) + "b") if m else "2b"
     p = os.path.join(here, "reference.json" if size == "2b" else "reference-%s.json" % size)
@@ -85,6 +88,9 @@ def run(cfg, log=print):
         log("no llama.cpp reference for this model in this version of Kindi")
         return 2
     ref = json.load(open(rp))
+    if ref.get("source_sha256") and ref["source_sha256"] != man.get("source_sha256"):
+        log("no llama.cpp reference for this source checkpoint")
+        return 2
     from .packcheck import check, PackError
     try:                                    # B16: every pack file as kindi convert wrote it (sha256)
         n = check(pack, "full", man)
