@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/kindi-banner.svg?v=0.8.0" alt="Kindi 0.8.0: language models on low-cost GPUs, from a 1 GB Quadro K420 to the RTX 50 series, the CMP 170HX and Radeon graphics. Ternary Bonsai 2B to 27B, AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B and DeepSeek-V4.1-Flash." width="100%"></p>
+<p align="center"><img src="assets/kindi-banner.svg?v=0.8.0" alt="Kindi 0.8.0: language models on low-cost GPUs, from a 1 GB Quadro K420 to the RTX 50 series, the CMP 170HX and Radeon graphics. Ternary Bonsai 2B to 27B, AH-Nanbeige4.3-33B, Nemotron 3.5 Lightning 30B-A3B, DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next and Inkling 2 Mini." width="100%"></p>
 
 # Kindi 0.8.0
 
@@ -131,7 +131,7 @@ its own installer ([docs/DEEPSEEK.md](docs/DEEPSEEK.md)).
 - [CHANGELOG.md](CHANGELOG.md): what changed in each version
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/CARDS.md](docs/CARDS.md): the measurements and the settings
 - [WHY.md](WHY.md): the one-page summary
-- The manual: [How to get work done with Kindi](https://amirhusain.com/software/kindi/How-To-Get-Work-Done-with-Kindi-0.7.0.pdf)
+- The manual: [How to get work done with Kindi](https://amirhusain.com/software/kindi/How-To-Get-Work-Done-with-Kindi-0.8.0.pdf)
 - Project page: [amirhusain.com/kindi](https://amirhusain.com/kindi/)
 
 By [Amir Husain](https://www.amirhusain.com).
